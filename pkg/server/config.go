@@ -22,6 +22,8 @@ type ServerConfig struct {
 	LLMsTxtPath string            `yaml:"llms_txt_path"`
 	// Models maps client-visible aliases to provider lanes + upstream ids.
 	Models map[string]ModelAlias `yaml:"models"`
+	// Timeouts maps provider lanes to request-timeout durations, e.g. {"vllm":"10m"}.
+	Timeouts map[string]string `yaml:"timeouts"`
 }
 
 // StorageConfig contains SQLite database configuration.

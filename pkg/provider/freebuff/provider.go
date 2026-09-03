@@ -23,7 +23,7 @@ import (
 const (
 	DefaultBaseURL = "https://www.codebuff.com/api/v1"
 	ProviderName   = "freebuff"
-	UserAgentValue = "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.25"
+	UserAgentValue = "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.25 runtime/node.js/v22.23.2"
 )
 
 // DefaultModels maps model names to agent IDs.
@@ -230,7 +230,7 @@ func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...pro
 		return nil, fmt.Errorf("failed to start agent run: %w", err)
 	}
 
-	reqBody, err := p.buildPayload(msgs, model, run.RunID, false, reqConfig)
+	reqBody, err := p.buildPayload(msgs, model, run.GetRunID(), false, reqConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +269,7 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 		return nil, fmt.Errorf("failed to start agent run: %w", err)
 	}
 
-	reqBody, err := p.buildPayload(msgs, model, run.RunID, true, reqConfig)
+	reqBody, err := p.buildPayload(msgs, model, run.GetRunID(), true, reqConfig)
 	if err != nil {
 		_ = p.actor.Release()
 		return nil, err
@@ -306,6 +306,7 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 
 func (p *Provider) buildPayload(msgs []*ir.Message, model, runID string, stream bool, cfg *provider.RequestConfig) (io.Reader, error) {
 	// Transparency: do not rewrite user messages or inject fake tools
+	// Transparency: do not rewrite user messages or inject fake tools unless required by mode
 	chatMsgs := openai.ConvertMessages(msgs, openai.ConvertOptions{})
 
 	payload := map[string]any{
@@ -322,6 +323,12 @@ func (p *Provider) buildPayload(msgs []*ir.Message, model, runID string, stream 
 		"provider": map[string]any{
 			"allow_fallbacks": true,
 		},
+	}
+
+	if cfg.ExtraBody != nil {
+		if tools, ok := cfg.ExtraBody["tools"]; ok && tools != nil {
+			payload["tools"] = tools
+		}
 	}
 
 	if cfg.MaxTokens > 0 {
@@ -345,7 +352,7 @@ func (p *Provider) setHeaders(req *http.Request, cfg *provider.RequestConfig) {
 	req.Header.Set("User-Agent", UserAgentValue)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-freebuff-instance-id", p.instanceID)
-	req.Header.Set("x-freebuff-acting-user-id", p.instanceID)
+	req.Header.Set("x-freebuff-acting-user-id", "adcc6f59-fffd-4735-8c09-703eb3158941")
 	if p.cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+p.cfg.Token)
 	}

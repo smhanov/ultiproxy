@@ -32,9 +32,17 @@ type Session struct {
 // AgentRun represents an upstream run instance.
 type AgentRun struct {
 	RunID      string `json:"run_id"`
+	RunIDAlt   string `json:"runId"`
 	AgentID    string `json:"agent_id"`
 	InstanceID string `json:"instance_id"`
 	Status     string `json:"status"`
+}
+
+func (r *AgentRun) GetRunID() string {
+	if r.RunID != "" {
+		return r.RunID
+	}
+	return r.RunIDAlt
 }
 
 type streamJob struct {
@@ -326,19 +334,12 @@ func (a *FreebuffAccountActor) Bind(ctxOrModel any, optionalModel ...string) err
 	client := a.httpClient
 	a.mu.Unlock()
 
-	payload, err := json.Marshal(map[string]string{
-		"instance_id": instID,
-		"model":       model,
-	})
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/freebuff/session", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/freebuff/session", bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-freebuff-model", model)
 	if tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
@@ -438,17 +439,14 @@ func (a *FreebuffAccountActor) StartRun(ctxOrAgentID any, optionalAgentID ...str
 
 	a.mu.Lock()
 	instID := a.instanceID
-	model := a.boundModel
 	tok := a.token
 	client := a.httpClient
 	a.mu.Unlock()
 
-	payload, err := json.Marshal(map[string]string{
-		"action":      "START",
-		"agentId":     agentID,
-		"agent_id":    agentID,
-		"instance_id": instID,
-		"model":       model,
+	payload, err := json.Marshal(map[string]any{
+		"action":         "START",
+		"agentId":        agentID,
+		"ancestorRunIds": []string{},
 	})
 	if err != nil {
 		return nil, err

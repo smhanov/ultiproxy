@@ -19,3 +19,12 @@ type AliasManager interface {
 	Set(alias string, entry ModelAlias) error
 	Remove(alias string) error
 }
+
+// TimeoutManager is implemented by the http Server's per-provider timeout
+// store. Durations are exchange as Go duration strings ("10m", "3m30s").
+type TimeoutManager interface {
+	Timeout(provider string) string
+	Set(provider string, timeout string) error
+	Remove(provider string) error
+	List() map[string]string
+}

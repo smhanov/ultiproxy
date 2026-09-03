@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -213,8 +214,20 @@ func (s *Server) dispatchRequest(
 		}
 		opts = append(opts, provider.WithModel(upstream))
 
+		// Apply the per-provider request timeout (default or MCP-configured).
+		// Providers honor context cancellation while calling upstream.
+		reqCtx := r.Context()
+		if s.timeouts != nil {
+			timeout := s.timeouts.Timeout(provName)
+			if timeout > 0 {
+				var cancel context.CancelFunc
+				reqCtx, cancel = context.WithTimeout(reqCtx, timeout)
+				defer cancel()
+			}
+		}
+
 		if stream {
-			streamChan, syncErr := prov.Inference.Stream(r.Context(), messages, opts...)
+			streamChan, syncErr := prov.Inference.Stream(reqCtx, messages, opts...)
 			if syncErr != nil {
 				// Synchronous error BEFORE headers committed -> failover!
 				if s.writer != nil {
@@ -355,7 +368,7 @@ func (s *Server) dispatchRequest(
 
 		} else {
 			// Non-streaming request
-			resp, genErr := prov.Inference.Generate(r.Context(), messages, opts...)
+			resp, genErr := prov.Inference.Generate(reqCtx, messages, opts...)
 			if genErr != nil {
 				if s.writer != nil {
 					_ = s.writer.TrackAttempt(storage.AttemptRecord{

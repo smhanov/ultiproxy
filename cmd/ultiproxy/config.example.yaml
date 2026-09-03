@@ -10,9 +10,42 @@ server:
   #   opencode: "sk-up-opencode"
   #   claude-code: "sk-ant-cc"
   llms_txt_path: "llms.txt"
+
+  # Per-provider request timeouts. Slow self-hosted lanes (megos vLLM) can
+  # take up to 5 minutes per request. Override at runtime via MCP:
+  # set_provider_timeout {"provider":"vllm","timeout":"10m"}
+  timeouts:
+    vllm: "10m"
+    freebuff: "2m"
+    antigravity: "3m"
+    xai: "3m"
+    opencode: "3m"
+
   # Model aliases: client-visible name -> provider lane + upstream id.
+  # Same model on multiple providers gets provider-prefixed aliases.
   models:
-    zai-flash:
+    # --- Antigravity (Google subscription) ---
+    gemini-3.8-flash-high:
+      provider: antigravity
+      upstream: gemini-3.8-flash-high
+      context_limit: 1048576
+      max_output: 32768
+      pricing_tag: subscription_zero_marginal
+    gemini-3.7-flash:
+      provider: antigravity
+      upstream: gemini-3.7-flash
+      context_limit: 1048576
+      max_output: 32768
+      pricing_tag: subscription_zero_marginal
+    antigravity-claude-sonnet-4-6:
+      provider: antigravity
+      upstream: claude-sonnet-4-6
+      context_limit: 200000
+      max_output: 32768
+      pricing_tag: subscription_zero_marginal
+
+    # --- Z.ai Coding Plan (GLM) ---
+    glm-5.3-flash:
       provider: zai
       upstream: glm-5.3-flash
       context_limit: 1000000
@@ -20,6 +53,82 @@ server:
       pricing_tag: subscription_zero_marginal
       benchmarks:
         swe_bench: 0.68
+    glm-5.3:
+      provider: zai
+      upstream: glm-5.3
+      context_limit: 1000000
+      max_output: 131072
+      pricing_tag: subscription_zero_marginal
+      benchmarks:
+        swe_bench: 0.70
+
+    # --- OpenCode Go workspace ---
+    opencode-deepseek-v4-flash:
+      provider: opencode
+      upstream: deepseek-v4-flash
+      context_limit: 128000
+      max_output: 16384
+      pricing_tag: opencode-go_plan
+    opencode-deepseek-v4-flash-vision:
+      provider: opencode
+      upstream: deepseek-v4-flash-vision-exp
+      context_limit: 128000
+      max_output: 16384
+      pricing_tag: opencode-go_plan
+
+    # --- Freebuff (Codebuff free tier; OpenAI + other models) ---
+    gpt-5.6-luna:
+      provider: freebuff
+      upstream: openai/gpt-5.6-luna
+      context_limit: 128000
+      max_output: 16384
+      pricing_tag: freebuff_free
+    freebuff-deepseek-v4-flash:
+      provider: freebuff
+      upstream: deepseek/deepseek-v4-flash
+      context_limit: 128000
+      max_output: 16384
+      pricing_tag: freebuff_free
+    freebuff-glm-5.3-flash:
+      provider: freebuff
+      upstream: z-ai/glm-5.3-flash
+      context_limit: 128000
+      max_output: 16384
+      pricing_tag: freebuff_free
+    solar-pro4:
+      provider: freebuff
+      upstream: upstage/solar-pro4
+      context_limit: 128000
+      max_output: 16384
+      pricing_tag: freebuff_free
+    minimax-m3:
+      provider: freebuff
+      upstream: minimax/minimax-m3
+      context_limit: 128000
+      max_output: 16384
+      pricing_tag: freebuff_free
+    kimi-k3-eco:
+      provider: freebuff
+      upstream: crof/kimi-k3-eco
+      context_limit: 128000
+      max_output: 16384
+      pricing_tag: freebuff_free
+    mimo-v2.5:
+      provider: freebuff
+      upstream: mimo/mimo-v2.5
+      context_limit: 128000
+      max_output: 16384
+      pricing_tag: freebuff_free
+
+    # --- xAI Grok (X Premium+) ---
+    grok-4.6:
+      provider: xai
+      upstream: grok-4.6
+      context_limit: 256000
+      max_output: 32768
+      pricing_tag: subscription_zero_marginal
+      benchmarks:
+        swe_bench: 0.71
 
 storage:
   db_path: "/home/smhanov/.local/state/ultiproxy/ultiproxy.db"

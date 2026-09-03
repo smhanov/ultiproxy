@@ -156,8 +156,8 @@ func TestMCPToolsList(t *testing.T) {
 		t.Fatalf("expected tools list, got %T", resMap["tools"])
 	}
 
-	if len(tools) != 8 {
-		t.Fatalf("expected 8 tools, got %d", len(tools))
+	if len(tools) != 11 {
+		t.Fatalf("expected 11 tools, got %d", len(tools))
 	}
 
 	toolNames := make(map[string]bool)
@@ -175,6 +175,9 @@ func TestMCPToolsList(t *testing.T) {
 		"list_model_aliases",
 		"set_model_alias",
 		"remove_model_alias",
+		"get_provider_timeouts",
+		"set_provider_timeout",
+		"remove_provider_timeout",
 	}
 
 	for _, name := range expectedTools {

@@ -108,8 +108,8 @@ func TestUserAgentHeaderSet(t *testing.T) {
 		t.Fatalf("Generate failed: %v", err)
 	}
 
-	if capturedUA != "antigravity-cli/1.1.19" {
-		t.Fatalf("User-Agent = %q, want 'antigravity-cli/1.1.19'", capturedUA)
+	if capturedUA != UserAgent {
+		t.Fatalf("User-Agent = %q, want %q", capturedUA, UserAgent)
 	}
 }
 

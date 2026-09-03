@@ -94,6 +94,34 @@ var standardTools = []Tool{
 			Required: []string{"alias"},
 		},
 	},
+	{
+		Name:        "get_provider_timeouts",
+		Description: "List per-provider request timeouts (Go duration strings)",
+		InputSchema: &InputSchema{Type: "object", Properties: map[string]PropertyDef{}},
+	},
+	{
+		Name:        "set_provider_timeout",
+		Description: "Set a per-provider request timeout, e.g. {\"provider\":\"vllm\",\"timeout\":\"10m\"}. Persists across restarts.",
+		InputSchema: &InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"provider": {Type: "string", Description: "Provider lane name, e.g. vllm, freebuff"},
+				"timeout":  {Type: "string", Description: "Duration string, e.g. 3m30s, 10m, 1h"},
+			},
+			Required: []string{"provider", "timeout"},
+		},
+	},
+	{
+		Name:        "remove_provider_timeout",
+		Description: "Clear a provider's explicit timeout (falls back to default)",
+		InputSchema: &InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"provider": {Type: "string", Description: "Provider lane name"},
+			},
+			Required: []string{"provider"},
+		},
+	},
 }
 
 func (s *Server) handleListTools() any {
@@ -128,6 +156,12 @@ func (s *Server) handleCallTool(ctx context.Context, rawParams json.RawMessage) 
 		return s.toolSetModelAlias(ctx, params.Arguments)
 	case "remove_model_alias":
 		return s.toolRemoveModelAlias(ctx, params.Arguments)
+	case "get_provider_timeouts":
+		return s.toolGetProviderTimeouts(ctx)
+	case "set_provider_timeout":
+		return s.toolSetProviderTimeout(ctx, params.Arguments)
+	case "remove_provider_timeout":
+		return s.toolRemoveProviderTimeout(ctx, params.Arguments)
 	default:
 		return nil, &JSONRPCError{
 			Code:    CodeMethodNotFound,
@@ -421,6 +455,89 @@ func (s *Server) toolRemoveModelAlias(ctx context.Context, argsRaw json.RawMessa
 		}, nil
 	}
 	res := map[string]any{"ok": true, "removed": args.Alias}
+	b, _ := json.MarshalIndent(res, "", "  ")
+	return &CallToolResult{
+		Content: []ToolContent{{Type: "text", Text: string(b)}},
+	}, nil
+}
+
+func (s *Server) toolGetProviderTimeouts(ctx context.Context) (*CallToolResult, *JSONRPCError) {
+	if s.timeouts == nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: timeout manager not configured"}},
+			IsError: true,
+		}, nil
+	}
+	timeouts := s.timeouts.List()
+	if timeouts == nil {
+		timeouts = map[string]string{}
+	}
+	b, _ := json.MarshalIndent(timeouts, "", "  ")
+	return &CallToolResult{
+		Content: []ToolContent{{Type: "text", Text: string(b)}},
+	}, nil
+}
+
+func (s *Server) toolSetProviderTimeout(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {
+	if s.timeouts == nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: timeout manager not configured"}},
+			IsError: true,
+		}, nil
+	}
+	var args struct {
+		Provider string `json:"provider"`
+		Timeout  string `json:"timeout"`
+	}
+	if err := json.Unmarshal(argsRaw, &args); err != nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: %v", err)}},
+			IsError: true,
+		}, nil
+	}
+	if args.Provider == "" || args.Timeout == "" {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: provider and timeout are required"}},
+			IsError: true,
+		}, nil
+	}
+	if err := s.timeouts.Set(args.Provider, args.Timeout); err != nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: %v", err)}},
+			IsError: true,
+		}, nil
+	}
+	res := map[string]any{"ok": true, "provider": args.Provider, "timeout": args.Timeout}
+	b, _ := json.MarshalIndent(res, "", "  ")
+	return &CallToolResult{
+		Content: []ToolContent{{Type: "text", Text: string(b)}},
+	}, nil
+}
+
+func (s *Server) toolRemoveProviderTimeout(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {
+	if s.timeouts == nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: timeout manager not configured"}},
+			IsError: true,
+		}, nil
+	}
+	var args struct {
+		Provider string `json:"provider"`
+	}
+	_ = json.Unmarshal(argsRaw, &args)
+	if args.Provider == "" {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: provider argument is required"}},
+			IsError: true,
+		}, nil
+	}
+	if err := s.timeouts.Remove(args.Provider); err != nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: %v", err)}},
+			IsError: true,
+		}, nil
+	}
+	res := map[string]any{"ok": true, "removed": args.Provider}
 	b, _ := json.MarshalIndent(res, "", "  ")
 	return &CallToolResult{
 		Content: []ToolContent{{Type: "text", Text: string(b)}},

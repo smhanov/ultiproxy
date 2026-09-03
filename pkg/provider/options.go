@@ -48,6 +48,12 @@ func WithTemperature(t float64) Option {
 	return func(c *RequestConfig) { c.Temperature = &t }
 }
 
+// WithTimeout sets a per-request timeout; providers should honor it via
+// context cancellation when calling upstream.
+func WithTimeout(d time.Duration) Option {
+	return func(c *RequestConfig) { c.Timeout = d }
+}
+
 // WithReasoningEffort sets low/medium/high/xhigh (provider-dependent).
 func WithReasoningEffort(e string) Option {
 	return func(c *RequestConfig) { c.ReasoningEffort = e }

@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/smhanov/ultiproxy/pkg/mcp"
 	"github.com/smhanov/ultiproxy/pkg/provider"
@@ -23,6 +25,7 @@ type Server struct {
 	mcpServer  *mcp.Server
 	auth       *AuthMiddleware
 	catalog    *ModelCatalog
+	timeouts   *TimeoutManager
 	httpServer *http.Server
 	mux        *http.ServeMux
 }
@@ -94,13 +97,20 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		s.syncCatalogToState()
 	}
 
+	// Per-provider request timeouts (config + runtime overrides).
+	timeouts, _ := NewTimeoutManager(cfg.Server.Timeouts, DefaultRequestTimeout, filepath.Join(cfg.DataDir, "timeouts.json"))
+	s.timeouts = timeouts
+
 	// Create MCP server if not provided
 	if s.mcpServer == nil {
 		var stateSrc mcp.StateSource
 		if s.sm != nil {
 			stateSrc = &stateManagerSourceAdapter{sm: s.sm}
 		}
-		s.mcpServer = mcp.NewServer(registry, stateSrc, mcp.WithAliasManager(&catalogBridge{catalog: s.catalog, server: s}))
+		s.mcpServer = mcp.NewServer(registry, stateSrc,
+			mcp.WithAliasManager(&catalogBridge{catalog: s.catalog, server: s}),
+			mcp.WithTimeoutManager(&timeoutBridge{timeouts: s.timeouts}),
+		)
 	}
 
 	// Auth middleware
@@ -286,3 +296,25 @@ func (b *catalogBridge) Remove(alias string) error {
 	b.server.syncCatalogToState()
 	return nil
 }
+
+// timeoutBridge adapts server.TimeoutManager to the mcp.TimeoutManager
+// interface. Durations are exchanged as Go duration strings.
+type timeoutBridge struct {
+	timeouts *TimeoutManager
+}
+
+func (b *timeoutBridge) Timeout(provider string) string {
+	return b.timeouts.Timeout(provider).String()
+}
+
+func (b *timeoutBridge) Set(provider string, timeout string) error {
+	d, err := time.ParseDuration(timeout)
+	if err != nil || d <= 0 {
+		return fmt.Errorf("invalid timeout %q: %w", timeout, errTimeoutInvalid)
+	}
+	return b.timeouts.Set(provider, d)
+}
+
+func (b *timeoutBridge) Remove(provider string) error { return b.timeouts.Remove(provider) }
+
+func (b *timeoutBridge) List() map[string]string { return b.timeouts.List() }

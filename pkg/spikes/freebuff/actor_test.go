@@ -154,23 +154,32 @@ func TestActorLifecycleAndEndpoints(t *testing.T) {
 
 		case r.Method == http.MethodPost && r.URL.Path == "/freebuff/session":
 			bindCalled.Add(1)
+			modelHeader := r.Header.Get("x-freebuff-model")
 			var payload map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&payload)
+			m := modelHeader
+			if m == "" {
+				m = payload["model"]
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(Session{
 				InstanceID: "inst-999",
-				Model:      payload["model"],
+				Model:      m,
 			})
 
 		case r.Method == http.MethodPost && r.URL.Path == "/agent-runs":
 			runCalled.Add(1)
-			var payload map[string]string
+			var payload map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&payload)
+			agID, _ := payload["agentId"].(string)
+			if agID == "" {
+				agID, _ = payload["agent_id"].(string)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(AgentRun{
 				RunID:      "run-001",
-				AgentID:    payload["agent_id"],
-				InstanceID: payload["instance_id"],
+				AgentID:    agID,
+				InstanceID: "inst-999",
 				Status:     "running",
 			})
 

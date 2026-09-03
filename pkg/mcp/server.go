@@ -17,6 +17,7 @@ type Server struct {
 	stateSource StateSource
 	usageSource UsageSource
 	aliases     AliasManager
+	timeouts    TimeoutManager
 	name        string
 	version     string
 	mu          sync.RWMutex
@@ -36,6 +37,13 @@ func WithUsageSource(u UsageSource) Option {
 func WithAliasManager(am AliasManager) Option {
 	return func(s *Server) {
 		s.aliases = am
+	}
+}
+
+// WithTimeoutManager configures per-provider timeouts.
+func WithTimeoutManager(tm TimeoutManager) Option {
+	return func(s *Server) {
+		s.timeouts = tm
 	}
 }
 

@@ -3,12 +3,15 @@ package antigravity
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,8 +24,8 @@ import (
 )
 
 const (
-	DefaultBaseURL   = "https://cloudcode-pa.googleapis.com"
-	UserAgent        = "antigravity-cli/1.1.19"
+	DefaultBaseURL   = "https://daily-cloudcode-pa.googleapis.com"
+	UserAgent        = "antigravity/hub/2.9.1 darwin/arm64"
 	DefaultClientID  = "antigravity-client-id"
 	DefaultDeviceURL = "https://oauth2.googleapis.com/device/code"
 	DefaultTokenURL  = "https://oauth2.googleapis.com/token"
@@ -288,34 +291,64 @@ type cloudCodeTool struct {
 	FunctionDeclarations []cloudCodeFunctionDecl `json:"functionDeclarations,omitempty"`
 }
 
-type cloudCodeRequest struct {
-	Project          string             `json:"project"`
-	Model            string             `json:"model,omitempty"`
+type cloudCodeInnerRequest struct {
+	SessionID        string             `json:"sessionId,omitempty"`
 	Contents         []cloudCodeContent `json:"contents"`
 	Tools            []cloudCodeTool    `json:"tools,omitempty"`
 	GenerationConfig map[string]any     `json:"generationConfig,omitempty"`
 }
 
+type cloudCodeRequest struct {
+	Project     string                `json:"project"`
+	Model       string                `json:"model,omitempty"`
+	UserAgent   string                `json:"userAgent"`
+	RequestType string                `json:"requestType"`
+	RequestID   string                `json:"requestId"`
+	Request     cloudCodeInnerRequest `json:"request"`
+}
+
+type cloudCodeCandidate struct {
+	Content struct {
+		Role  string `json:"role"`
+		Parts []struct {
+			Text             string                 `json:"text,omitempty"`
+			Thought          any                    `json:"thought,omitempty"`
+			ThoughtSignature string                 `json:"thoughtSignature,omitempty"`
+			FunctionCall     *cloudCodeFunctionCall `json:"functionCall,omitempty"`
+		} `json:"parts"`
+	} `json:"content"`
+	FinishReason     string          `json:"finishReason,omitempty"`
+	ThoughtSignature string          `json:"thoughtSignature,omitempty"`
+	ReasoningState   json.RawMessage `json:"reasoningState,omitempty"`
+}
+
+type cloudCodeUsageMetadata struct {
+	PromptTokenCount     int `json:"promptTokenCount"`
+	CandidatesTokenCount int `json:"candidatesTokenCount"`
+	TotalTokenCount      int `json:"totalTokenCount"`
+}
+
 type cloudCodeResponse struct {
-	Candidates []struct {
-		Content struct {
-			Role  string `json:"role"`
-			Parts []struct {
-				Text             string                 `json:"text,omitempty"`
-				Thought          any                    `json:"thought,omitempty"`
-				ThoughtSignature string                 `json:"thoughtSignature,omitempty"`
-				FunctionCall     *cloudCodeFunctionCall `json:"functionCall,omitempty"`
-			} `json:"parts"`
-		} `json:"content"`
-		FinishReason     string          `json:"finishReason,omitempty"`
-		ThoughtSignature string          `json:"thoughtSignature,omitempty"`
-		ReasoningState   json.RawMessage `json:"reasoningState,omitempty"`
-	} `json:"candidates"`
-	UsageMetadata *struct {
-		PromptTokenCount     int `json:"promptTokenCount"`
-		CandidatesTokenCount int `json:"candidatesTokenCount"`
-		TotalTokenCount      int `json:"totalTokenCount"`
-	} `json:"usageMetadata"`
+	Response *struct {
+		Candidates    []cloudCodeCandidate    `json:"candidates"`
+		UsageMetadata *cloudCodeUsageMetadata `json:"usageMetadata"`
+	} `json:"response"`
+	Candidates    []cloudCodeCandidate    `json:"candidates"`
+	UsageMetadata *cloudCodeUsageMetadata `json:"usageMetadata"`
+}
+
+func (r *cloudCodeResponse) getCandidates() []cloudCodeCandidate {
+	if r.Response != nil && len(r.Response.Candidates) > 0 {
+		return r.Response.Candidates
+	}
+	return r.Candidates
+}
+
+func (r *cloudCodeResponse) getUsage() *cloudCodeUsageMetadata {
+	if r.Response != nil && r.Response.UsageMetadata != nil {
+		return r.Response.UsageMetadata
+	}
+	return r.UsageMetadata
 }
 
 func (p *Provider) getToken(ctx context.Context) (string, error) {
@@ -439,19 +472,57 @@ func (p *Provider) buildRequest(msgs []*ir.Message, cfg *provider.RequestConfig)
 	}
 
 	genCfg := make(map[string]any)
-	if cfg.MaxTokens > 0 {
+	if cfg.MaxTokens > 0 && !strings.Contains(cfg.Model, "flash") && !strings.Contains(cfg.Model, "pro") {
 		genCfg["maxOutputTokens"] = cfg.MaxTokens
 	}
 	if cfg.Temperature != nil {
 		genCfg["temperature"] = *cfg.Temperature
 	}
 
+	var firstUserText string
+	for _, m := range msgs {
+		if m != nil && m.Role == "user" {
+			for _, blk := range m.Blocks {
+				if tb, ok := blk.(ir.TextBlock); ok && tb.Text != "" {
+					firstUserText = tb.Text
+					break
+				}
+				if tb, ok := blk.(*ir.TextBlock); ok && tb.Text != "" {
+					firstUserText = tb.Text
+					break
+				}
+			}
+			if firstUserText != "" {
+				break
+			}
+		}
+	}
+
+	sessionID := fmt.Sprintf("-%d", time.Now().UnixNano())
+	if firstUserText != "" {
+		h := sha256.Sum256([]byte(firstUserText))
+		val := int64(binary.BigEndian.Uint64(h[:8])) & 0x7FFFFFFFFFFFFFFF
+		sessionID = "-" + strconv.FormatInt(val, 10)
+	}
+	reqID := fmt.Sprintf("agent-%d-%d", time.Now().UnixMilli(), time.Now().Nanosecond())
+
+	model := cfg.Model
+	if model == "" {
+		model = "gemini-3.7-flash-high"
+	}
+
 	return &cloudCodeRequest{
-		Project:          project,
-		Model:            cfg.Model,
-		Contents:         contents,
-		Tools:            tools,
-		GenerationConfig: genCfg,
+		Project:     project,
+		Model:       model,
+		UserAgent:   "antigravity",
+		RequestType: "agent",
+		RequestID:   reqID,
+		Request: cloudCodeInnerRequest{
+			SessionID:        sessionID,
+			Contents:         contents,
+			Tools:            tools,
+			GenerationConfig: genCfg,
+		},
 	}, nil
 }
 
@@ -474,7 +545,7 @@ func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...pro
 		return nil, fmt.Errorf("antigravity: failed to marshal request: %w", err)
 	}
 
-	endpoint := p.baseURL + "/v1internal:generateCode"
+	endpoint := p.baseURL + "/v1internal:generateContent"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("antigravity: failed to create request: %w", err)
@@ -508,8 +579,9 @@ func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...pro
 	}
 
 	irResp := &ir.Response{FinishReason: "stop"}
-	if len(ccResp.Candidates) > 0 {
-		cand := ccResp.Candidates[0]
+	cands := ccResp.getCandidates()
+	if len(cands) > 0 {
+		cand := cands[0]
 		if cand.FinishReason != "" {
 			irResp.FinishReason = strings.ToLower(cand.FinishReason)
 		}
@@ -555,11 +627,11 @@ func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...pro
 		}
 	}
 
-	if ccResp.UsageMetadata != nil {
+	if usage := ccResp.getUsage(); usage != nil {
 		irResp.Usage = &ir.Usage{
-			PromptTokens:     ccResp.UsageMetadata.PromptTokenCount,
-			CompletionTokens: ccResp.UsageMetadata.CandidatesTokenCount,
-			TotalTokens:      ccResp.UsageMetadata.TotalTokenCount,
+			PromptTokens:     usage.PromptTokenCount,
+			CompletionTokens: usage.CandidatesTokenCount,
+			TotalTokens:      usage.TotalTokenCount,
 		}
 	}
 
@@ -585,7 +657,7 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 		return nil, fmt.Errorf("antigravity: failed to marshal stream request: %w", err)
 	}
 
-	endpoint := p.baseURL + "/v1internal:streamGenerateCode"
+	endpoint := p.baseURL + "/v1internal:streamGenerateContent?alt=sse"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("antigravity: failed to create stream request: %w", err)
@@ -631,15 +703,15 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 				continue
 			}
 
-			if chunk.UsageMetadata != nil {
+			if usage := chunk.getUsage(); usage != nil {
 				outCh <- ir.EventUsageUpdate{
-					PromptTokens:     chunk.UsageMetadata.PromptTokenCount,
-					CompletionTokens: chunk.UsageMetadata.CandidatesTokenCount,
-					TotalTokens:      chunk.UsageMetadata.TotalTokenCount,
+					PromptTokens:     usage.PromptTokenCount,
+					CompletionTokens: usage.CandidatesTokenCount,
+					TotalTokens:      usage.TotalTokenCount,
 				}
 			}
 
-			for _, cand := range chunk.Candidates {
+			for _, cand := range chunk.getCandidates() {
 				if cand.ThoughtSignature != "" {
 					outCh <- ir.EventReasoningSignature{
 						Index:     blockIndex,

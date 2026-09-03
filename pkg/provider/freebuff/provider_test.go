@@ -40,9 +40,13 @@ func TestFreebuffActorIntegrationAndModelSwitch(t *testing.T) {
 
 		case r.Method == http.MethodPost && r.URL.Path == "/freebuff/session":
 			sessionPosts.Add(1)
+			modelHeader := r.Header.Get("x-freebuff-model")
 			var body map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			lastBound = body["model"]
+			lastBound = modelHeader
+			if lastBound == "" {
+				lastBound = body["model"]
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(spikesfreebuff.Session{
 				InstanceID: "inst-test",

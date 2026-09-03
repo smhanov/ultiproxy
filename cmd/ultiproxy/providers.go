@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/provider/antigravity"
@@ -12,17 +17,121 @@ import (
 	"github.com/smhanov/ultiproxy/pkg/provider/copilot"
 	"github.com/smhanov/ultiproxy/pkg/provider/deepseek"
 	"github.com/smhanov/ultiproxy/pkg/provider/freebuff"
+	"github.com/smhanov/ultiproxy/pkg/provider/opencode"
 	"github.com/smhanov/ultiproxy/pkg/provider/openrouter"
 	"github.com/smhanov/ultiproxy/pkg/provider/vllm"
 	"github.com/smhanov/ultiproxy/pkg/provider/xai"
 	"github.com/smhanov/ultiproxy/pkg/provider/zai"
 )
 
+// readJSONField loads a key from a JSON file, returning "" if unavailable.
+func readJSONField(path string, fields ...string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return "", false
+	}
+	cur := any(m)
+	for _, f := range fields {
+		m2, ok := cur.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		v, ok := m2[f]
+		if !ok {
+			return "", false
+		}
+		cur = v
+	}
+	s, ok := cur.(string)
+	if !ok || s == "" {
+		return "", false
+	}
+	return s, true
+}
+
+// readNestedToken walks a JSON file: try the exact field path first; if that
+// fails, return the "access_token" field of the first dict value that has one.
+// This handles files where credentials are nested under an opaque scope key
+// (e.g. ~/.grok/auth.json keyed by OAuth scope).
+func readNestedToken(path string, fields ...string) (string, bool) {
+	if tok, ok := readJSONField(path, fields...); ok {
+		return tok, true
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return "", false
+	}
+	for _, v := range m {
+		if entry, ok := v.(map[string]any); ok {
+			if tok, ok := entry["access_token"].(string); ok && tok != "" {
+				return tok, true
+			}
+			if tok, ok := entry["key"].(string); ok && tok != "" {
+				return tok, true
+			}
+		}
+	}
+	if tok, ok := m["access_token"].(string); ok && tok != "" {
+		return tok, true
+	}
+	return "", false
+}
+
+// execGhAuthToken shells out to `gh auth token` (best effort, 8s timeout).
+func execGhAuthToken() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "gh", "auth", "token").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// envFile reads a KEY=value pair from one or more dotenv files.
+func envFile(envFile, key string) string {
+	data, err := os.ReadFile(envFile)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, key+"=") {
+			return strings.Trim(strings.TrimPrefix(line, key+"="), `"'`)
+		}
+	}
+	return ""
+}
+
+// firstEnv returns the first non-empty environment variable.
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // registerProviders wires upstream adapters into the registry. Registration is
-// opt-in per provider and driven by environment variables, so the binary
-// boots cleanly in CI and on machines without any subscription credentials.
+// opt-in per provider and driven by environment variables OR local credential
+// files, so the binary boots cleanly in CI and on machines without any
+// subscription credentials. Local tokens kept fresh by the legacy bridge
+// daemons (cliproxy, xgroxy, codex, gh) are read at startup.
 func registerProviders(registry *provider.Registry) {
 	home, _ := os.UserHomeDir()
+	stateDir := firstEnv("ULTIPROXY_DATA_DIR", "ULTIPROXY_STATE_DIR")
+	if stateDir == "" {
+		stateDir = filepath.Join(home, ".local", "state", "ultiproxy")
+	}
 
 	add := func(name string, bundle provider.Provider) {
 		registry.Register(bundle)
@@ -30,8 +139,9 @@ func registerProviders(registry *provider.Registry) {
 	}
 
 	// Z.ai Coding Plan (GLM) — zero marginal cost on subscription.
-	if os.Getenv("ZAI_API_KEY") != "" {
-		if p, err := zai.New(zai.Config{}); err == nil {
+	zaiKey := firstEnv("ZAI_API_KEY", "ULTIPROXY_ZAI_API_KEY")
+	if zaiKey != "" {
+		if p, err := zai.New(zai.Config{APIKey: zaiKey}); err == nil {
 			add("zai", p.Provider())
 		} else {
 			log.Printf("[providers] zai: %v", err)
@@ -39,8 +149,8 @@ func registerProviders(registry *provider.Registry) {
 	}
 
 	// DeepSeek (metered API).
-	if os.Getenv("DEEPSEEK_API_KEY") != "" {
-		if p, err := deepseek.New(deepseek.Config{}); err == nil {
+	if key := firstEnv("DEEPSEEK_API_KEY", "ULTIPROXY_DEEPSEEK_API_KEY"); key != "" {
+		if p, err := deepseek.New(deepseek.Config{APIKey: key}); err == nil {
 			add("deepseek", p.Provider())
 		} else {
 			log.Printf("[providers] deepseek: %v", err)
@@ -48,8 +158,8 @@ func registerProviders(registry *provider.Registry) {
 	}
 
 	// OpenRouter (metered fallback aggregator).
-	if os.Getenv("OPENROUTER_API_KEY") != "" {
-		if p, err := openrouter.New(openrouter.Config{}); err == nil {
+	if key := firstEnv("OPENROUTER_API_KEY", "ULTIPROXY_OPENROUTER_API_KEY"); key != "" {
+		if p, err := openrouter.New(openrouter.Config{APIKey: key}); err == nil {
 			add("openrouter", p.Provider())
 		} else {
 			log.Printf("[providers] openrouter: %v", err)
@@ -57,11 +167,27 @@ func registerProviders(registry *provider.Registry) {
 	}
 
 	// Local vLLM (megos-style) — ULTIPROXY_VLLM_BASE_URL, optional key.
-	if base := os.Getenv("ULTIPROXY_VLLM_BASE_URL"); base != "" {
-		if p, err := vllm.New(vllm.Config{BaseURL: base, APIKey: os.Getenv("ULTIPROXY_VLLM_API_KEY")}); err == nil {
+	if base := firstEnv("ULTIPROXY_VLLM_BASE_URL", "VLLM_BASE_URL"); base != "" {
+		key := firstEnv("ULTIPROXY_VLLM_API_KEY", "VLLM_API_KEY")
+		if p, err := vllm.New(vllm.Config{BaseURL: base, APIKey: key}); err == nil {
 			add("vllm", p.Provider())
 		} else {
 			log.Printf("[providers] vllm: %v", err)
+		}
+	}
+
+	// OpenCode Go — workspace id + session cookie (from dashboard .env).
+	ocWorkspace := firstEnv("OPENCODE_WORKSPACE_ID", "ULTIPROXY_OPENCODE_WORKSPACE")
+	ocCookie := firstEnv("OPENCODE_SESSION_COOKIE", "ULTIPROXY_OPENCODE_COOKIE")
+	if ocWorkspace == "" {
+		ocWorkspace = envFile(filepath.Join(home, "ai-quota-dashboard", ".env"), "OPENCODE_WORKSPACE_ID")
+		ocCookie = envFile(filepath.Join(home, "ai-quota-dashboard", ".env"), "OPENCODE_SESSION_COOKIE")
+	}
+	if ocWorkspace != "" && ocCookie != "" {
+		if p, err := opencode.New(opencode.Config{WorkspaceID: ocWorkspace, SessionCookie: ocCookie}); err == nil {
+			add("opencode", p.Provider())
+		} else {
+			log.Printf("[providers] opencode: %v", err)
 		}
 	}
 
@@ -75,37 +201,68 @@ func registerProviders(registry *provider.Registry) {
 		}
 	}
 
-	// xAI Grok — static Bearer token (ULTIPROXY_XAI_TOKEN) or OAuth via auth manager.
-	if tok := os.Getenv("ULTIPROXY_XAI_TOKEN"); tok != "" {
-		p := xai.New(xai.Config{StaticToken: tok})
+	// xAI Grok — env or ~/.grok/auth.json (kept fresh by xgroxy daemon).
+	xaiTok := firstEnv("ULTIPROXY_XAI_TOKEN")
+	if xaiTok == "" {
+		xaiTok, _ = readNestedToken(filepath.Join(home, ".grok", "auth.json"))
+	}
+	if xaiTok != "" {
+		p := xai.New(xai.Config{StaticToken: xaiTok})
 		add("xai", p.ProviderBundle())
 	}
 
-	// Codex — static Bearer token (ULTIPROXY_CODEX_TOKEN).
-	if tok := os.Getenv("ULTIPROXY_CODEX_TOKEN"); tok != "" {
-		p := codex.New(codex.Config{StaticToken: tok})
+	// Codex — env or ~/.codex/auth.json tokens.access_token (kept fresh by the codex CLI).
+	codexTok := firstEnv("ULTIPROXY_CODEX_TOKEN")
+	if codexTok == "" {
+		codexTok, _ = readJSONField(filepath.Join(home, ".codex", "auth.json"), "tokens", "access_token")
+	}
+	if codexTok == "" {
+		codexTok, _ = readJSONField(filepath.Join(home, ".codex", "auth.json"), "access_token")
+	}
+	if codexTok != "" {
+		p := codex.New(codex.Config{StaticToken: codexTok})
 		add("codex", p.ProviderBundle())
 	}
 
-	// Antigravity — static Bearer token (ULTIPROXY_ANTIGRAVITY_TOKEN).
-	if tok := os.Getenv("ULTIPROXY_ANTIGRAVITY_TOKEN"); tok != "" {
-		p := antigravity.New(antigravity.Config{StaticToken: tok})
+	// Antigravity — env or ~/.cli-proxy-api/antigravity-*.json (cliproxy keeps fresh).
+	agTok := firstEnv("ULTIPROXY_ANTIGRAVITY_TOKEN")
+	agProject := firstEnv("ULTIPROXY_ANTIGRAVITY_PROJECT")
+	if agTok == "" || agProject == "" {
+		matches, _ := filepath.Glob(filepath.Join(home, ".cli-proxy-api", "antigravity-*.json"))
+		for _, m := range matches {
+			if tok, _ := readJSONField(m, "access_token"); tok != "" {
+				agTok = tok
+				if proj, _ := readJSONField(m, "project_id"); proj != "" {
+					agProject = proj
+				}
+				break
+			}
+		}
+	}
+	if agTok != "" {
+		p := antigravity.New(antigravity.Config{StaticToken: agTok, ProjectID: agProject})
 		add("antigravity", p.ProviderBundle())
 	}
 
-	// Copilot — static GitHub token (ULTIPROXY_COPILOT_TOKEN) or gh auth.
-	if tok := os.Getenv("ULTIPROXY_COPILOT_TOKEN"); tok != "" {
-		p := copilot.New(copilot.Config{Token: tok})
+	// Copilot — env, gh auth token, or gh CLI output.
+	copTok := firstEnv("ULTIPROXY_COPILOT_TOKEN", "COPILOT_GITHUB_TOKEN", "GH_TOKEN")
+	if copTok == "" {
+		if out, err := execGhAuthToken(); err == nil && out != "" {
+			copTok = out
+		}
+	}
+	if copTok != "" {
+		p := copilot.New(copilot.Config{Token: copTok})
 		add("copilot", p.ProviderBundle())
 	}
 
-	// Freebuff — static token + data dir for the account actor lock.
-	if tok := os.Getenv("ULTIPROXY_FREEBUFF_TOKEN"); tok != "" {
-		datadir := os.Getenv("ULTIPROXY_DATA_DIR")
-		if datadir == "" {
-			datadir = filepath.Join(home, ".local", "state", "ultiproxy")
-		}
-		if p, err := freebuff.New(freebuff.Config{Token: tok, DataDir: datadir}); err == nil {
+	// Freebuff — env or ~/workspace/freebuff-proxy/.env FREEBUFF_TOKEN.
+	fbTok := firstEnv("ULTIPROXY_FREEBUFF_TOKEN", "FREEBUFF_TOKEN")
+	if fbTok == "" {
+		fbTok = envFile(filepath.Join(home, "workspace", "freebuff-proxy", ".env"), "FREEBUFF_TOKEN")
+	}
+	if fbTok != "" {
+		if p, err := freebuff.New(freebuff.Config{Token: fbTok, DataDir: stateDir}); err == nil {
 			add("freebuff", p.Provider())
 		} else {
 			log.Printf("[providers] freebuff: %v", err)
