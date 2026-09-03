@@ -1,0 +1,26 @@
+{
+  "groups": [
+    {
+      "displayName": "Gemini Models",
+      "buckets": [
+        {
+          "bucketId": "gemini-2.5-pro",
+          "remainingFraction": 0.85,
+          "resetTime": "2026-09-03T18:00:00Z",
+          "window": "5h"
+        }
+      ]
+    },
+    {
+      "displayName": "Claude and GPT Models",
+      "buckets": [
+        {
+          "bucketId": "claude-3-7-sonnet",
+          "remainingFraction": 0.25,
+          "resetTime": "2026-09-04T00:00:00Z",
+          "window": "weekly"
+        }
+      ]
+    }
+  ]
+}

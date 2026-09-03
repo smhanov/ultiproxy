@@ -1,0 +1,8 @@
+data: {"id":"grok-stream-1","choices":[{"index":0,"delta":{"reasoning_content":"Thinking deeply about the answer...","content":"Answer begins"},"finish_reason":null}]}
+
+data: {"id":"grok-stream-1","choices":[{"index":0,"delta":{"content":" with clear logic."},"finish_reason":null}]}
+
+data: {"id":"grok-stream-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":25,"completion_tokens":12,"total_tokens":37}}
+
+data: [DONE]
+

@@ -1,0 +1,8 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"Thinking step 1: analyze requirement."}]}}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":" Thinking step 2: formulate answer."}]},"thoughtSignature":"sig_opaque_12345"}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Here is the solution to your request."}]}}]}
+
+data: {"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":15,"totalTokenCount":35}}
+
