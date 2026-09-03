@@ -1,13 +1,13 @@
 # Ultiproxy
 
-> Agent-First Universal LLM Subscription Proxy (:8317)
+> Agent-First Universal LLM Subscription Proxy (:9050)
 > Pooling GitHub Copilot, OpenAI Codex, Claude, Antigravity, Grok, DeepSeek, Z.ai, and local vLLM into a single quota-aware endpoint.
 
 Ultiproxy is an ultra-fast, local-first proxy daemon that multiplexes multiple upstream AI subscriptions into unified OpenAI and Anthropic compatible APIs. It provides automated quota-aware routing, per-API-key accounting, zero-marginal-cost pooling, and a native Model Context Protocol (MCP) server for autonomous agents.
 
 ## Key Capabilities
 
-- **Unified Surface**: Exposes `POST /v1/chat/completions` (OpenAI format) and `POST /v1/messages` (Anthropic format) on port `8317`.
+- **Unified Surface**: Exposes `POST /v1/chat/completions` (OpenAI format) and `POST /v1/messages` (Anthropic format) on port `9050`.
 - **Zero-Marginal-Cost Subscription Pooling**: Combines flat-fee developer subscriptions into a unified high-capacity gateway, bypassing per-token API billing.
 - **Quota-Aware Intelligent Routing**: Automatically inspects remaining request windows and resets across upstreams, redirecting traffic away from exhausted providers.
 - **Embedded MCP Server**: Streamable HTTP and SSE Model Context Protocol endpoints allow agents to introspect active models, check remaining quota, and toggle backends dynamically.
@@ -35,7 +35,7 @@ Complete OpenAPI 3.1 specification is available in `docs/openapi.yaml`.
   - `max_tokens` / `max_completion_tokens` (integer): Output limit
 - **Sample Request**:
 ```bash
-curl -s http://localhost:8317/v1/chat/completions \
+curl -s http://localhost:9050/v1/chat/completions \
   -H "Authorization: Bearer sk-up-local-agent-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -58,7 +58,7 @@ curl -s http://localhost:8317/v1/chat/completions \
   - `tools` (array): Anthropic tool definitions
 - **Sample Request**:
 ```bash
-curl -s http://localhost:8317/v1/messages \
+curl -s http://localhost:9050/v1/messages \
   -H "x-api-key: sk-up-local-agent-key" \
   -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
@@ -223,7 +223,7 @@ Ultiproxy reads configuration from `~/.config/ultiproxy/config.yaml`.
 
 ```yaml
 server:
-  listen: "127.0.0.1:8317"
+  listen: "127.0.0.1:9050"
   api_keys:
     - "sk-up-local-agent-key"
 
@@ -275,7 +275,7 @@ Add Ultiproxy to `~/.config/opencode/opencode.json`:
     "ultiproxy": {
       "name": "Ultiproxy Universal Gateway",
       "type": "openai",
-      "baseURL": "http://localhost:8317/v1",
+      "baseURL": "http://localhost:9050/v1",
       "apiKey": "sk-up-local-agent-key",
       "models": [
         "gpt-4o",
@@ -294,7 +294,7 @@ Configure Hermes custom provider in your agent's config YAML:
 ```yaml
 llm:
   provider: "custom"
-  base_url: "http://localhost:8317/v1"
+  base_url: "http://localhost:9050/v1"
   api_key: "sk-up-local-agent-key"
   model: "claude-3-5-sonnet"
   max_tokens: 8192
@@ -307,7 +307,7 @@ llm:
 Point Claude Code to the Anthropic compatibility endpoint using environment variables:
 
 ```bash
-export ANTHROPIC_BASE_URL="http://localhost:8317"
+export ANTHROPIC_BASE_URL="http://localhost:9050"
 export ANTHROPIC_AUTH_TOKEN="sk-up-local-agent-key"
 
 # Run Claude Code directly against pooled subscriptions
@@ -321,7 +321,7 @@ For any tool expecting OpenAI endpoints:
 import OpenAI from "openai";
 
 const client = new OpenAI({
-  baseURL: "http://localhost:8317/v1",
+  baseURL: "http://localhost:9050/v1",
   apiKey: "sk-up-local-agent-key",
 });
 
@@ -355,7 +355,7 @@ const response = await client.chat.completions.create({
 
 ## Security Model
 
-1. **Localhost Isolation**: By default, Ultiproxy binds strictly to `127.0.0.1:8317`.
+1. **Localhost Isolation**: By default, Ultiproxy binds strictly to `127.0.0.1:9050`.
 2. **Token Encapsulation**: Upstream subscription keys and OAuth refresh credentials remain inside `~/.config/ultiproxy/config.yaml` (chmod 600) and are never forwarded to downstream clients.
 3. **Bearer Token Validation**: Inbound agent and developer connections require a configured client API key (`sk-up-...`).
 4. **Per-Key Rate Limits**: Granular accounting prevents runaway agent loops from consuming pooled upstream quotas.

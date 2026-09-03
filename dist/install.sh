@@ -160,10 +160,10 @@ if [ ! -f "${CONFIG_FILE}" ]; then
   mkdir -p "${CONFIG_DIR}"
   cat <<'CONFIG_EOF' > "${CONFIG_FILE}"
 # Ultiproxy Configuration
-# Universal LLM Subscription Proxy (:8317)
+# Universal LLM Subscription Proxy (:9050)
 
 server:
-  listen: "127.0.0.1:8317"
+  listen: "127.0.0.1:9050"
   # Client bearer tokens accepted by Ultiproxy
   api_keys:
     - "sk-up-local-agent-key"
@@ -259,7 +259,7 @@ else
 fi
 echo ""
 echo "3. Verify health & endpoints:"
-echo "   curl http://localhost:8317/healthz"
-echo "   curl http://localhost:8317/v1/models -H 'Authorization: Bearer sk-up-local-agent-key'"
-echo "   curl http://localhost:8317/api/quota"
+echo "   curl http://localhost:9050/healthz"
+echo "   curl http://localhost:9050/v1/models -H 'Authorization: Bearer sk-up-local-agent-key'"
+echo "   curl http://localhost:9050/api/quota"
 echo ""

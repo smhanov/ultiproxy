@@ -1,14 +1,27 @@
-# Ultiproxy Configuration Example
+# Ultiproxy Production Configuration
+# NOTE: no api_key / client_keys configured = OPEN ACCESS (anyone on the
+# network can use the models). Set api_key to require a single bearer key,
+# or client_keys for per-agent accounting.
 server:
-  addr: "127.0.0.1:8317"
-  api_key: "admin-secret-key"
-  client_keys:
-    cursor: "sk-cursor-secret"
-    codex: "sk-codex-secret"
-    claude-code: "sk-claude-code-secret"
+  addr: "127.0.0.1:9050"
+  # api_key: ""            # unset -> no auth required
+  # client_keys:           # per-agent keys for accounting
+  #   hermes: "sk-up-hermes"
+  #   opencode: "sk-up-opencode"
+  #   claude-code: "sk-ant-cc"
   llms_txt_path: "llms.txt"
+  # Model aliases: client-visible name -> provider lane + upstream id.
+  models:
+    zai-flash:
+      provider: zai
+      upstream: glm-5.3-flash
+      context_limit: 1000000
+      max_output: 131072
+      pricing_tag: subscription_zero_marginal
+      benchmarks:
+        swe_bench: 0.68
 
 storage:
-  db_path: "ultiproxy.db"
+  db_path: "/home/smhanov/.local/state/ultiproxy/ultiproxy.db"
 
-data_dir: "."
+data_dir: "/home/smhanov/.local/state/ultiproxy"

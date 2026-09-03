@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License">
   <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.23-00ADD8.svg?logo=go" alt="Go 1.23"></a>
   <a href="#contributing"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
-  <img src="https://img.shields.io/badge/Port-:8317-22d3ee.svg" alt="Port 8317">
+  <img src="https://img.shields.io/badge/Port-:9050-22d3ee.svg" alt="Port 9050">
   <img src="https://img.shields.io/badge/MCP-Native-e879f9.svg" alt="MCP Native">
   <img src="https://img.shields.io/badge/Architecture-Linux%20%7C%20macOS-a3e635.svg" alt="Linux and macOS">
 </p>
@@ -19,7 +19,7 @@
 
 Yet every time you spin up an autonomous coding agent—[OpenCode](https://opencode.ai), [Hermes](https://hermes-agent.dev), [Claude Code](https://github.com/anthropics/claude-code), [Cursor](https://cursor.com), or [Aider](https://aider.chat)—you are forced to supply raw, pay-as-you-go API keys that burn money per token. Meanwhile, your monthly subscriptions sit idle 85% of the day.
 
-**The solution:** **Ultiproxy** pools all your subscriptions into **ONE local endpoint at `:8317`** that natively speaks both OpenAI (`POST /v1/chat/completions`) and Anthropic (`POST /v1/messages`).
+**The solution:** **Ultiproxy** pools all your subscriptions into **ONE local endpoint at `:9050`** that natively speaks both OpenAI (`POST /v1/chat/completions`) and Anthropic (`POST /v1/messages`).
 
 - **Zero-Marginal-Cost Pooling**: Run agents 24/7 on your flat subscriptions. Stop paying per-token API bills for workloads you've already paid for.
 - **Quota-Aware Intelligent Routing**: When Copilot exhausts its 5-hour rate window, Ultiproxy instantly cascades traffic to Google Antigravity, Codex, or DeepSeek without dropping agent context.
@@ -48,7 +48,7 @@ Edit `~/.config/ultiproxy/config.yaml`:
 
 ```yaml
 server:
-  listen: "127.0.0.1:8317"
+  listen: "127.0.0.1:9050"
   api_keys: ["sk-up-local-agent-key"]
 routing:
   strategy: "quota-priority"
@@ -73,7 +73,7 @@ ultiproxy serve
 
 Verify connectivity:
 ```bash
-curl http://localhost:8317/healthz
+curl http://localhost:9050/healthz
 ```
 
 ---
@@ -92,7 +92,7 @@ Add to `~/.config/opencode/opencode.json`:
     "ultiproxy": {
       "name": "Ultiproxy Universal Gateway",
       "type": "openai",
-      "baseURL": "http://localhost:8317/v1",
+      "baseURL": "http://localhost:9050/v1",
       "apiKey": "sk-up-local-agent-key",
       "models": [
         "gpt-4o",
@@ -111,7 +111,7 @@ Add to your Hermes agent YAML configuration:
 ```yaml
 llm:
   provider: "custom"
-  base_url: "http://localhost:8317/v1"
+  base_url: "http://localhost:9050/v1"
   api_key: "sk-up-local-agent-key"
   model: "claude-3-5-sonnet"
   max_tokens: 8192
@@ -123,7 +123,7 @@ llm:
 Run Claude Code against your pooled subscriptions using the native Anthropic endpoint:
 
 ```bash
-export ANTHROPIC_BASE_URL="http://localhost:8317"
+export ANTHROPIC_BASE_URL="http://localhost:9050"
 export ANTHROPIC_AUTH_TOKEN="sk-up-local-agent-key"
 
 # Launch Claude Code
@@ -134,14 +134,14 @@ claude
 
 In Cursor or standard OpenAI SDKs:
 
-- **Base URL**: `http://localhost:8317/v1`
+- **Base URL**: `http://localhost:9050/v1`
 - **API Key**: `sk-up-local-agent-key`
 
 ```typescript
 import OpenAI from "openai";
 
 const openai = new OpenAI({
-  baseURL: "http://localhost:8317/v1",
+  baseURL: "http://localhost:9050/v1",
   apiKey: "sk-up-local-agent-key",
 });
 
@@ -193,7 +193,7 @@ Configure MCP in Claude Desktop or your agent's MCP config:
 {
   "mcpServers": {
     "ultiproxy": {
-      "url": "http://localhost:8317/mcp",
+      "url": "http://localhost:9050/mcp",
       "headers": {
         "Authorization": "Bearer sk-up-local-agent-key"
       }

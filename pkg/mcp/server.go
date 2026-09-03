@@ -16,6 +16,7 @@ type Server struct {
 	registry    *provider.Registry
 	stateSource StateSource
 	usageSource UsageSource
+	aliases     AliasManager
 	name        string
 	version     string
 	mu          sync.RWMutex
@@ -28,6 +29,13 @@ type Option func(*Server)
 func WithUsageSource(u UsageSource) Option {
 	return func(s *Server) {
 		s.usageSource = u
+	}
+}
+
+// WithAliasManager configures the model alias catalog.
+func WithAliasManager(am AliasManager) Option {
+	return func(s *Server) {
+		s.aliases = am
 	}
 }
 

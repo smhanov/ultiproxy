@@ -23,7 +23,7 @@ func parseCLIArgs(rawArgs []string) CLIConfig {
 		Key: os.Getenv("ULTIPROXY_KEY"),
 	}
 	if cfg.URL == "" {
-		cfg.URL = "http://127.0.0.1:8317"
+		cfg.URL = "http://127.0.0.1:9050"
 	}
 
 	for i := 0; i < len(rawArgs); i++ {
@@ -94,7 +94,7 @@ Commands:
   login <provider>   Initiate OAuth login flow for a provider (POST /mcp)
 
 Flags:
-  --url URL          Ultiproxy URL (default: $ULTIPROXY_URL or http://127.0.0.1:8317)
+  --url URL          Ultiproxy URL (default: $ULTIPROXY_URL or http://127.0.0.1:9050)
   --key KEY          API key for authentication (default: $ULTIPROXY_KEY)`)
 }
 

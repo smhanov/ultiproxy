@@ -196,12 +196,22 @@ func (s *Server) dispatchRequest(
 		}
 
 		opts := append(options, provider.WithClientKeyHash(clientKeyHash))
-		// Strip the "<provider>/" prefix from the model identifier before it
-		// reaches upstream. Route() resolves the provider from the prefixed
-		// name, but upstream APIs only know the suffix (e.g. "zai/glm-5.3-flash"
-		// must become "glm-5.3-flash" for Z.ai). Last-apply wins, so this
-		// overrides the codec's WithModel(full-prefixed-name).
-		opts = append(opts, provider.WithModel(stripProviderPrefix(model, provName)))
+		// Resolve the upstream model id: model aliases map to explicit
+		// upstream names (e.g. "qwenpoint-3.8" -> "Qwen/Qwen3.8-Instruct-AWQ");
+		// otherwise strip a "<provider>/" prefix for prefixed names (e.g.
+		// "zai/glm-5.3-flash" -> "glm-5.3-flash"). Mostly the provider
+		// forwards the requested identifier verbatim. Last-apply wins, so this
+		// overrides the codec's WithModel().
+		upstream := ""
+		if s.catalog != nil {
+			if u, ok := s.catalog.UpstreamName(model); ok {
+				upstream = u
+			}
+		}
+		if upstream == "" {
+			upstream = stripProviderPrefix(model, provName)
+		}
+		opts = append(opts, provider.WithModel(upstream))
 
 		if stream {
 			streamChan, syncErr := prov.Inference.Stream(r.Context(), messages, opts...)

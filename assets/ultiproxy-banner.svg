@@ -113,7 +113,7 @@
       <rect x="0" y="0" width="370" height="28" rx="14" fill="#0f172a" stroke="#22d3ee" stroke-width="1.2" stroke-opacity="0.6" />
       <circle cx="14" cy="14" r="4" fill="#a3e635" filter="url(#glow-subtle)" />
       <text x="28" y="18" class="mono" font-size="11" font-weight="600" fill="#22d3ee" letter-spacing="1.5">v1.0 // AGENT-FIRST UNIVERSAL PROXY</text>
-      <text x="312" y="18" class="mono" font-size="11" font-weight="700" fill="#a3e635">:8317</text>
+      <text x="312" y="18" class="mono" font-size="11" font-weight="700" fill="#a3e635">:9050</text>
     </g>
 
     <!-- Main Title -->
@@ -291,7 +291,7 @@
       <circle cx="0" cy="0" r="4" fill="#a3e635" filter="url(#glow-subtle)" />
     </g>
     <text x="0" y="16" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#ffffff" letter-spacing="2">GATEWAY</text>
-    <text x="0" y="29" text-anchor="middle" class="mono" font-size="9" font-weight="700" fill="#22d3ee" letter-spacing="1.2">:8317</text>
+    <text x="0" y="29" text-anchor="middle" class="mono" font-size="9" font-weight="700" fill="#22d3ee" letter-spacing="1.2">:9050</text>
   </g>
 
   <!-- Top / Bottom Cyber Borders -->

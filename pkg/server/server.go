@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"github.com/smhanov/ultiproxy/pkg/mcp"
 	"github.com/smhanov/ultiproxy/pkg/provider"
@@ -20,6 +22,7 @@ type Server struct {
 	writer     *storage.Writer
 	mcpServer  *mcp.Server
 	auth       *AuthMiddleware
+	catalog    *ModelCatalog
 	httpServer *http.Server
 	mux        *http.ServeMux
 }
@@ -75,13 +78,29 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		s.router = NewRegistryRouter(registry, s.sm)
 	}
 
+	// Model alias catalog (config + runtime-persisted aliases). Must exist
+	// before the MCP server is built (the bridge references it).
+	catalog, catalogErr := NewModelCatalog(cfg.Server.Models, filepath.Join(cfg.DataDir, "aliases.json"))
+	if catalogErr != nil {
+		log.Printf("[server] model catalog error (continuing with config only): %v", catalogErr)
+		cfg.Server.Models = nil
+		catalog, _ = NewModelCatalog(cfg.Server.Models, "")
+	}
+	s.catalog = catalog
+
+	// Register aliases into the state manager so the router and /v1/models
+	// resolve them without touching the catalog on every request.
+	if s.sm != nil {
+		s.syncCatalogToState()
+	}
+
 	// Create MCP server if not provided
 	if s.mcpServer == nil {
 		var stateSrc mcp.StateSource
 		if s.sm != nil {
 			stateSrc = &stateManagerSourceAdapter{sm: s.sm}
 		}
-		s.mcpServer = mcp.NewServer(registry, stateSrc)
+		s.mcpServer = mcp.NewServer(registry, stateSrc, mcp.WithAliasManager(&catalogBridge{catalog: s.catalog, server: s}))
 	}
 
 	// Auth middleware
@@ -193,5 +212,77 @@ func (a *stateManagerSourceAdapter) ToggleModel(modelID string, enabled bool) er
 		m.Enabled = enabled
 		snap.Models[modelID] = m
 	})
+	return nil
+}
+
+// syncCatalogToState copies every alias from the catalog into the state
+// manager's Models map so routing and /v1/models resolve them.
+func (s *Server) syncCatalogToState() {
+	if s.sm == nil {
+		return
+	}
+	aliases := s.catalog.List()
+	s.sm.Update(func(snap *state.RuntimeSnapshot) {
+		if snap.Models == nil {
+			snap.Models = make(map[string]state.ModelRuntime)
+		}
+		for alias, entry := range aliases {
+			snap.Models[alias] = state.ModelRuntime{
+				ID:              alias,
+				Provider:        entry.Provider,
+				Enabled:         true,
+				ContextLimit:    entry.ContextLimit,
+				MaxOutput:       entry.MaxOutput,
+				PricingTag:      entry.PricingTag,
+				BenchmarkScores: entry.BenchmarkScores,
+			}
+		}
+	})
+}
+
+// catalogBridge adapts server.ModelCatalog to the mcp.AliasManager interface
+// and re-syncs the state manager after runtime mutations.
+type catalogBridge struct {
+	catalog *ModelCatalog
+	server  *Server
+}
+
+func (b *catalogBridge) List() map[string]mcp.ModelAlias {
+	out := make(map[string]mcp.ModelAlias)
+	for alias, entry := range b.catalog.List() {
+		out[alias] = mcp.ModelAlias{
+			Provider:        entry.Provider,
+			Upstream:        entry.Upstream,
+			ContextLimit:    entry.ContextLimit,
+			MaxOutput:       entry.MaxOutput,
+			PricingTag:      entry.PricingTag,
+			BenchmarkScores: entry.BenchmarkScores,
+		}
+	}
+	return out
+}
+
+func (b *catalogBridge) Sorted() []string { return b.catalog.Sorted() }
+
+func (b *catalogBridge) Set(alias string, entry mcp.ModelAlias) error {
+	if err := b.catalog.Set(alias, ModelAlias{
+		Provider:        entry.Provider,
+		Upstream:        entry.Upstream,
+		ContextLimit:    entry.ContextLimit,
+		MaxOutput:       entry.MaxOutput,
+		PricingTag:      entry.PricingTag,
+		BenchmarkScores: entry.BenchmarkScores,
+	}); err != nil {
+		return err
+	}
+	b.server.syncCatalogToState()
+	return nil
+}
+
+func (b *catalogBridge) Remove(alias string) error {
+	if err := b.catalog.Remove(alias); err != nil {
+		return err
+	}
+	b.server.syncCatalogToState()
 	return nil
 }

@@ -184,7 +184,7 @@ func TestServer_FailoverNeverAfterFirstByte(t *testing.T) {
 func TestServer_Auth401Paths(t *testing.T) {
 	cfg := &Config{
 		Server: ServerConfig{
-			Addr:   "127.0.0.1:8317",
+			Addr:   "127.0.0.1:9050",
 			APIKey: "admin-secret-key-123",
 			ClientKeys: map[string]string{
 				"client-alpha": "alpha-secret-456",

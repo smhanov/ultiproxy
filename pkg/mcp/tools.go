@@ -62,6 +62,38 @@ var standardTools = []Tool{
 			Required: []string{"provider"},
 		},
 	},
+	{
+		Name:        "list_model_aliases",
+		Description: "List all model aliases (client-visible name -> provider lane + upstream id)",
+		InputSchema: &InputSchema{Type: "object", Properties: map[string]PropertyDef{}},
+	},
+	{
+		Name:        "set_model_alias",
+		Description: "Set a model alias mapping a client-visible name to a provider lane and upstream model id. Persists across restarts.",
+		InputSchema: &InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"alias":         {Type: "string", Description: "Client-visible model name, e.g. qwenpoint-3.8"},
+				"provider":      {Type: "string", Description: "Provider lane name, e.g. vllm, zai"},
+				"upstream":      {Type: "string", Description: "Upstream model id, e.g. Qwen/Qwen3.8-Instruct-AWQ"},
+				"context_limit": {Type: "number", Description: "Optional context window size"},
+				"max_output":    {Type: "number", Description: "Optional max output tokens"},
+				"pricing_tag":   {Type: "string", Description: "Optional pricing label"},
+			},
+			Required: []string{"alias", "provider", "upstream"},
+		},
+	},
+	{
+		Name:        "remove_model_alias",
+		Description: "Remove a model alias mapping",
+		InputSchema: &InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"alias": {Type: "string", Description: "Alias to remove"},
+			},
+			Required: []string{"alias"},
+		},
+	},
 }
 
 func (s *Server) handleListTools() any {
@@ -90,6 +122,12 @@ func (s *Server) handleCallTool(ctx context.Context, rawParams json.RawMessage) 
 		return s.toolGetClientUsage(ctx, params.Arguments)
 	case "initiate_oauth_login":
 		return s.toolInitiateOAuthLogin(ctx, params.Arguments)
+	case "list_model_aliases":
+		return s.toolListModelAliases(ctx)
+	case "set_model_alias":
+		return s.toolSetModelAlias(ctx, params.Arguments)
+	case "remove_model_alias":
+		return s.toolRemoveModelAlias(ctx, params.Arguments)
 	default:
 		return nil, &JSONRPCError{
 			Code:    CodeMethodNotFound,
@@ -292,3 +330,99 @@ func (s *Server) toolInitiateOAuthLogin(ctx context.Context, argsRaw json.RawMes
 
 // Ensure unused import compiles cleanly
 var _ = provider.ErrProviderNotFound
+
+func (s *Server) toolListModelAliases(ctx context.Context) (*CallToolResult, *JSONRPCError) {
+	if s.aliases == nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: model alias manager not configured"}},
+			IsError: true,
+		}, nil
+	}
+	aliases := s.aliases.List()
+	if aliases == nil {
+		aliases = map[string]ModelAlias{}
+	}
+	b, _ := json.MarshalIndent(aliases, "", "  ")
+	return &CallToolResult{
+		Content: []ToolContent{{Type: "text", Text: string(b)}},
+	}, nil
+}
+
+func (s *Server) toolSetModelAlias(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {
+	if s.aliases == nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: model alias manager not configured"}},
+			IsError: true,
+		}, nil
+	}
+	var args struct {
+		Alias        string             `json:"alias"`
+		Provider     string             `json:"provider"`
+		Upstream     string             `json:"upstream"`
+		ContextLimit int                `json:"context_limit"`
+		MaxOutput    int                `json:"max_output"`
+		PricingTag   string             `json:"pricing_tag"`
+		Benchmarks   map[string]float64 `json:"benchmarks"`
+	}
+	if err := json.Unmarshal(argsRaw, &args); err != nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: %v", err)}},
+			IsError: true,
+		}, nil
+	}
+	entry := ModelAlias{
+		Provider:        args.Provider,
+		Upstream:        args.Upstream,
+		ContextLimit:    args.ContextLimit,
+		MaxOutput:       args.MaxOutput,
+		PricingTag:      args.PricingTag,
+		BenchmarkScores: args.Benchmarks,
+	}
+	if args.Alias == "" || entry.Provider == "" || entry.Upstream == "" {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: alias, provider and upstream are required"}},
+			IsError: true,
+		}, nil
+	}
+	if err := s.aliases.Set(args.Alias, entry); err != nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: %v", err)}},
+			IsError: true,
+		}, nil
+	}
+	res := map[string]any{"ok": true, "alias": args.Alias, "entry": entry}
+	b, _ := json.MarshalIndent(res, "", "  ")
+	return &CallToolResult{
+		Content: []ToolContent{{Type: "text", Text: string(b)}},
+	}, nil
+}
+
+func (s *Server) toolRemoveModelAlias(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {
+	if s.aliases == nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: model alias manager not configured"}},
+			IsError: true,
+		}, nil
+	}
+	var args struct {
+		Alias string `json:"alias"`
+	}
+	_ = json.Unmarshal(argsRaw, &args)
+	if args.Alias == "" {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: alias argument is required"}},
+			IsError: true,
+		}, nil
+	}
+	if err := s.aliases.Remove(args.Alias); err != nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: %v", err)}},
+			IsError: true,
+		}, nil
+	}
+	res := map[string]any{"ok": true, "removed": args.Alias}
+	b, _ := json.MarshalIndent(res, "", "  ")
+	return &CallToolResult{
+		Content: []ToolContent{{Type: "text", Text: string(b)}},
+	}, nil
+}

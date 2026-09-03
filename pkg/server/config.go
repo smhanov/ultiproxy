@@ -20,6 +20,8 @@ type ServerConfig struct {
 	APIKey      string            `yaml:"api_key"`
 	ClientKeys  map[string]string `yaml:"client_keys"`
 	LLMsTxtPath string            `yaml:"llms_txt_path"`
+	// Models maps client-visible aliases to provider lanes + upstream ids.
+	Models map[string]ModelAlias `yaml:"models"`
 }
 
 // StorageConfig contains SQLite database configuration.
@@ -29,17 +31,19 @@ type StorageConfig struct {
 
 // DefaultConfig returns reasonable defaults.
 func DefaultConfig() *Config {
-	return &Config{
+	cfg := &Config{
 		Server: ServerConfig{
-			Addr:        "127.0.0.1:8317",
+			Addr:        "127.0.0.1:9050",
 			ClientKeys:  make(map[string]string),
 			LLMsTxtPath: "llms.txt",
+			Models:      make(map[string]ModelAlias),
 		},
 		Storage: StorageConfig{
 			DBPath: "ultiproxy.db",
 		},
 		DataDir: ".",
 	}
+	return cfg
 }
 
 // LoadConfig loads configuration from a YAML file. If path is empty, DefaultConfig is returned.
@@ -59,7 +63,7 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	if cfg.Server.Addr == "" {
-		cfg.Server.Addr = "127.0.0.1:8317"
+		cfg.Server.Addr = "127.0.0.1:9050"
 	}
 	if cfg.Storage.DBPath == "" {
 		cfg.Storage.DBPath = "ultiproxy.db"
