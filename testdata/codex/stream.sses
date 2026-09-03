@@ -1,0 +1,10 @@
+data: {"id":"codex-1","choices":[{"delta":{"role":"assistant","content":""}}]}
+
+data: {"id":"codex-1","choices":[{"delta":{"content":"Code generation "}}]}
+
+data: {"id":"codex-1","choices":[{"delta":{"content":"complete."}}]}
+
+data: {"id":"codex-1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":14,"completion_tokens":4,"total_tokens":18}}
+
+data: [DONE]
+

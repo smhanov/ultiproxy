@@ -1,0 +1,31 @@
+{
+  "copilot_plan": "individual",
+  "access_type_sku": "yearly_subscriber_quota",
+  "quota_reset_date": "2026-09-01",
+  "quota_reset_date_utc": "2026-09-01T00:00:00.000Z",
+  "quota_snapshots": {
+    "chat": {
+      "unlimited": true,
+      "percent_remaining": 100.0,
+      "has_quota": true,
+      "remaining": 0,
+      "entitlement": 0,
+      "credits_used": 0
+    },
+    "completions": {
+      "unlimited": true,
+      "percent_remaining": 100.0,
+      "has_quota": true
+    },
+    "premium_interactions": {
+      "unlimited": false,
+      "percent_remaining": 93.3,
+      "has_quota": true,
+      "overage_count": 0,
+      "overage_permitted": false,
+      "credits_used": 20,
+      "entitlement": 300,
+      "remaining": 280
+    }
+  }
+}
