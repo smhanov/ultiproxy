@@ -39,6 +39,7 @@ type AgentRun struct {
 
 type streamJob struct {
 	ctx    context.Context
+	req    *http.Request
 	body   io.Reader
 	respCh chan streamResult
 }
@@ -62,6 +63,13 @@ func WithBaseURL(url string) Option {
 func WithQueueCapacity(cap int) Option {
 	return func(a *FreebuffAccountActor) {
 		a.queueCap = cap
+	}
+}
+
+// WithInstanceID sets the initial instance ID.
+func WithInstanceID(id string) Option {
+	return func(a *FreebuffAccountActor) {
+		a.instanceID = id
 	}
 }
 
@@ -124,6 +132,34 @@ func NewFreebuffAccountActor(lockPath string, httpClient *http.Client, token str
 	go actor.workerLoop()
 
 	return actor, nil
+}
+
+// BaseURL returns current baseURL.
+func (a *FreebuffAccountActor) BaseURL() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.baseURL
+}
+
+// Token returns current token.
+func (a *FreebuffAccountActor) Token() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.token
+}
+
+// HTTPClient returns current http.Client.
+func (a *FreebuffAccountActor) HTTPClient() *http.Client {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.httpClient
+}
+
+// SetInstanceID updates instance ID.
+func (a *FreebuffAccountActor) SetInstanceID(id string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.instanceID = id
 }
 
 // TryAcquire attempts to acquire the advisory lock non-blockingly.
@@ -226,11 +262,20 @@ func (a *FreebuffAccountActor) Reconcile(ctxs ...context.Context) error {
 	if err != nil {
 		return err
 	}
-	if a.token != "" {
-		req.Header.Set("Authorization", "Bearer "+a.token)
+	a.mu.Lock()
+	tok := a.token
+	instID := a.instanceID
+	client := a.httpClient
+	a.mu.Unlock()
+
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	if instID != "" {
+		req.Header.Set("x-freebuff-instance-id", instID)
 	}
 
-	resp, err := a.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -277,6 +322,8 @@ func (a *FreebuffAccountActor) Bind(ctxOrModel any, optionalModel ...string) err
 
 	a.mu.Lock()
 	instID := a.instanceID
+	tok := a.token
+	client := a.httpClient
 	a.mu.Unlock()
 
 	payload, err := json.Marshal(map[string]string{
@@ -292,11 +339,14 @@ func (a *FreebuffAccountActor) Bind(ctxOrModel any, optionalModel ...string) err
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if a.token != "" {
-		req.Header.Set("Authorization", "Bearer "+a.token)
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	if instID != "" {
+		req.Header.Set("x-freebuff-instance-id", instID)
 	}
 
-	resp, err := a.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -336,11 +386,20 @@ func (a *FreebuffAccountActor) DeleteSession(ctxs ...context.Context) error {
 	if err != nil {
 		return err
 	}
-	if a.token != "" {
-		req.Header.Set("Authorization", "Bearer "+a.token)
+	a.mu.Lock()
+	tok := a.token
+	instID := a.instanceID
+	client := a.httpClient
+	a.mu.Unlock()
+
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	if instID != "" {
+		req.Header.Set("x-freebuff-instance-id", instID)
 	}
 
-	resp, err := a.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -380,9 +439,13 @@ func (a *FreebuffAccountActor) StartRun(ctxOrAgentID any, optionalAgentID ...str
 	a.mu.Lock()
 	instID := a.instanceID
 	model := a.boundModel
+	tok := a.token
+	client := a.httpClient
 	a.mu.Unlock()
 
 	payload, err := json.Marshal(map[string]string{
+		"action":      "START",
+		"agentId":     agentID,
 		"agent_id":    agentID,
 		"instance_id": instID,
 		"model":       model,
@@ -396,11 +459,14 @@ func (a *FreebuffAccountActor) StartRun(ctxOrAgentID any, optionalAgentID ...str
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if a.token != "" {
-		req.Header.Set("Authorization", "Bearer "+a.token)
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	if instID != "" {
+		req.Header.Set("x-freebuff-instance-id", instID)
 	}
 
-	resp, err := a.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -420,6 +486,117 @@ func (a *FreebuffAccountActor) StartRun(ctxOrAgentID any, optionalAgentID ...str
 	a.mu.Unlock()
 
 	return &run, nil
+}
+
+// FetchUsage calls POST /usage with fingerprintId via the actor.
+func (a *FreebuffAccountActor) FetchUsage(ctx context.Context, fingerprintID string) ([]byte, error) {
+	if fingerprintID == "" {
+		fingerprintID = "cli-usage"
+	}
+	payload, err := json.Marshal(map[string]string{
+		"fingerprintId": fingerprintID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/usage", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	a.mu.Lock()
+	tok := a.token
+	instID := a.instanceID
+	client := a.httpClient
+	a.mu.Unlock()
+
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	if instID != "" {
+		req.Header.Set("x-freebuff-instance-id", instID)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("failed to fetch usage, status: %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+// GetSession retrieves current session via GET /freebuff/session through actor.
+func (a *FreebuffAccountActor) GetSession(ctx context.Context) (*Session, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.baseURL+"/freebuff/session", nil)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	tok := a.token
+	instID := a.instanceID
+	client := a.httpClient
+	a.mu.Unlock()
+
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	if instID != "" {
+		req.Header.Set("x-freebuff-instance-id", instID)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("failed to get session, status: %d", resp.StatusCode)
+	}
+
+	var sess Session
+	if err := json.NewDecoder(resp.Body).Decode(&sess); err != nil {
+		return nil, err
+	}
+
+	return &sess, nil
+}
+
+// DoStream enqueues an arbitrary streaming HTTP request through the actor's FIFO queue.
+func (a *FreebuffAccountActor) DoStream(ctx context.Context, req *http.Request) (io.ReadCloser, error) {
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return nil, ErrClosed
+	}
+	a.mu.Unlock()
+
+	respCh := make(chan streamResult, 1)
+	job := streamJob{
+		ctx:    ctx,
+		req:    req,
+		respCh: respCh,
+	}
+
+	select {
+	case a.queue <- job:
+	default:
+		return nil, ErrQueueFull
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-respCh:
+		return res.body, res.err
+	case <-a.stopCh:
+		return nil, ErrClosed
+	}
 }
 
 // Stream serializes request bodies through the FIFO bounded queue.
@@ -507,13 +684,19 @@ func (a *FreebuffAccountActor) processStreamJob(job streamJob) {
 		return
 	}
 
-	req, err := http.NewRequestWithContext(job.ctx, http.MethodPost, a.baseURL+"/agent-runs/stream", job.body)
-	if err != nil {
-		job.respCh <- streamResult{err: err}
-		return
-	}
-	if a.token != "" {
-		req.Header.Set("Authorization", "Bearer "+a.token)
+	var req *http.Request
+	if job.req != nil {
+		req = job.req.WithContext(job.ctx)
+	} else {
+		var err error
+		req, err = http.NewRequestWithContext(job.ctx, http.MethodPost, a.baseURL+"/agent-runs/stream", job.body)
+		if err != nil {
+			job.respCh <- streamResult{err: err}
+			return
+		}
+		if a.token != "" {
+			req.Header.Set("Authorization", "Bearer "+a.token)
+		}
 	}
 
 	resp, err := a.httpClient.Do(req)

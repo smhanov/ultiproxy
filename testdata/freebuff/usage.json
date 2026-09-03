@@ -1,0 +1,9 @@
+{
+  "dayUsed": 25,
+  "dayLimit": 100,
+  "weekUsed": 150,
+  "weekLimit": 500,
+  "monthUsed": 450,
+  "monthLimit": 2000,
+  "resetAt": "2026-09-04T00:00:00Z"
+}

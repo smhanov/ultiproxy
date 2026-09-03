@@ -1,0 +1,24 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "limits": [
+      {
+        "type": "5-hour",
+        "unit": "credits",
+        "used": 35.0,
+        "limit": 100.0,
+        "remaining": 65.0,
+        "reset_at": "2026-09-03T18:00:00Z"
+      },
+      {
+        "type": "Weekly",
+        "unit": "credits",
+        "used": 240.0,
+        "limit": 1000.0,
+        "remaining": 760.0,
+        "reset_at": "2026-09-10T00:00:00Z"
+      }
+    ]
+  }
+}

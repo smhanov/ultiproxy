@@ -1,0 +1,34 @@
+[
+  {
+    "role": "user",
+    "blocks": [
+      {
+        "block_kind": "text",
+        "text": "What is the square root of 144?"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "blocks": [
+      {
+        "block_kind": "reasoning",
+        "reasoning_kind": "text",
+        "text": "The user is asking for sqrt(144). 12 * 12 = 144."
+      },
+      {
+        "block_kind": "text",
+        "text": "12"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "blocks": [
+      {
+        "block_kind": "text",
+        "text": "And multiplied by 2?"
+      }
+    ]
+  }
+]
