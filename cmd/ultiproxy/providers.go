@@ -176,15 +176,36 @@ func registerProviders(registry *provider.Registry) {
 		}
 	}
 
-	// OpenCode Go — workspace id + session cookie (from dashboard .env).
+	// OpenCode Go — workspace id + session cookie (from dashboard .env) + API key (from opencode.json).
+	ocKey := firstEnv("OPENCODE_API_KEY", "ULTIPROXY_OPENCODE_API_KEY")
+	if ocKey == "" {
+		if k, ok := readNestedToken(filepath.Join(home, ".config", "opencode", "opencode.json"), "provider", "opencode-go", "options", "apiKey"); ok {
+			ocKey = k
+		}
+	}
+	if ocKey == "" {
+		// check old backup files if opencode.json was overwritten
+		matches, _ := filepath.Glob(filepath.Join(home, ".config", "opencode", "opencode.json.bak-*"))
+		for _, m := range matches {
+			if k, ok := readNestedToken(m, "provider", "opencode-go", "options", "apiKey"); ok && k != "" {
+				ocKey = k
+				break
+			}
+		}
+	}
+
 	ocWorkspace := firstEnv("OPENCODE_WORKSPACE_ID", "ULTIPROXY_OPENCODE_WORKSPACE")
 	ocCookie := firstEnv("OPENCODE_SESSION_COOKIE", "ULTIPROXY_OPENCODE_COOKIE")
 	if ocWorkspace == "" {
 		ocWorkspace = envFile(filepath.Join(home, "ai-quota-dashboard", ".env"), "OPENCODE_WORKSPACE_ID")
 		ocCookie = envFile(filepath.Join(home, "ai-quota-dashboard", ".env"), "OPENCODE_SESSION_COOKIE")
 	}
-	if ocWorkspace != "" && ocCookie != "" {
-		if p, err := opencode.New(opencode.Config{WorkspaceID: ocWorkspace, SessionCookie: ocCookie}); err == nil {
+	if ocKey != "" || (ocWorkspace != "" && ocCookie != "") {
+		if p, err := opencode.New(opencode.Config{
+			APIKey:        ocKey,
+			WorkspaceID:   ocWorkspace,
+			SessionCookie: ocCookie,
+		}); err == nil {
 			add("opencode", p.Provider())
 		} else {
 			log.Printf("[providers] opencode: %v", err)
