@@ -1,0 +1,302 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" width="1600" height="400">
+  <defs>
+    <!-- Gradients -->
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#060911" />
+      <stop offset="50%" stop-color="#0a0e17" />
+      <stop offset="100%" stop-color="#0d1527" />
+    </linearGradient>
+
+    <linearGradient id="text-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="40%" stop-color="#22d3ee" />
+      <stop offset="85%" stop-color="#e879f9" />
+      <stop offset="100%" stop-color="#a3e635" />
+    </linearGradient>
+
+    <linearGradient id="line-cyan-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.8" />
+      <stop offset="100%" stop-color="#22d3ee" stop-opacity="0.1" />
+    </linearGradient>
+
+    <linearGradient id="line-magenta-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e879f9" stop-opacity="0.8" />
+      <stop offset="100%" stop-color="#e879f9" stop-opacity="0.1" />
+    </linearGradient>
+
+    <linearGradient id="line-lime-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#a3e635" stop-opacity="0.8" />
+      <stop offset="100%" stop-color="#a3e635" stop-opacity="0.1" />
+    </linearGradient>
+
+    <radialGradient id="ambient-cyan" cx="80%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.18" />
+      <stop offset="50%" stop-color="#22d3ee" stop-opacity="0.04" />
+      <stop offset="100%" stop-color="#22d3ee" stop-opacity="0" />
+    </radialGradient>
+
+    <radialGradient id="ambient-magenta" cx="75%" cy="35%" r="40%">
+      <stop offset="0%" stop-color="#e879f9" stop-opacity="0.16" />
+      <stop offset="60%" stop-color="#e879f9" stop-opacity="0.03" />
+      <stop offset="100%" stop-color="#e879f9" stop-opacity="0" />
+    </radialGradient>
+
+    <radialGradient id="ambient-lime" cx="88%" cy="70%" r="40%">
+      <stop offset="0%" stop-color="#a3e635" stop-opacity="0.12" />
+      <stop offset="60%" stop-color="#a3e635" stop-opacity="0.02" />
+      <stop offset="100%" stop-color="#a3e635" stop-opacity="0" />
+    </radialGradient>
+
+    <radialGradient id="core-glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.35" />
+      <stop offset="40%" stop-color="#0ea5e9" stop-opacity="0.15" />
+      <stop offset="100%" stop-color="#0284c7" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Glow Filters -->
+    <filter id="glow-heavy" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="7" result="blur1" />
+      <feGaussianBlur stdDeviation="3" result="blur2" />
+      <feMerge>
+        <feMergeNode in="blur1" />
+        <feMergeNode in="blur2" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+
+    <filter id="glow-subtle" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="2.5" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+
+    <!-- Grid Pattern -->
+    <pattern id="cyber-grid" width="36" height="36" patternUnits="userSpaceOnUse">
+      <path d="M 36 0 L 0 0 0 36" fill="none" stroke="#162238" stroke-width="0.75" stroke-opacity="0.6" />
+      <circle cx="36" cy="0" r="0.8" fill="#22d3ee" fill-opacity="0.25" />
+    </pattern>
+    <pattern id="cyber-dots" width="144" height="144" patternUnits="userSpaceOnUse">
+      <circle cx="72" cy="72" r="1.5" fill="#e879f9" fill-opacity="0.2" />
+    </pattern>
+  </defs>
+
+  <style>
+    .mono { font-family: ui-monospace, 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace; }
+    .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; }
+  </style>
+
+  <!-- Background Layer -->
+  <rect width="1600" height="400" fill="url(#bg-grad)" />
+  <rect width="1600" height="400" fill="url(#cyber-grid)" />
+  <rect width="1600" height="400" fill="url(#cyber-dots)" />
+
+  <!-- Ambient Light Orbs -->
+  <rect width="1600" height="400" fill="url(#ambient-cyan)" />
+  <rect width="1600" height="400" fill="url(#ambient-magenta)" />
+  <rect width="1600" height="400" fill="url(#ambient-lime)" />
+
+  <!-- Accent Geometry & Circuit Traces on Left/Background -->
+  <g opacity="0.35" stroke="#1e293b" stroke-width="1" fill="none">
+    <path d="M 0,80 L 320,80 L 360,120 L 780,120" />
+    <path d="M 0,320 L 260,320 L 300,280 L 640,280" />
+    <path d="M 120,0 L 120,40 L 160,80" />
+    <circle cx="360" cy="120" r="2.5" fill="#22d3ee" />
+    <circle cx="300" cy="280" r="2.5" fill="#e879f9" />
+  </g>
+
+  <!-- ==================== LEFT SECTION: BRAND & TYPOGRAPHY ==================== -->
+  <g transform="translate(80, 0)">
+    <!-- Pill Badge -->
+    <g transform="translate(0, 72)">
+      <rect x="0" y="0" width="370" height="28" rx="14" fill="#0f172a" stroke="#22d3ee" stroke-width="1.2" stroke-opacity="0.6" />
+      <circle cx="14" cy="14" r="4" fill="#a3e635" filter="url(#glow-subtle)" />
+      <text x="28" y="18" class="mono" font-size="11" font-weight="600" fill="#22d3ee" letter-spacing="1.5">v1.0 // AGENT-FIRST UNIVERSAL PROXY</text>
+      <text x="312" y="18" class="mono" font-size="11" font-weight="700" fill="#a3e635">:8317</text>
+    </g>
+
+    <!-- Main Title -->
+    <text x="0" y="174" class="mono" font-size="78" font-weight="900" letter-spacing="8" fill="url(#text-grad)" filter="url(#glow-heavy)">ULTIPROXY</text>
+
+    <!-- Subtitle / Tagline -->
+    <text x="2" y="222" class="mono" font-size="22" font-weight="500" fill="#cbd5e1" letter-spacing="1.2">One endpoint to rule your LLM subscriptions</text>
+
+    <!-- Description Details -->
+    <text x="2" y="260" class="sans" font-size="14.5" fill="#94a3b8" letter-spacing="0.3">
+      Zero-marginal-cost pooling • Quota-aware routing • Embedded MCP server • Single OpenAI/Anthropic spec
+    </text>
+
+    <!-- Feature Pills Row -->
+    <g transform="translate(0, 296)">
+      <!-- Pill 1: OpenAI & Anthropic -->
+      <rect x="0" y="0" width="154" height="28" rx="6" fill="#111827" stroke="#334155" stroke-width="1" />
+      <text x="12" y="18" class="mono" font-size="11" fill="#e2e8f0"><tspan fill="#22d3ee">◆</tspan> /v1/chat + /v1/msg</text>
+
+      <!-- Pill 2: Quota-Aware -->
+      <rect x="166" y="0" width="138" height="28" rx="6" fill="#111827" stroke="#334155" stroke-width="1" />
+      <text x="178" y="18" class="mono" font-size="11" fill="#e2e8f0"><tspan fill="#a3e635">⚡</tspan> Quota Router</text>
+
+      <!-- Pill 3: Embedded MCP -->
+      <rect x="316" y="0" width="130" height="28" rx="6" fill="#111827" stroke="#334155" stroke-width="1" />
+      <text x="328" y="18" class="mono" font-size="11" fill="#e2e8f0"><tspan fill="#e879f9">⚙</tspan> Native MCP</text>
+
+      <!-- Pill 4: Zero-Marginal-Cost -->
+      <rect x="458" y="0" width="136" height="28" rx="6" fill="#111827" stroke="#334155" stroke-width="1" />
+      <text x="470" y="18" class="mono" font-size="11" fill="#e2e8f0"><tspan fill="#38bdf8">◈</tspan> Pool 12+ Subs</text>
+
+      <!-- Pill 5: High Performance -->
+      <rect x="606" y="0" width="118" height="28" rx="6" fill="#111827" stroke="#334155" stroke-width="1" />
+      <text x="618" y="18" class="mono" font-size="11" fill="#e2e8f0"><tspan fill="#f59e0b">★</tspan> Pure Go</text>
+    </g>
+  </g>
+
+  <!-- ==================== RIGHT SECTION: MULTI-NODE HUB MOTIF ==================== -->
+  <!-- Hub Center is at (1260, 200) -->
+  <g id="hub-container" transform="translate(1260, 200)">
+    <!-- Radial Core Glow -->
+    <circle cx="0" cy="0" r="170" fill="url(#core-glow)" />
+
+    <!-- Orbital Concentric Rings -->
+    <circle cx="0" cy="0" r="148" fill="none" stroke="#22d3ee" stroke-width="1" stroke-dasharray="4 6" opacity="0.35" />
+    <circle cx="0" cy="0" r="195" fill="none" stroke="#e879f9" stroke-width="0.8" stroke-dasharray="2 10" opacity="0.25" />
+    <circle cx="0" cy="0" r="95" fill="none" stroke="#334155" stroke-width="1" stroke-dasharray="3 3" opacity="0.4" />
+
+    <!-- Radiant Connecting Lines from satellite positions to center -->
+    <!-- Angles:
+         Copilot:   -145° -> (-121, -85)
+         Codex:     -105° -> (-38, -143)
+         Anthropic:  -60° -> (74, -128)
+         Grok:       -15° -> (143, -38)
+         DeepSeek:    25° -> (134, 62)
+         Z.ai:        70° -> (51, 139)
+         Antigrav:   115° -> (-63, 134)
+         vLLM:       160° -> (-139, 51)
+         OpenRouter: 195° -> (-143, -38)
+    -->
+    <g stroke-linecap="round">
+      <!-- Glow Underlays -->
+      <line x1="-121" y1="-85" x2="0" y2="0" stroke="#22d3ee" stroke-width="3" opacity="0.2" filter="url(#glow-subtle)" />
+      <line x1="-38" y1="-143" x2="0" y2="0" stroke="#22d3ee" stroke-width="3" opacity="0.2" filter="url(#glow-subtle)" />
+      <line x1="74" y1="-128" x2="0" y2="0" stroke="#e879f9" stroke-width="3" opacity="0.2" filter="url(#glow-subtle)" />
+      <line x1="143" y1="-38" x2="0" y2="0" stroke="#22d3ee" stroke-width="3" opacity="0.2" filter="url(#glow-subtle)" />
+      <line x1="134" y1="62" x2="0" y2="0" stroke="#22d3ee" stroke-width="3" opacity="0.2" filter="url(#glow-subtle)" />
+      <line x1="51" y1="139" x2="0" y2="0" stroke="#a3e635" stroke-width="3" opacity="0.2" filter="url(#glow-subtle)" />
+      <line x1="-63" y1="134" x2="0" y2="0" stroke="#22d3ee" stroke-width="3" opacity="0.2" filter="url(#glow-subtle)" />
+      <line x1="-139" y1="51" x2="0" y2="0" stroke="#a3e635" stroke-width="3" opacity="0.2" filter="url(#glow-subtle)" />
+      <line x1="-143" y1="-38" x2="0" y2="0" stroke="#e879f9" stroke-width="3" opacity="0.2" filter="url(#glow-subtle)" />
+
+      <!-- Sharp Lines -->
+      <line x1="-121" y1="-85" x2="0" y2="0" stroke="#22d3ee" stroke-width="1.6" opacity="0.8" />
+      <line x1="-38" y1="-143" x2="0" y2="0" stroke="#22d3ee" stroke-width="1.6" opacity="0.8" stroke-dasharray="6 3" />
+      <line x1="74" y1="-128" x2="0" y2="0" stroke="#e879f9" stroke-width="1.6" opacity="0.85" />
+      <line x1="143" y1="-38" x2="0" y2="0" stroke="#22d3ee" stroke-width="1.6" opacity="0.75" stroke-dasharray="4 4" />
+      <line x1="134" y1="62" x2="0" y2="0" stroke="#22d3ee" stroke-width="1.6" opacity="0.8" />
+      <line x1="51" y1="139" x2="0" y2="0" stroke="#a3e635" stroke-width="1.6" opacity="0.85" />
+      <line x1="-63" y1="134" x2="0" y2="0" stroke="#22d3ee" stroke-width="1.6" opacity="0.8" stroke-dasharray="5 3" />
+      <line x1="-139" y1="51" x2="0" y2="0" stroke="#a3e635" stroke-width="1.6" opacity="0.9" />
+      <line x1="-143" y1="-38" x2="0" y2="0" stroke="#e879f9" stroke-width="1.6" opacity="0.7" />
+    </g>
+
+    <!-- Moving Data Pulses / Packets on Lines -->
+    <circle cx="-60" cy="-42" r="3.5" fill="#22d3ee" filter="url(#glow-subtle)" />
+    <circle cx="37" cy="-64" r="3.5" fill="#e879f9" filter="url(#glow-subtle)" />
+    <circle cx="67" cy="31" r="3" fill="#22d3ee" filter="url(#glow-subtle)" />
+    <circle cx="-70" cy="25" r="3.5" fill="#a3e635" filter="url(#glow-subtle)" />
+    <circle cx="-19" cy="-71" r="3" fill="#22d3ee" filter="url(#glow-subtle)" />
+    <circle cx="25" cy="69" r="3" fill="#a3e635" filter="url(#glow-subtle)" />
+
+    <!-- ================= SATELLITE NODES ================= -->
+
+    <!-- 1. COPILOT (-121, -85) -->
+    <g transform="translate(-121, -85)">
+      <rect x="-42" y="-13" width="84" height="26" rx="13" fill="#091322" stroke="#22d3ee" stroke-width="1.4" filter="url(#glow-subtle)" />
+      <circle cx="-28" cy="0" r="3.5" fill="#22d3ee" />
+      <text x="-18" y="4" class="mono" font-size="9.5" font-weight="700" fill="#f1f5f9">COPILOT</text>
+    </g>
+
+    <!-- 2. OPENAI CODEX (-38, -143) -->
+    <g transform="translate(-38, -143)">
+      <rect x="-40" y="-13" width="80" height="26" rx="13" fill="#091322" stroke="#22d3ee" stroke-width="1.4" filter="url(#glow-subtle)" />
+      <circle cx="-26" cy="0" r="3.5" fill="#22d3ee" />
+      <text x="-16" y="4" class="mono" font-size="9.5" font-weight="700" fill="#f1f5f9">CODEX</text>
+    </g>
+
+    <!-- 3. ANTHROPIC (74, -128) -->
+    <g transform="translate(74, -128)">
+      <rect x="-50" y="-13" width="100" height="26" rx="13" fill="#160d24" stroke="#e879f9" stroke-width="1.4" filter="url(#glow-subtle)" />
+      <circle cx="-35" cy="0" r="3.5" fill="#e879f9" />
+      <text x="-25" y="4" class="mono" font-size="9.5" font-weight="700" fill="#f1f5f9">ANTHROPIC</text>
+    </g>
+
+    <!-- 4. xAI GROK (143, -38) -->
+    <g transform="translate(143, -38)">
+      <rect x="-35" y="-13" width="70" height="26" rx="13" fill="#091322" stroke="#22d3ee" stroke-width="1.4" />
+      <circle cx="-22" cy="0" r="3.5" fill="#22d3ee" />
+      <text x="-12" y="4" class="mono" font-size="9.5" font-weight="700" fill="#f1f5f9">GROK</text>
+    </g>
+
+    <!-- 5. DEEPSEEK (134, 62) -->
+    <g transform="translate(134, 62)">
+      <rect x="-46" y="-13" width="92" height="26" rx="13" fill="#091322" stroke="#22d3ee" stroke-width="1.4" />
+      <circle cx="-32" cy="0" r="3.5" fill="#22d3ee" />
+      <text x="-22" y="4" class="mono" font-size="9.5" font-weight="700" fill="#f1f5f9">DEEPSEEK</text>
+    </g>
+
+    <!-- 6. Z.AI (51, 139) -->
+    <g transform="translate(51, 139)">
+      <rect x="-32" y="-13" width="64" height="26" rx="13" fill="#0d1b18" stroke="#a3e635" stroke-width="1.4" filter="url(#glow-subtle)" />
+      <circle cx="-20" cy="0" r="3.5" fill="#a3e635" />
+      <text x="-10" y="4" class="mono" font-size="9.5" font-weight="700" fill="#f1f5f9">Z.AI</text>
+    </g>
+
+    <!-- 7. ANTIGRAVITY (-63, 134) -->
+    <g transform="translate(-63, 134)">
+      <rect x="-54" y="-13" width="108" height="26" rx="13" fill="#091322" stroke="#22d3ee" stroke-width="1.4" />
+      <circle cx="-40" cy="0" r="3.5" fill="#22d3ee" />
+      <text x="-30" y="4" class="mono" font-size="9.5" font-weight="700" fill="#f1f5f9">ANTIGRAVITY</text>
+    </g>
+
+    <!-- 8. LOCAL vLLM (-139, 51) -->
+    <g transform="translate(-139, 51)">
+      <rect x="-38" y="-13" width="76" height="26" rx="13" fill="#0d1b18" stroke="#a3e635" stroke-width="1.4" filter="url(#glow-subtle)" />
+      <circle cx="-25" cy="0" r="3.5" fill="#a3e635" />
+      <text x="-15" y="4" class="mono" font-size="9.5" font-weight="700" fill="#a3e635">vLLM</text>
+    </g>
+
+    <!-- 9. OPENROUTER (-143, -38) -->
+    <g transform="translate(-143, -38)">
+      <rect x="-56" y="-13" width="112" height="26" rx="13" fill="#160d24" stroke="#e879f9" stroke-width="1.4" />
+      <circle cx="-42" cy="0" r="3.5" fill="#e879f9" />
+      <text x="-32" y="4" class="mono" font-size="9.5" font-weight="700" fill="#f1f5f9">OPENROUTER</text>
+    </g>
+
+    <!-- ================= CENTRAL GATEWAY HEXAGON ================= -->
+    <!-- Outer Decorative Rotating Hexagon Frame -->
+    <polygon points="0,-68 59,-34 59,34 0,68 -59,34 -59,-34"
+             fill="#080e1a" stroke="#22d3ee" stroke-width="2" filter="url(#glow-heavy)" />
+
+    <!-- Middle Hexagon Accent -->
+    <polygon points="0,-58 50,-29 50,29 0,58 -50,29 -50,-29"
+             fill="none" stroke="#e879f9" stroke-width="1" stroke-dasharray="6 4" opacity="0.7" />
+
+    <!-- Inner Core Hexagon -->
+    <polygon points="0,-48 41,-24 41,24 0,48 -41,24 -41,-24"
+             fill="#0c1626" stroke="#22d3ee" stroke-width="1.5" />
+
+    <!-- Center Icon & Labels -->
+    <!-- Glowing gateway router node symbol -->
+    <g transform="translate(0, -10)">
+      <path d="M -12,-8 L 0,-15 L 12,-8 L 12,7 L 0,14 L -12,7 Z" fill="#22d3ee" fill-opacity="0.25" stroke="#22d3ee" stroke-width="1.5" />
+      <circle cx="0" cy="0" r="4" fill="#a3e635" filter="url(#glow-subtle)" />
+    </g>
+    <text x="0" y="16" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#ffffff" letter-spacing="2">GATEWAY</text>
+    <text x="0" y="29" text-anchor="middle" class="mono" font-size="9" font-weight="700" fill="#22d3ee" letter-spacing="1.2">:8317</text>
+  </g>
+
+  <!-- Top / Bottom Cyber Borders -->
+  <line x1="0" y1="0" x2="1600" y2="0" stroke="#22d3ee" stroke-width="2" opacity="0.8" />
+  <line x1="0" y1="399" x2="1600" y2="399" stroke="#e879f9" stroke-width="2" opacity="0.6" />
+  <rect x="0" y="0" width="120" height="3" fill="#22d3ee" />
+  <rect x="1480" y="397" width="120" height="3" fill="#a3e635" />
+</svg>

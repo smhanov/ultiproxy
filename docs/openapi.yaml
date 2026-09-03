@@ -1,0 +1,962 @@
+openapi: 3.1.0
+info:
+  title: Ultiproxy Public API
+  version: 1.0.0
+  description: |
+    Ultiproxy is an agent-first universal LLM subscription proxy.
+    It exposes a single OpenAI-compatible and Anthropic-compatible gateway at port 8317,
+    fronting multiple pooled subscriptions (GitHub Copilot, OpenAI Codex, Anthropic Claude,
+    Google Antigravity, xAI Grok, DeepSeek, Z.ai, local vLLM, etc.) with quota-aware routing,
+    per-API-key accounting, and an embedded Model Context Protocol (MCP) server.
+servers:
+  - url: http://localhost:8317
+    description: Local Ultiproxy Gateway Daemon
+  - url: http://127.0.0.1:8317
+    description: Loopback address
+
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/chat/completions:
+    post:
+      summary: Create chat completion
+      description: |
+        OpenAI-compatible chat completion endpoint supporting multi-turn conversations,
+        streaming Server-Sent Events (SSE), tool calling / function calling, vision/image inputs,
+        and reasoning deltas (o1/DeepSeek-R1 style).
+      operationId: createChatCompletion
+      tags:
+        - OpenAI Compatibility
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+      responses:
+        '200':
+          description: Successful completion or streaming event stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: Real-time Server-Sent Events (SSE) data stream of ChatCompletionChunk objects.
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '502':
+          $ref: '#/components/responses/BadGatewayError'
+
+  /v1/messages:
+    post:
+      summary: Create Anthropic message
+      description: |
+        Anthropic-compatible Messages API endpoint for direct use by Claude Code, Hermes,
+        and Anthropic SDKs. Supports system prompts, structured content blocks, and streaming.
+      operationId: createAnthropicMessage
+      tags:
+        - Anthropic Compatibility
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnthropicMessageRequest'
+      responses:
+        '200':
+          description: Anthropic message response or event stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnthropicMessageResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: Anthropic SSE message stream (message_start, content_block_delta, etc.).
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/models:
+    get:
+      summary: List available models
+      description: |
+        Returns the unified catalog of available models across all active upstreams,
+        annotated with provider prefixes, benchmark rankings, context limits, and pricing tags.
+      operationId: listModels
+      tags:
+        - Models
+      responses:
+        '200':
+          description: List of available model entries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelListResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /api/quota:
+    get:
+      summary: Quota status dashboard API
+      description: |
+        Returns the quota status across all pooled provider subscriptions.
+        Preserves 100% contract compatibility with legacy quota.fjkl.cc so monitoring probes
+        and dashboard web UIs work without modification.
+      operationId: getQuotaStatus
+      tags:
+        - Dashboard & Quotas
+      security: []
+      responses:
+        '200':
+          description: Provider quota status summary and window details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuotaDashboardResponse'
+
+  /api/stats/summary:
+    get:
+      summary: System usage and accounting summary
+      description: |
+        Returns aggregated usage metrics, total prompt/completion tokens, cache hit rates,
+        active clients, and estimated cost savings achieved by pooling subscriptions.
+      operationId: getStatsSummary
+      tags:
+        - Accounting & Metrics
+      responses:
+        '200':
+          description: Usage summary across all clients and providers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsSummaryResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /api/stats/by-client:
+    get:
+      summary: Per-client token accounting breakdown
+      description: |
+        Returns per-API-key accounting metrics, tracking which agent or developer consumed tokens,
+        request counts, errors, and current rate-limiting states.
+      operationId: getStatsByClient
+      tags:
+        - Accounting & Metrics
+      responses:
+        '200':
+          description: Per-client usage breakdown
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ClientUsageRecord'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /llms.txt:
+    get:
+      summary: Machine-readable agent discovery manifest
+      description: |
+        Returns markdown-formatted discovery document adhering to the llms.txt convention,
+        enabling automated agent introspection of endpoints, tools, and capabilities.
+      operationId: getLlmsTxt
+      tags:
+        - Discovery & Health
+      security: []
+      responses:
+        '200':
+          description: Discovery markdown document
+          content:
+            text/plain:
+              schema:
+                type: string
+            text/markdown:
+              schema:
+                type: string
+
+  /healthz:
+    get:
+      summary: Health and liveness probe
+      description: Returns health status of Ultiproxy daemon and connectivity to upstream providers.
+      operationId: getHealth
+      tags:
+        - Discovery & Health
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Service unhealthy or upstream unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /mcp:
+    get:
+      summary: Streamable HTTP Model Context Protocol (MCP) endpoint
+      description: |
+        Streamable HTTP transport endpoint for MCP clients and AI agents.
+        Exposes built-in tools for model introspection, quota queries, and dynamic model toggling.
+      operationId: getMcpStream
+      tags:
+        - Model Context Protocol
+      responses:
+        '200':
+          description: MCP streaming connection established
+          content:
+            text/event-stream:
+              schema:
+                type: string
+            application/json:
+              schema:
+                type: object
+    post:
+      summary: Post MCP message
+      description: Send JSON-RPC 2.0 messages to the embedded MCP server over HTTP transport.
+      operationId: postMcpMessage
+      tags:
+        - Model Context Protocol
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/McpJsonRpcRequest'
+      responses:
+        '200':
+          description: MCP JSON-RPC response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/McpJsonRpcResponse'
+
+  /mcp/sse:
+    get:
+      summary: Legacy Server-Sent Events MCP endpoint
+      description: Backward-compatible SSE transport for older MCP clients.
+      operationId: getMcpSse
+      tags:
+        - Model Context Protocol
+      responses:
+        '200':
+          description: SSE event stream for MCP
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: APIKey
+      description: "Ultiproxy bearer token specified in ~/.config/ultiproxy/config.yaml (e.g. Authorization: Bearer sk-up-...)"
+
+  responses:
+    BadRequestError:
+      description: Invalid request payload or parameter format
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnauthorizedError:
+      description: Missing or invalid authorization token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    RateLimitError:
+      description: Quota or rate limit exceeded on upstream providers
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalServerError:
+      description: Internal proxy error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    BadGatewayError:
+      description: Upstream provider failure or connection timeout
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - message
+            - type
+          properties:
+            message:
+              type: string
+            type:
+              type: string
+            code:
+              type: string
+            param:
+              type: string
+
+    # --- OpenAI Chat Schemas ---
+    ChatCompletionRequest:
+      type: object
+      required:
+        - model
+        - messages
+      properties:
+        model:
+          type: string
+          description: Model identifier (e.g. gpt-4o, claude-3-5-sonnet, deepseek-r1, copilot/gpt-4o)
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        stream:
+          type: boolean
+          default: false
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          minimum: 0
+          maximum: 1
+        max_tokens:
+          type: integer
+        max_completion_tokens:
+          type: integer
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolDefinition'
+        tool_choice:
+          oneOf:
+            - type: string
+            - type: object
+        stream_options:
+          type: object
+          properties:
+            include_usage:
+              type: boolean
+
+    ChatMessage:
+      type: object
+      required:
+        - role
+        - content
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                $ref: '#/components/schemas/ContentPart'
+        reasoning_content:
+          type: string
+          description: Thinking or reasoning chain output (o1/R1 models)
+        name:
+          type: string
+        tool_call_id:
+          type: string
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolCall'
+
+    ContentPart:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum: [text, image_url]
+        text:
+          type: string
+        image_url:
+          type: object
+          required:
+            - url
+          properties:
+            url:
+              type: string
+            detail:
+              type: string
+              enum: [auto, low, high]
+
+    ToolDefinition:
+      type: object
+      required:
+        - type
+        - function
+      properties:
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          required:
+            - name
+          properties:
+            name:
+              type: string
+            description:
+              type: string
+            parameters:
+              type: object
+
+    ToolCall:
+      type: object
+      required:
+        - id
+        - type
+        - function
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          required:
+            - name
+            - arguments
+          properties:
+            name:
+              type: string
+            arguments:
+              type: string
+
+    ChatCompletionResponse:
+      type: object
+      required:
+        - id
+        - object
+        - created
+        - model
+        - choices
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: [chat.completion]
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            required:
+              - index
+              - message
+              - finish_reason
+            properties:
+              index:
+                type: integer
+              message:
+                $ref: '#/components/schemas/ChatMessage'
+              finish_reason:
+                type: string
+        usage:
+          $ref: '#/components/schemas/UsageStats'
+
+    UsageStats:
+      type: object
+      required:
+        - prompt_tokens
+        - completion_tokens
+        - total_tokens
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+        prompt_tokens_details:
+          type: object
+          properties:
+            cached_tokens:
+              type: integer
+        completion_tokens_details:
+          type: object
+          properties:
+            reasoning_tokens:
+              type: integer
+
+    # --- Anthropic Messages Schemas ---
+    AnthropicMessageRequest:
+      type: object
+      required:
+        - model
+        - messages
+        - max_tokens
+      properties:
+        model:
+          type: string
+        messages:
+          type: array
+          items:
+            type: object
+            required:
+              - role
+              - content
+            properties:
+              role:
+                type: string
+                enum: [user, assistant]
+              content:
+                oneOf:
+                  - type: string
+                  - type: array
+                    items:
+                      type: object
+        max_tokens:
+          type: integer
+        system:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: object
+        temperature:
+          type: number
+        stream:
+          type: boolean
+        tools:
+          type: array
+          items:
+            type: object
+
+    AnthropicMessageResponse:
+      type: object
+      required:
+        - id
+        - type
+        - role
+        - model
+        - content
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [message]
+        role:
+          type: string
+          enum: [assistant]
+        model:
+          type: string
+        content:
+          type: array
+          items:
+            type: object
+            required:
+              - type
+            properties:
+              type:
+                type: string
+                enum: [text, tool_use]
+              text:
+                type: string
+        stop_reason:
+          type: string
+        usage:
+          type: object
+          properties:
+            input_tokens:
+              type: integer
+            output_tokens:
+              type: integer
+
+    # --- Models Catalog Schema ---
+    ModelListResponse:
+      type: object
+      required:
+        - object
+        - data
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelRecord'
+
+    ModelRecord:
+      type: object
+      required:
+        - id
+        - object
+        - created
+        - owned_by
+      properties:
+        id:
+          type: string
+          description: Model identifier with provider prefix (e.g. copilot/claude-3-5-sonnet, openai/gpt-4o)
+        object:
+          type: string
+          enum: [model]
+        created:
+          type: integer
+        owned_by:
+          type: string
+        context_length:
+          type: integer
+        max_output_tokens:
+          type: integer
+        pricing:
+          type: object
+          properties:
+            input:
+              type: number
+            output:
+              type: number
+            unit:
+              type: string
+              example: "per_1k_tokens"
+        benchmarks:
+          type: object
+          properties:
+            swe_bench:
+              type: number
+            humaneval:
+              type: number
+            reasoning_score:
+              type: number
+        provider:
+          type: object
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+            status:
+              type: string
+              enum: [ok, degraded, unavailable]
+
+    # --- Quota Dashboard Schemas (quota.fjkl.cc compatible) ---
+    QuotaDashboardResponse:
+      type: object
+      required:
+        - providers
+        - summary
+      properties:
+        providers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderSummary'
+        summary:
+          $ref: '#/components/schemas/QuotaSummary'
+
+    ProviderSummary:
+      type: object
+      required:
+        - id
+        - name
+        - plan
+        - status
+        - gauge_pct
+        - windows
+        - bars
+        - updated
+        - detail
+      properties:
+        id:
+          type: string
+          example: copilot
+        name:
+          type: string
+          example: GitHub Copilot
+        plan:
+          type: string
+          example: Pro (annual)
+        status:
+          type: string
+          enum: [ok, unavailable, error]
+        gauge_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+        windows:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuotaWindow'
+        bars:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuotaBar'
+        updated:
+          type: string
+          format: date-time
+        detail:
+          type: string
+        extra:
+          type: object
+
+    QuotaWindow:
+      type: object
+      required:
+        - label
+        - used_pct
+        - reset_at
+        - seconds_remaining
+      properties:
+        label:
+          type: string
+          example: Premium requests
+        used_pct:
+          type: number
+        reset_at:
+          type: string
+          format: date-time
+        seconds_remaining:
+          type: integer
+
+    QuotaBar:
+      type: object
+      required:
+        - label
+        - used
+        - limit
+        - remaining
+        - unit
+        - pct
+      properties:
+        label:
+          type: string
+        used:
+          type: number
+        limit:
+          type: number
+        remaining:
+          type: number
+        unit:
+          type: string
+          enum: [requests, credits, '%']
+        pct:
+          type: number
+
+    QuotaSummary:
+      type: object
+      required:
+        - total
+        - ok
+        - unavailable
+        - next_reset
+        - fetched_at
+        - fetched_at_epoch
+        - stale
+        - age_seconds
+        - refreshing
+        - refresh_started_at
+        - refresh_min_interval
+        - last_refresh_error
+      properties:
+        total:
+          type: integer
+        ok:
+          type: integer
+        unavailable:
+          type: integer
+        next_reset:
+          type: object
+          properties:
+            seconds:
+              type: integer
+            provider:
+              type: string
+            reset_at:
+              type: string
+              format: date-time
+        fetched_at:
+          type: string
+          example: "12:00:00"
+        fetched_at_epoch:
+          type: integer
+        stale:
+          type: boolean
+        age_seconds:
+          type: integer
+        refreshing:
+          type: boolean
+        refresh_started_at:
+          type: string
+          nullable: true
+        refresh_min_interval:
+          type: integer
+        last_refresh_error:
+          type: string
+          nullable: true
+
+    # --- Accounting & Stats Schemas ---
+    StatsSummaryResponse:
+      type: object
+      required:
+        - total_requests
+        - total_prompt_tokens
+        - total_completion_tokens
+        - active_clients
+        - estimated_cost_saved_usd
+      properties:
+        total_requests:
+          type: integer
+        total_prompt_tokens:
+          type: integer
+        total_completion_tokens:
+          type: integer
+        total_cached_tokens:
+          type: integer
+        active_clients:
+          type: integer
+        estimated_cost_saved_usd:
+          type: number
+        provider_breakdown:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              requests:
+                type: integer
+              tokens:
+                type: integer
+              errors:
+                type: integer
+
+    ClientUsageRecord:
+      type: object
+      required:
+        - client_id
+        - request_count
+        - prompt_tokens
+        - completion_tokens
+        - last_active
+      properties:
+        client_id:
+          type: string
+        client_name:
+          type: string
+        request_count:
+          type: integer
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        cached_tokens:
+          type: integer
+        error_count:
+          type: integer
+        rate_limited_count:
+          type: integer
+        last_active:
+          type: string
+          format: date-time
+
+    # --- Health & Discovery Schemas ---
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - version
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, error]
+        version:
+          type: string
+        uptime_seconds:
+          type: integer
+        healthy_providers:
+          type: integer
+        total_providers:
+          type: integer
+
+    # --- MCP Schemas ---
+    McpJsonRpcRequest:
+      type: object
+      required:
+        - jsonrpc
+        - method
+        - id
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        method:
+          type: string
+          enum:
+            - tools/list
+            - tools/call
+            - resources/list
+            - resources/read
+            - prompts/list
+            - initialize
+        id:
+          oneOf:
+            - type: string
+            - type: integer
+        params:
+          type: object
+
+    McpJsonRpcResponse:
+      type: object
+      required:
+        - jsonrpc
+        - id
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        id:
+          oneOf:
+            - type: string
+            - type: integer
+        result:
+          type: object
+        error:
+          type: object
+          properties:
+            code:
+              type: integer
+            message:
+              type: string
