@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/gofrs/flock v0.13.1
 	golang.org/x/sync v0.22.0
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.58.0
 )
 

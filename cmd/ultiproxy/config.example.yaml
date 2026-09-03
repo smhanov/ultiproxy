@@ -1,0 +1,14 @@
+# Ultiproxy Configuration Example
+server:
+  addr: "127.0.0.1:8317"
+  api_key: "admin-secret-key"
+  client_keys:
+    cursor: "sk-cursor-secret"
+    codex: "sk-codex-secret"
+    claude-code: "sk-claude-code-secret"
+  llms_txt_path: "llms.txt"
+
+storage:
+  db_path: "ultiproxy.db"
+
+data_dir: "."
