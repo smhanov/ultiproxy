@@ -1,0 +1,13 @@
+data: {"id":"grok-stream-tc","choices":[{"index":0,"delta":{"reasoning_content":"Need to inspect the repo."},"finish_reason":null}]}
+
+data: {"id":"grok-stream-tc","choices":[{"index":0,"delta":{"content":"I'll look up how day1 seeds login accounts."},"finish_reason":null}]}
+
+data: {"id":"grok-stream-tc","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_bash_1","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"grok-stream-tc","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]},"finish_reason":null}]}
+
+data: {"id":"grok-stream-tc","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":" \"ls\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"grok-stream-tc","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":52000,"completion_tokens":80,"total_tokens":52080}}
+
+data: [DONE]

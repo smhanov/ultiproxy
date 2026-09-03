@@ -136,6 +136,76 @@ func TestStreamingReasoningOrder(t *testing.T) {
 	}
 }
 
+func TestStreamingToolCallsAreNotDropped(t *testing.T) {
+	fixturePath := filepath.Join("..", "..", "..", "testdata", "xai", "stream-tool-calls.sses")
+	fixtureData, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("failed to read fixture: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write(fixtureData)
+	}))
+	defer srv.Close()
+
+	p := New(Config{
+		BaseURL:     srv.URL,
+		StaticToken: "test-token",
+		HTTPClient:  srv.Client(),
+	})
+
+	msgs := []*ir.Message{
+		{Role: "user", Blocks: []ir.Block{ir.TextBlock{Text: "inspect the seed account"}}},
+	}
+
+	eventCh, err := p.Stream(context.Background(), msgs, provider.WithModel("grok-4.6"))
+	if err != nil {
+		t.Fatalf("Stream failed: %v", err)
+	}
+
+	var kinds []string
+	var start ir.EventToolCallStart
+	var args strings.Builder
+	var finish string
+	gotStart, gotStop := false, false
+	for ev := range eventCh {
+		kinds = append(kinds, ev.EventKind())
+		switch e := ev.(type) {
+		case ir.EventToolCallStart:
+			gotStart = true
+			start = e
+		case ir.EventToolArgumentsDelta:
+			args.WriteString(e.Arguments)
+		case ir.EventToolCallStop:
+			gotStop = true
+		case ir.EventMessageStop:
+			finish = e.FinishReason
+		}
+	}
+
+	if !gotStart {
+		t.Fatalf("expected tool_call_start; got events %v", kinds)
+	}
+	if start.ID != "call_bash_1" || start.Name != "bash" {
+		t.Errorf("tool start = %+v, want id=call_bash_1 name=bash", start)
+	}
+	if args.String() != `{"command": "ls"}` {
+		t.Errorf("arguments = %q, want {\"command\": \"ls\"}", args.String())
+	}
+	if !gotStop {
+		t.Errorf("expected tool_call_stop before message_stop; got %v", kinds)
+	}
+	if finish != "tool_calls" {
+		t.Errorf("finish_reason = %q, want tool_calls", finish)
+	}
+
+	// The OpenCode death loop: finish_reason=tool_calls with no tool payload.
+	if finish == "tool_calls" && !gotStart {
+		t.Fatal("finish_reason=tool_calls with no tool_call_start (opencode retry loop)")
+	}
+}
+
 func TestEffortPassthroughInPayload(t *testing.T) {
 	var capturedBody map[string]any
 

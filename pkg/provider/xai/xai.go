@@ -439,13 +439,24 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 		started := false
 		var responseID string
 
+		type streamToolCall struct {
+			Index    int    `json:"index"`
+			ID       string `json:"id"`
+			Type     string `json:"type"`
+			Function struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"function"`
+		}
+
 		type streamChunk struct {
 			ID      string `json:"id"`
 			Choices []struct {
 				Index int `json:"index"`
 				Delta struct {
-					Content          string `json:"content,omitempty"`
-					ReasoningContent string `json:"reasoning_content,omitempty"`
+					Content          string           `json:"content,omitempty"`
+					ReasoningContent string           `json:"reasoning_content,omitempty"`
+					ToolCalls        []streamToolCall `json:"tool_calls,omitempty"`
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
@@ -455,6 +466,8 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 				TotalTokens      int `json:"total_tokens"`
 			} `json:"usage"`
 		}
+
+		activeTools := make(map[int]bool)
 
 		for scanner.Scan() {
 			ev := scanner.Event()
@@ -477,7 +490,9 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 				started = true
 			}
 
-			// Deliver reasoning_content BEFORE text deltas
+			// Deliver reasoning_content BEFORE text deltas, then tool_calls.
+			// Dropping tool_calls while still forwarding finish_reason=tool_calls
+			// is what made OpenCode retry the same turn forever.
 			for _, c := range chunk.Choices {
 				if c.Delta.ReasoningContent != "" {
 					outCh <- ir.EventReasoningDelta{Index: c.Index, Text: c.Delta.ReasoningContent}
@@ -485,7 +500,21 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 				if c.Delta.Content != "" {
 					outCh <- ir.EventTextDelta{Index: c.Index, Text: c.Delta.Content}
 				}
+				for _, tc := range c.Delta.ToolCalls {
+					toolIdx := tc.Index
+					if !activeTools[toolIdx] {
+						activeTools[toolIdx] = true
+						outCh <- ir.EventToolCallStart{Index: toolIdx, ID: tc.ID, Name: tc.Function.Name}
+					}
+					if tc.Function.Arguments != "" {
+						outCh <- ir.EventToolArgumentsDelta{Index: toolIdx, Arguments: tc.Function.Arguments}
+					}
+				}
 				if c.FinishReason != nil && *c.FinishReason != "" {
+					for idx := range activeTools {
+						outCh <- ir.EventToolCallStop{Index: idx}
+					}
+					activeTools = make(map[int]bool)
 					outCh <- ir.EventMessageStop{FinishReason: *c.FinishReason, UpstreamID: responseID}
 				}
 			}
