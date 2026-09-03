@@ -1,0 +1,30 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_parallel_01","model":"gpt-4o","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"item_call_1","type":"function_call","call_id":"call_apple_01","name":"get_stock_quote","arguments":""}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"item_call_2","type":"function_call","call_id":"call_tesla_02","name":"get_stock_quote","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"item_call_1","output_index":0,"call_id":"call_apple_01","delta":"{\"ticker\": \"AAPL\""}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"item_call_2","output_index":1,"call_id":"call_tesla_02","delta":"{\"ticker\": \"TSLA\""}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"item_call_1","output_index":0,"call_id":"call_apple_01","delta":", \"market\": \"US\"}"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"item_call_2","output_index":1,"call_id":"call_tesla_02","delta":", \"market\": \"US\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"item_call_1","type":"function_call","call_id":"call_apple_01","name":"get_stock_quote","arguments":"{\"ticker\": \"AAPL\", \"market\": \"US\"}"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":1,"item":{"id":"item_call_2","type":"function_call","call_id":"call_tesla_02","name":"get_stock_quote","arguments":"{\"ticker\": \"TSLA\", \"market\": \"US\"}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_parallel_01","model":"gpt-4o","status":"completed","usage":{"input_tokens":85,"output_tokens":62,"total_tokens":147}}}
+
