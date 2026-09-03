@@ -1,0 +1,50 @@
+{
+  "providers": [
+    {
+      "id": "copilot",
+      "name": "GitHub Copilot",
+      "plan": "Pro (annual)",
+      "status": "ok",
+      "gauge_pct": 42.5,
+      "windows": [
+        {
+          "label": "Premium requests",
+          "used_pct": 42.5,
+          "reset_at": "2026-09-03T14:00:00Z",
+          "seconds_remaining": 3600
+        }
+      ],
+      "bars": [
+        {
+          "label": "Premium requests",
+          "used": 425,
+          "limit": 1000,
+          "remaining": 575,
+          "unit": "requests",
+          "pct": 42.5
+        }
+      ],
+      "updated": "2026-09-03T16:00:00Z",
+      "detail": "Premium 57.5% remaining · resets 2026-09-03 · chat+completions included/unlimited",
+      "extra": {}
+    }
+  ],
+  "summary": {
+    "total": 1,
+    "ok": 1,
+    "unavailable": 0,
+    "next_reset": {
+      "seconds": 3600,
+      "provider": "GitHub Copilot",
+      "reset_at": "2026-09-03T14:00:00Z"
+    },
+    "fetched_at": "12:00:00",
+    "fetched_at_epoch": 1788436800,
+    "stale": false,
+    "age_seconds": 0,
+    "refreshing": false,
+    "refresh_started_at": null,
+    "refresh_min_interval": 30,
+    "last_refresh_error": null
+  }
+}
