@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,14 +23,21 @@ import (
 const version = "0.1.0"
 
 func main() {
-	configPath := flag.String("config", "", "Path to YAML configuration file")
-	dataDir := flag.String("data-dir", "", "Data directory path")
-	flag.Parse()
-
-	args := flag.Args()
+	// Subcommand-first CLI: `ultiproxy serve --config ...`. Go's flag
+	// package stops parsing at the first non-flag argument, so we extract
+	// the subcommand before parsing flags.
+	args := os.Args[1:]
 	cmd := "serve"
-	if len(args) > 0 {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		cmd = args[0]
+		args = args[1:]
+	}
+
+	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to YAML configuration file")
+	dataDir := fs.String("data-dir", "", "Data directory path")
+	if err := fs.Parse(args); err != nil {
+		log.Fatalf("flag parse error: %v", err)
 	}
 
 	switch cmd {
@@ -67,6 +75,8 @@ func runServe(configPath, dataDir string) {
 
 	registry := provider.NewRegistry()
 	stateManager := state.NewStateManager()
+
+	registerProviders(registry)
 
 	srv := server.NewServer(cfg, registry,
 		server.WithStateManager(stateManager),

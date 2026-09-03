@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/smhanov/ultiproxy/pkg/codec"
@@ -17,6 +18,25 @@ import (
 type streamEventEncoder interface {
 	EncodeEvent(evt ir.Event) error
 	Close() error
+}
+
+// stripProviderPrefix removes a "<provider>/" prefix from a model identifier.
+// It only strips when the prefix exactly matches the resolved provider name
+// (or the prefix names the provider's own namespace), preserving models that
+// legitimately contain slashes (e.g. OpenRouter's "meta-llama/llama-3.3-70b").
+func stripProviderPrefix(model, providerName string) string {
+	if providerName == "" || model == "" {
+		return model
+	}
+	idx := strings.Index(model, "/")
+	if idx <= 0 {
+		return model
+	}
+	prefix := model[:idx]
+	if strings.EqualFold(prefix, providerName) {
+		return model[idx+1:]
+	}
+	return model
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -176,6 +196,12 @@ func (s *Server) dispatchRequest(
 		}
 
 		opts := append(options, provider.WithClientKeyHash(clientKeyHash))
+		// Strip the "<provider>/" prefix from the model identifier before it
+		// reaches upstream. Route() resolves the provider from the prefixed
+		// name, but upstream APIs only know the suffix (e.g. "zai/glm-5.3-flash"
+		// must become "glm-5.3-flash" for Z.ai). Last-apply wins, so this
+		// overrides the codec's WithModel(full-prefixed-name).
+		opts = append(opts, provider.WithModel(stripProviderPrefix(model, provName)))
 
 		if stream {
 			streamChan, syncErr := prov.Inference.Stream(r.Context(), messages, opts...)
