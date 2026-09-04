@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -896,8 +897,12 @@ func TestOpenAICompat_Login_Freebuff(t *testing.T) {
 }
 
 func TestOpenAICompat_Login_OAuthManager(t *testing.T) {
+	var deviceForm url.Values
 	mux := http.NewServeMux()
 	mux.HandleFunc("/device", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		deviceForm, _ = url.ParseQuery(string(body))
+
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"device_code": "dev-test-123",
@@ -939,11 +944,85 @@ func TestOpenAICompat_Login_OAuthManager(t *testing.T) {
 		t.Fatalf("Login failed: %v", err)
 	}
 
+	if got := deviceForm.Get("scope"); got != defaultXAIScope {
+		t.Errorf("device code scope = %q, want %q", got, defaultXAIScope)
+	}
+
 	tok, err := p.Token(context.Background())
 	if err != nil {
 		t.Fatalf("Token() failed: %v", err)
 	}
 	if tok != "mock-xai-access-tok" {
 		t.Errorf("Token() = %q, want mock-xai-access-tok", tok)
+	}
+}
+
+func TestOpenAICompat_StartLogin_XAIScope(t *testing.T) {
+	var deviceForm url.Values
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/device", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		deviceForm, _ = url.ParseQuery(string(body))
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"device_code": "dev-start-456",
+			"user_code": "START-4567",
+			"verification_uri": "https://accounts.x.ai/oauth2/device",
+			"verification_uri_complete": "https://accounts.x.ai/oauth2/device?user_code=START-4567",
+			"expires_in": 600,
+			"interval": 5
+		}`))
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	p, err := New(Config{
+		Name:          "xai",
+		BaseURL:       "https://api.x.ai",
+		DataDir:       t.TempDir(),
+		HTTPClient:    srv.Client(),
+		DeviceAuthURL: srv.URL + "/device",
+		TokenURL:      srv.URL + "/token",
+		Quirks: Quirks{
+			AuthViaOAuthManager: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	info, err := p.StartLogin(context.Background())
+	if err != nil {
+		t.Fatalf("StartLogin failed: %v", err)
+	}
+
+	// The device-code request must carry the full xAI scope, otherwise the
+	// minted token lacks "api:access" and every chat call 403s.
+	if got := deviceForm.Get("scope"); got != defaultXAIScope {
+		t.Errorf("device code scope = %q, want %q", got, defaultXAIScope)
+	}
+	for _, want := range []string{"api:access", "grok-cli:access", "offline_access"} {
+		if !strings.Contains(deviceForm.Get("scope"), want) {
+			t.Errorf("device code scope %q missing %q", deviceForm.Get("scope"), want)
+		}
+	}
+	if got := deviceForm.Get("client_id"); got != defaultXAIClientID {
+		t.Errorf("device code client_id = %q, want %q", got, defaultXAIClientID)
+	}
+
+	if info.Kind != provider.LoginFlowDevice {
+		t.Errorf("LoginStartInfo.Kind = %v, want %v", info.Kind, provider.LoginFlowDevice)
+	}
+	if info.UserCode != "START-4567" {
+		t.Errorf("LoginStartInfo.UserCode = %q, want START-4567", info.UserCode)
+	}
+	if info.VerificationURI != "https://accounts.x.ai/oauth2/device" {
+		t.Errorf("LoginStartInfo.VerificationURI = %q", info.VerificationURI)
+	}
+	if info.ExpiresIn != 600 {
+		t.Errorf("LoginStartInfo.ExpiresIn = %d, want 600", info.ExpiresIn)
 	}
 }

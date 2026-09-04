@@ -23,6 +23,10 @@ const (
 	defaultXAIClientID      = "b1a00492-073a-47ea-816f-4c329264a828"
 	defaultXAIDeviceURL     = "https://auth.x.ai/oauth2/device/code"
 	defaultXAITokenURL      = "https://auth.x.ai/oauth2/token"
+	// defaultXAIScope mirrors the xAI CLI device-flow scope (see the xgroxy
+	// reference): "api:access" is what the API enforces on chat calls, the
+	// rest cover the CLI surfaces (conversations, workspaces) and refresh.
+	defaultXAIScope = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write"
 )
 
 // SupabaseTokenData represents stored Supabase OAuth tokens.

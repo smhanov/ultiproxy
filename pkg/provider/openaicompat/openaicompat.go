@@ -696,6 +696,7 @@ func (p *Provider) startXAI(ctx context.Context) (*provider.LoginStartInfo, erro
 		ClientID:      defaultXAIClientID,
 		DeviceAuthURL: deviceURL,
 		TokenURL:      tokenURL,
+		Scope:         defaultXAIScope,
 		HTTPClient:    p.httpClient,
 	}
 
