@@ -212,6 +212,18 @@ func NewFromState(home, stateDir string, httpClient *http.Client) *Provider {
 	})
 }
 
+// HasToken reports whether a usable OAuth credential exists in storage. A
+// freshly-installed host must register ZERO lanes (no config file, no external
+// tool state), so antigravity is only registered when the user has actually
+// completed login.
+func (p *Provider) HasToken() bool {
+	if p == nil || p.authManager == nil {
+		return false
+	}
+	cred, err := p.authManager.LoadFromDisk(p.clientID)
+	return err == nil && cred.AccessToken != ""
+}
+
 // Name implements InferenceProvider, QuotaProvider, and AuthProvider.
 func (p *Provider) Name() string {
 	return "antigravity"

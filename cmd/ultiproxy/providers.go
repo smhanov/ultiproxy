@@ -292,7 +292,7 @@ func registerProviders(registry *provider.Registry) {
 			} else {
 				log.Printf("[providers] xai: %v", err)
 			}
-		} else if mgrErr == nil {
+		} else if mgrErr == nil && managerHasToken(mgr, xaiDefaultClientID) {
 			if p, err := openaicompat.New(openaicompat.Config{
 				Name:    "xai",
 				BaseURL: xaiDefaultBaseURL,
@@ -319,14 +319,15 @@ func registerProviders(registry *provider.Registry) {
 		} else if tok := firstEnv("ULTIPROXY_CODEX_TOKEN"); tok != "" {
 			p := codex.New(codex.Config{StaticToken: tok})
 			add("codex", p.ProviderBundle())
-		} else if mgrErr == nil {
+		} else if mgrErr == nil && managerHasToken(mgr, codex.DefaultClientID) {
 			p := codex.New(codex.Config{AuthManager: mgr, ClientID: codex.DefaultClientID})
 			add("codex", p.ProviderBundle())
 		}
 	}
 
-	// Antigravity — ultiproxy-owned OAuth only.
-	if p := antigravity.NewFromState(home, stateDir, nil); p != nil {
+	// Antigravity — ultiproxy-owned OAuth only; registers only when a real token
+	// exists (a fresh install registers zero lanes).
+	if p := antigravity.NewFromState(home, stateDir, nil); p != nil && p.HasToken() {
 		add("antigravity", p.ProviderBundle())
 	}
 
