@@ -1,5 +1,9 @@
 # Agent notes — ultiproxy
 
+## Task tracking: plans/todo.md
+
+Use the untracked `plans/todo.md` as the running list of future/outstanding tasks (status column: `todo` → `in-progress` → `done`, with a Done table carrying commit hashes). When you finish work or discover a new follow-up, update it — don't leave task state only in conversation.
+
 ## llmhub changes MUST go through PRs
 
 - ultiproxy depends on `github.com/smhanov/llmhub` via a local `replace` (`go.mod`: `replace github.com/smhanov/llmhub => ../llmhub`).
