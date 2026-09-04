@@ -135,8 +135,8 @@ func TestHubResponseToIR_AllContentTypes(t *testing.T) {
 	if len(blocks) != 3 {
 		t.Fatalf("expected 3 blocks, got %d", len(blocks))
 	}
-	assertIRTextBlock(t, blocks[0], "hello ")
-	assertIRReasoningBlock(t, blocks[1], ir.ReasoningText, "thinking")
+	assertIRReasoningBlock(t, blocks[0], ir.ReasoningText, "thinking")
+	assertIRTextBlock(t, blocks[1], "hello ")
 	assertIRToolCallBlock(t, blocks[2], "tc1", "weather", `{"city":"nyc"}`)
 
 	if irResp.Usage == nil {
@@ -193,8 +193,8 @@ func TestStreamBridge_Events(t *testing.T) {
 
 	want := []ir.Event{
 		ir.EventMessageStart{ID: "stream-1"},
-		ir.EventTextDelta{Text: "Hello"},
 		ir.EventReasoningDelta{Text: "think"},
+		ir.EventTextDelta{Text: "Hello"},
 		ir.EventToolCallStart{Index: 0, ID: "tc1", Name: "weather"},
 		ir.EventToolArgumentsDelta{Index: 0, Arguments: `{"ci`},
 		ir.EventToolCallStop{Index: 0},

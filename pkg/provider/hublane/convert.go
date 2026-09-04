@@ -108,18 +108,26 @@ func HubResponseToIR(resp *llmhub.Response, model string) *ir.Response {
 	}
 
 	var blocks []ir.Block
+	// Reasoning blocks come first (DeepSeek/Anthropic convention: the old
+	// internal converters emitted reasoning before text). Text/tool blocks
+	// follow in upstream order.
+	for _, part := range resp.Content {
+		if rc, ok := part.(*llmhub.ReasoningContent); ok && rc != nil {
+			blocks = append(blocks, ir.ReasoningBlock{
+				ReasoningKind: ir.ReasoningText,
+				Text:          rc.Text,
+			})
+		}
+	}
 	for _, part := range resp.Content {
 		if part == nil {
 			continue
 		}
 		switch p := part.(type) {
+		case *llmhub.ReasoningContent:
+			// Already emitted above.
 		case *llmhub.TextContent:
 			blocks = append(blocks, ir.TextBlock{Text: p.Text})
-		case *llmhub.ReasoningContent:
-			blocks = append(blocks, ir.ReasoningBlock{
-				ReasoningKind: ir.ReasoningText,
-				Text:          p.Text,
-			})
 		case *llmhub.ToolCallContent:
 			blocks = append(blocks, ir.ToolCallBlock{
 				Index:     p.Index,
@@ -170,13 +178,13 @@ func finishReasonFromRaw(raw interface{}) string {
 // StreamBridge reads llmhub streaming chunks and emits normalized IR events.
 //
 // Event order per chunk:
-//   1. EventMessageStart on the first chunk with a non-empty ID.
-//   2. EventTextDelta for chunk.Delta.
-//   3. EventReasoningDelta for chunk.ReasoningDelta.
-//   4. For each tool call in chunk.ToolCalls: start, arguments delta, stop.
-//   5. EventUsageUpdate if chunk.Usage is present.
-//   6. EventMessageStop if chunk.FinishReason is set or chunk.Done is true.
-//   7. EventUpstreamError if chunk.Err is set.
+//  1. EventMessageStart on the first chunk with a non-empty ID.
+//  2. EventTextDelta for chunk.Delta.
+//  3. EventReasoningDelta for chunk.ReasoningDelta.
+//  4. For each tool call in chunk.ToolCalls: start, arguments delta, stop.
+//  5. EventUsageUpdate if chunk.Usage is present.
+//  6. EventMessageStop if chunk.FinishReason is set or chunk.Done is true.
+//  7. EventUpstreamError if chunk.Err is set.
 //
 // The returned channel is closed when the input channel closes or the context
 // is cancelled.
@@ -199,11 +207,13 @@ func StreamBridge(ctx context.Context, hubChan <-chan llmhub.StreamChunk) <-chan
 					started = true
 				}
 
-				if chunk.Delta != "" {
-					out <- ir.EventTextDelta{Text: chunk.Delta}
-				}
+				// Reasoning delta MUST precede text delta (DeepSeek requirement,
+				// preserved from the previous internal/openai stream client).
 				if chunk.ReasoningDelta != "" {
 					out <- ir.EventReasoningDelta{Text: chunk.ReasoningDelta}
+				}
+				if chunk.Delta != "" {
+					out <- ir.EventTextDelta{Text: chunk.Delta}
 				}
 
 				for _, tc := range chunk.ToolCalls {
