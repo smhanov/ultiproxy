@@ -296,7 +296,7 @@ func registerProviders(registry *provider.Registry) {
 	if ocKey != "" || (ocWorkspace != "" && ocCookie != "") {
 		if p, err := openaicompat.New(openaicompat.Config{
 			Name:          "opencode",
-			BaseURL:       "https://opencode.ai",
+			BaseURL:       "https://opencode.ai/zen/go/v1",
 			APIKey:        ocKey,
 			WorkspaceID:   ocWorkspace,
 			SessionCookie: ocCookie,
