@@ -9,6 +9,8 @@ type ModelAlias struct {
 	ContextLimit    int                `json:"context_limit,omitempty"`
 	MaxOutput       int                `json:"max_output,omitempty"`
 	PricingTag      string             `json:"pricing_tag,omitempty"`
+	InputCost       float64            `json:"input_cost,omitempty"`
+	OutputCost      float64            `json:"output_cost,omitempty"`
 	BenchmarkScores map[string]float64 `json:"benchmarks,omitempty"`
 }
 

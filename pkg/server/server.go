@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/smhanov/ultiproxy/pkg/mcp"
@@ -32,6 +33,20 @@ type Server struct {
 	mcpLaneBuilder func(name, kind, apiKey string) (provider.Provider, error)
 	httpServer     *http.Server
 	mux            *http.ServeMux
+	// requestIDSeq allocates the request ids that tie the request, attempt and
+	// usage telemetry rows of one dispatch together. See nextRequestID.
+	requestIDSeq atomic.Int64
+}
+
+// nextRequestID returns a unique positive request id.
+//
+// Ids are minted by the proxy instead of by SQLite because the attempt and
+// usage rows of a dispatch are recorded before its terminal request row (the
+// outcome is only known at the end) and must reference it. The sequence is
+// seeded from the wall clock, so ids stay unique across restarts even though
+// the requests table also auto-assigns small rowids for id-less rows.
+func (s *Server) nextRequestID() int64 {
+	return s.requestIDSeq.Add(1)
 }
 
 // Option configures Server.
@@ -87,6 +102,7 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		registry: registry,
 		mux:      http.NewServeMux(),
 	}
+	s.requestIDSeq.Store(time.Now().UnixNano())
 
 	for _, opt := range opts {
 		opt(s)
@@ -312,6 +328,8 @@ func (b *catalogBridge) List() map[string]mcp.ModelAlias {
 			ContextLimit:    entry.ContextLimit,
 			MaxOutput:       entry.MaxOutput,
 			PricingTag:      entry.PricingTag,
+			InputCost:       entry.InputCost,
+			OutputCost:      entry.OutputCost,
 			BenchmarkScores: entry.BenchmarkScores,
 		}
 	}
@@ -327,6 +345,8 @@ func (b *catalogBridge) Set(alias string, entry mcp.ModelAlias) error {
 		ContextLimit:    entry.ContextLimit,
 		MaxOutput:       entry.MaxOutput,
 		PricingTag:      entry.PricingTag,
+		InputCost:       entry.InputCost,
+		OutputCost:      entry.OutputCost,
 		BenchmarkScores: entry.BenchmarkScores,
 	}); err != nil {
 		return err

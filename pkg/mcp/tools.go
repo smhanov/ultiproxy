@@ -104,6 +104,8 @@ var standardTools = []Tool{
 				"context_limit": {Type: "number", Description: "Optional context window size"},
 				"max_output":    {Type: "number", Description: "Optional max output tokens"},
 				"pricing_tag":   {Type: "string", Description: "Optional pricing label"},
+				"input_cost":    {Type: "number", Description: "Optional input price in US dollars per 1M prompt tokens (drives cost accounting)"},
+				"output_cost":   {Type: "number", Description: "Optional output price in US dollars per 1M completion tokens (drives cost accounting)"},
 			},
 			Required: []string{"alias", "provider", "upstream"},
 		},
@@ -620,6 +622,8 @@ func (s *Server) toolSetModelAlias(ctx context.Context, argsRaw json.RawMessage)
 		ContextLimit int                `json:"context_limit"`
 		MaxOutput    int                `json:"max_output"`
 		PricingTag   string             `json:"pricing_tag"`
+		InputCost    float64            `json:"input_cost"`
+		OutputCost   float64            `json:"output_cost"`
 		Benchmarks   map[string]float64 `json:"benchmarks"`
 	}
 	if err := json.Unmarshal(argsRaw, &args); err != nil {
@@ -634,6 +638,8 @@ func (s *Server) toolSetModelAlias(ctx context.Context, argsRaw json.RawMessage)
 		ContextLimit:    args.ContextLimit,
 		MaxOutput:       args.MaxOutput,
 		PricingTag:      args.PricingTag,
+		InputCost:       args.InputCost,
+		OutputCost:      args.OutputCost,
 		BenchmarkScores: args.Benchmarks,
 	}
 	if args.Alias == "" || entry.Provider == "" || entry.Upstream == "" {

@@ -233,6 +233,73 @@ func (s *Server) dispatchRequest(
 	startTime := time.Now()
 	clientKeyHash := ClientKeyHashFromContext(r.Context())
 
+	// reqID ties this dispatch's request, attempt and usage telemetry rows
+	// together (storage.AttemptRecord.RequestID / UsageRecord.RequestID point
+	// at storage.RequestRecord.ID), so usage queries can join back to the
+	// request that produced them.
+	reqID := s.nextRequestID()
+
+	// The request row is opened before its children and re-written with the
+	// terminal outcome: storage upserts a record carrying a positive id, so
+	// attempts and usage (which reference requests.id through a foreign key)
+	// always land on an existing parent row, even when the writer flushes one
+	// item per transaction.
+	lastProvider := ""
+	requestOpened := false
+	openRequestRow := func() {
+		if s.writer == nil || requestOpened {
+			return
+		}
+		requestOpened = true
+		_ = s.writer.TrackRequest(storage.RequestRecord{
+			ID:             reqID,
+			ClientKeyHash:  clientKeyHash,
+			RequestedModel: model,
+			ResolvedModel:  model,
+			Provider:       lastProvider,
+			CreatedAt:      startTime.UTC().Format(time.RFC3339),
+			StreamComplete: 0,
+			ErrorClass:     "in_flight",
+		})
+	}
+
+	// trackAttempt records one provider attempt, opening the request row first so
+	// the attempt request_id foreign key is satisfied.
+	trackAttempt := func(rec storage.AttemptRecord) {
+		if s.writer == nil {
+			return
+		}
+		openRequestRow()
+		_ = s.writer.TrackAttempt(rec)
+	}
+
+	// recordRequest writes the terminal request row exactly once per dispatch:
+	// on success, on client disconnect, and when every candidate provider fails
+	// before commit. Attempt and usage rows already reference reqID, so a
+	// missing request row would orphan them (and break the usage joins).
+	requestTracked := false
+	recordRequest := func(finishReason, errorClass string, streamComplete int, ttftMs int64) {
+		if s.writer == nil || requestTracked {
+			return
+		}
+		requestTracked = true
+		openRequestRow()
+		_ = s.writer.TrackRequest(storage.RequestRecord{
+			ID:             reqID,
+			ClientKeyHash:  clientKeyHash,
+			RequestedModel: model,
+			ResolvedModel:  model,
+			Provider:       lastProvider,
+			CreatedAt:      startTime.UTC().Format(time.RFC3339),
+			CompletedAt:    time.Now().UTC().Format(time.RFC3339),
+			FinishReason:   finishReason,
+			StreamComplete: streamComplete,
+			ErrorClass:     errorClass,
+			TTFTMs:         ttftMs,
+			TotalMs:        time.Since(startTime).Milliseconds(),
+		})
+	}
+
 	failedProviders := make(map[string]bool)
 	var lastErr error
 	maxAttempts := 3
@@ -255,7 +322,11 @@ func (s *Server) dispatchRequest(
 				renderFailedBeforeCommit(w, err, "")
 				return
 			}
-			// No provider available
+			// No provider available: every candidate lane has failed, so close
+			// the request row the recorded attempts point at.
+			if requestOpened {
+				recordRequest("", errorClassFromError(err), 0, 0)
+			}
 			renderFailedBeforeCommit(w, lastErr, fmt.Sprintf("no available provider for model %q: %v", model, err))
 			return
 		}
@@ -277,6 +348,7 @@ func (s *Server) dispatchRequest(
 			failedProviders[provName] = true
 			continue
 		}
+		lastProvider = provName
 
 		if toolsRequested && !prov.Capabilities.Tools {
 			w.Header().Set("Content-Type", "application/json")
@@ -327,33 +399,34 @@ func (s *Server) dispatchRequest(
 			if syncErr != nil {
 				lastErr = syncErr
 				// Synchronous error BEFORE headers committed -> failover!
-				if s.writer != nil {
-					_ = s.writer.TrackAttempt(storage.AttemptRecord{
-						Attempt:    attemptCount,
-						Provider:   provName,
-						Model:      model,
-						StatusCode: http.StatusBadGateway,
-						ErrorClass: "stream_sync_error",
-					})
-				}
+				trackAttempt(storage.AttemptRecord{
+					RequestID:  reqID,
+					Attempt:    attemptCount,
+					Provider:   provName,
+					Model:      model,
+					StatusCode: http.StatusBadGateway,
+					ErrorClass: "stream_sync_error",
+				})
 				failedProviders[provName] = true
 				continue
 			}
 
 			// Read first event synchronously before committing headers!
+			// ttft is measured when headers commit (first event) and reused when the
+			// client disconnects mid-stream.
+			var ttft int64
 			select {
 			case firstEvt, ok := <-streamChan:
 				if !ok {
 					// Channel closed immediately without events
-					if s.writer != nil {
-						_ = s.writer.TrackAttempt(storage.AttemptRecord{
-							Attempt:    attemptCount,
-							Provider:   provName,
-							Model:      model,
-							StatusCode: http.StatusBadGateway,
-							ErrorClass: "stream_empty",
-						})
-					}
+					trackAttempt(storage.AttemptRecord{
+						RequestID:  reqID,
+						Attempt:    attemptCount,
+						Provider:   provName,
+						Model:      model,
+						StatusCode: http.StatusBadGateway,
+						ErrorClass: "stream_empty",
+					})
 					failedProviders[provName] = true
 					continue
 				}
@@ -361,22 +434,21 @@ func (s *Server) dispatchRequest(
 				if upErr, isUpErr := firstEvt.(ir.EventUpstreamError); isUpErr {
 					lastErr = fmt.Errorf("upstream error: %s", upErr.Kind)
 					// Upstream error BEFORE headers committed -> failover!
-					if s.writer != nil {
-						_ = s.writer.TrackAttempt(storage.AttemptRecord{
-							Attempt:           attemptCount,
-							Provider:          provName,
-							Model:             model,
-							StatusCode:        http.StatusBadGateway,
-							ErrorClass:        upErr.Kind,
-							RetryAfterSeconds: upErr.RetryAfterSeconds,
-						})
-					}
+					trackAttempt(storage.AttemptRecord{
+						RequestID:         reqID,
+						Attempt:           attemptCount,
+						Provider:          provName,
+						Model:             model,
+						StatusCode:        http.StatusBadGateway,
+						ErrorClass:        upErr.Kind,
+						RetryAfterSeconds: upErr.RetryAfterSeconds,
+					})
 					failedProviders[provName] = true
 					continue
 				}
 
 				// First event is valid: COMMIT HEADERS!
-				ttft := time.Since(startTime).Milliseconds()
+				ttft = time.Since(startTime).Milliseconds()
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.Header().Set("Cache-Control", "no-cache")
 				w.Header().Set("Connection", "keep-alive")
@@ -387,18 +459,22 @@ func (s *Server) dispatchRequest(
 					flusher.Flush()
 				}
 
-				if s.writer != nil {
-					_ = s.writer.TrackAttempt(storage.AttemptRecord{
-						Attempt:    attemptCount,
-						Provider:   provName,
-						Model:      model,
-						StatusCode: http.StatusOK,
-					})
-				}
+				trackAttempt(storage.AttemptRecord{
+					RequestID:  reqID,
+					Attempt:    attemptCount,
+					Provider:   provName,
+					Model:      model,
+					StatusCode: http.StatusOK,
+				})
 
 				// NO FAILOVER AFTER FIRST BYTE: stream rest of events
 				var finishReason string
 				var errorClass string
+				// Usage events are cumulative across a stream (Anthropic reports
+				// one per delta): keep the last one and record a single usage row
+				// for the request, so per-event rows cannot double-count tokens or
+				// cost.
+				var lastUsage *ir.EventUsageUpdate
 
 				encoder := createEncoder(w)
 				_ = encoder.EncodeEvent(firstEvt)
@@ -421,13 +497,8 @@ func (s *Server) dispatchRequest(
 					}
 
 					if usageEvt, isUsage := ev.(ir.EventUsageUpdate); isUsage {
-						if s.writer != nil {
-							_ = s.writer.TrackUsage(storage.UsageRecord{
-								PromptTokens:     int64(usageEvt.PromptTokens),
-								CompletionTokens: int64(usageEvt.CompletionTokens),
-								Cost:             usageEvt.Cost,
-							})
-						}
+						usage := usageEvt
+						lastUsage = &usage
 					}
 
 					if stopEvt, isStop := ev.(ir.EventMessageStop); isStop {
@@ -445,25 +516,24 @@ func (s *Server) dispatchRequest(
 					flusher.Flush()
 				}
 
-				totalMs := time.Since(startTime).Milliseconds()
-				if s.writer != nil {
-					_ = s.writer.TrackRequest(storage.RequestRecord{
-						ClientKeyHash:  clientKeyHash,
-						RequestedModel: model,
-						ResolvedModel:  model,
-						Provider:       provName,
-						CreatedAt:      startTime.UTC().Format(time.RFC3339),
-						CompletedAt:    time.Now().UTC().Format(time.RFC3339),
-						FinishReason:   finishReason,
-						StreamComplete: 1,
-						ErrorClass:     errorClass,
-						TTFTMs:         ttft,
-						TotalMs:        totalMs,
-					})
+				if lastUsage != nil {
+					s.trackUsage(reqID, &ir.Usage{
+						PromptTokens:             lastUsage.PromptTokens,
+						CompletionTokens:         lastUsage.CompletionTokens,
+						TotalTokens:              lastUsage.TotalTokens,
+						CacheCreationInputTokens: lastUsage.CacheCreationInputTokens,
+						CacheReadInputTokens:     lastUsage.CacheReadInputTokens,
+						Cost:                     lastUsage.Cost,
+					}, alias)
 				}
+				recordRequest(finishReason, errorClass, 1, ttft)
 				return
 
 			case <-r.Context().Done():
+				// Client went away mid-stream: the request still happened, and its
+				// attempts/usage rows are already queued against reqID, so close the
+				// request row instead of orphaning them.
+				recordRequest("", "client_disconnected", 0, ttft)
 				return
 			}
 
@@ -472,48 +542,28 @@ func (s *Server) dispatchRequest(
 			resp, genErr := prov.Inference.Generate(reqCtx, messages, opts...)
 			if genErr != nil {
 				lastErr = genErr
-				if s.writer != nil {
-					_ = s.writer.TrackAttempt(storage.AttemptRecord{
-						Attempt:    attemptCount,
-						Provider:   provName,
-						Model:      model,
-						StatusCode: http.StatusBadGateway,
-						ErrorClass: "generate_error",
-					})
-				}
+				trackAttempt(storage.AttemptRecord{
+					RequestID:  reqID,
+					Attempt:    attemptCount,
+					Provider:   provName,
+					Model:      model,
+					StatusCode: http.StatusBadGateway,
+					ErrorClass: "generate_error",
+				})
 				failedProviders[provName] = true
 				continue // Failover before commit!
 			}
 
 			// Generate success: commit response
-			if s.writer != nil {
-				_ = s.writer.TrackAttempt(storage.AttemptRecord{
-					Attempt:    attemptCount,
-					Provider:   provName,
-					Model:      model,
-					StatusCode: http.StatusOK,
-				})
-				if resp.Usage != nil {
-					_ = s.writer.TrackUsage(storage.UsageRecord{
-						PromptTokens:     int64(resp.Usage.PromptTokens),
-						CompletionTokens: int64(resp.Usage.CompletionTokens),
-						ReasoningTokens:  int64(resp.Usage.ReasoningTokens),
-						Cost:             resp.Usage.Cost,
-					})
-				}
-				totalMs := time.Since(startTime).Milliseconds()
-				_ = s.writer.TrackRequest(storage.RequestRecord{
-					ClientKeyHash:  clientKeyHash,
-					RequestedModel: model,
-					ResolvedModel:  model,
-					Provider:       provName,
-					CreatedAt:      startTime.UTC().Format(time.RFC3339),
-					CompletedAt:    time.Now().UTC().Format(time.RFC3339),
-					FinishReason:   resp.FinishReason,
-					StreamComplete: 1,
-					TotalMs:        totalMs,
-				})
-			}
+			trackAttempt(storage.AttemptRecord{
+				RequestID:  reqID,
+				Attempt:    attemptCount,
+				Provider:   provName,
+				Model:      model,
+				StatusCode: http.StatusOK,
+			})
+			s.trackUsage(reqID, resp.Usage, alias)
+			recordRequest(resp.FinishReason, "", 1, 0)
 
 			outBytes, err := encodeResponse(resp, model)
 			if err != nil {
@@ -528,13 +578,16 @@ func (s *Server) dispatchRequest(
 		}
 	}
 
-	// All candidate providers failed before commit
+	// All candidate providers failed before commit: close the request row so the
+	// recorded attempts are not orphaned and the failure is counted.
+	recordRequest("", errorClassFromError(lastErr), 0, 0)
 	renderFailedBeforeCommit(w, lastErr, "all candidate providers failed before commit")
 }
 
 // upstreamOptions builds the provider option slice for one dispatch attempt:
 // the client key hash for accounting, the resolved upstream model id (applied
-// after the codec's own options so it wins), and the catalog alias output cap.
+// after the codec's own options so it wins), the catalog alias output cap and
+// the catalog alias pricing.
 //
 // A catalog alias MaxOutput clamps max_tokens: a request that asks for more
 // output tokens than the alias allows is reduced to the alias limit, and a
@@ -544,13 +597,22 @@ func (s *Server) dispatchRequest(
 // estimating prompt token counts per provider would require a tokenizer the
 // proxy does not own.
 func upstreamOptions(base []provider.Option, upstream string, alias ModelAlias, hasAlias bool, clientKeyHash string) []provider.Option {
-	opts := make([]provider.Option, 0, len(base)+3)
+	opts := make([]provider.Option, 0, len(base)+4)
 	opts = append(opts, base...)
 	opts = append(opts,
 		provider.WithClientKeyHash(clientKeyHash),
 		provider.WithModel(upstream),
 	)
-	if !hasAlias || alias.MaxOutput <= 0 {
+	if !hasAlias {
+		return opts
+	}
+	if alias.InputCost > 0 || alias.OutputCost > 0 {
+		// Alias pricing rides along so llmhub lanes can price the request
+		// themselves; the recorded usage cost is back-filled from the same rates
+		// when the upstream reports none (see trackUsage).
+		opts = append(opts, provider.WithCost(alias.InputCost, alias.OutputCost))
+	}
+	if alias.MaxOutput <= 0 {
 		return opts
 	}
 	cfg := provider.NewRequestConfig(opts...)
@@ -560,32 +622,78 @@ func upstreamOptions(base []provider.Option, upstream string, alias ModelAlias, 
 	return append(opts, provider.WithMaxTokens(alias.MaxOutput))
 }
 
-func renderFailedBeforeCommit(w http.ResponseWriter, lastErr error, fallbackMsg string) {
-	statusCode := http.StatusBadGateway
-	errMsg := fallbackMsg
-	errType := "bad_gateway"
+// trackUsage records the token/cost accounting row of one dispatch.
+//
+// Cost is whatever the upstream reported (llmhub lanes: provider-reported cost,
+// or the rates supplied through provider.WithCost); when the upstream prices
+// nothing, the resolved alias input_cost/output_cost rates fill the estimate
+// in, so lanes that never report a cost are still accounted for. Cached tokens
+// are recorded as the sum of cache-creation and cache-read input tokens (the
+// two flavours of prompt tokens served from a cache).
+func (s *Server) trackUsage(reqID int64, u *ir.Usage, alias ModelAlias) {
+	if s.writer == nil || u == nil {
+		return
+	}
+	cost := u.Cost
+	if cost == 0 {
+		cost = estimatedCost(int64(u.PromptTokens), int64(u.CompletionTokens), alias.InputCost, alias.OutputCost)
+	}
+	_ = s.writer.TrackUsage(storage.UsageRecord{
+		RequestID:        reqID,
+		PromptTokens:     int64(u.PromptTokens),
+		CompletionTokens: int64(u.CompletionTokens),
+		ReasoningTokens:  int64(u.ReasoningTokens),
+		CachedTokens:     int64(u.CacheCreationInputTokens + u.CacheReadInputTokens),
+		Cost:             cost,
+	})
+}
+
+// estimatedCost prices a prompt/completion token pair at the given
+// US-dollar-per-million-token rates. Missing rates price nothing, so a
+// provider-reported cost is never overwritten with 0.
+func estimatedCost(promptTokens, completionTokens int64, inputCostPerMillion, outputCostPerMillion float64) float64 {
+	if inputCostPerMillion <= 0 && outputCostPerMillion <= 0 {
+		return 0
+	}
+	return float64(promptTokens)*inputCostPerMillion/1_000_000 + float64(completionTokens)*outputCostPerMillion/1_000_000
+}
+
+// classifyUpstreamError maps a dispatch error onto the HTTP status and the
+// machine-readable error class used both for the client error response and for
+// the telemetry request row.
+func classifyUpstreamError(err error, fallbackMsg string) (statusCode int, errType, errMsg string) {
+	statusCode = http.StatusBadGateway
+	errMsg = fallbackMsg
+	errType = "bad_gateway"
 	var uerr *UnknownModelError
-	if errors.As(lastErr, &uerr) {
-		statusCode = http.StatusNotFound
-		errType = "unknown_model"
-		errMsg = uerr.Error()
-	} else if lastErr != nil {
-		errMsg = lastErr.Error()
+	if errors.As(err, &uerr) {
+		return http.StatusNotFound, "unknown_model", uerr.Error()
+	}
+	if err != nil {
+		errMsg = err.Error()
 		msgLower := strings.ToLower(errMsg)
 		if strings.Contains(msgLower, "status 429") || strings.Contains(msgLower, "http 429") || strings.Contains(msgLower, "429 too many") || strings.Contains(msgLower, "resource_exhausted") || strings.Contains(msgLower, "quota_exceeded") || strings.Contains(msgLower, "daily token limit") || strings.Contains(msgLower, "rate limit") {
-			statusCode = http.StatusTooManyRequests
-			errType = "rate_limit_exceeded"
+			return http.StatusTooManyRequests, "rate_limit_exceeded", errMsg
 		} else if strings.Contains(msgLower, "status 401") || strings.Contains(msgLower, "http 401") || strings.Contains(msgLower, "unauthorized") {
-			statusCode = http.StatusUnauthorized
-			errType = "authentication_error"
+			return http.StatusUnauthorized, "authentication_error", errMsg
 		} else if strings.Contains(msgLower, "status 403") || strings.Contains(msgLower, "http 403") || strings.Contains(msgLower, "forbidden") {
-			statusCode = http.StatusForbidden
-			errType = "permission_denied"
+			return http.StatusForbidden, "permission_denied", errMsg
 		} else if strings.Contains(msgLower, "status 404") || strings.Contains(msgLower, "http 404") || strings.Contains(msgLower, "not found") {
-			statusCode = http.StatusNotFound
-			errType = "not_found"
+			return http.StatusNotFound, "not_found", errMsg
 		}
 	}
+	return statusCode, errType, errMsg
+}
+
+// errorClassFromError returns the machine-readable error class of a failed
+// dispatch (see classifyUpstreamError).
+func errorClassFromError(err error) string {
+	_, errType, _ := classifyUpstreamError(err, "")
+	return errType
+}
+
+func renderFailedBeforeCommit(w http.ResponseWriter, lastErr error, fallbackMsg string) {
+	statusCode, errType, errMsg := classifyUpstreamError(lastErr, fallbackMsg)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(map[string]any{

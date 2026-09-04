@@ -26,11 +26,17 @@ import (
 // is not enforced, because estimating prompt tokens would require a
 // provider-specific tokenizer.
 type ModelAlias struct {
-	Provider        string             `yaml:"provider" json:"provider"`
-	Upstream        string             `yaml:"upstream" json:"upstream"`
-	ContextLimit    int                `yaml:"context_limit,omitempty" json:"context_limit,omitempty"`
-	MaxOutput       int                `yaml:"max_output,omitempty" json:"max_output,omitempty"`
-	PricingTag      string             `yaml:"pricing_tag,omitempty" json:"pricing_tag,omitempty"`
+	Provider     string `yaml:"provider" json:"provider"`
+	Upstream     string `yaml:"upstream" json:"upstream"`
+	ContextLimit int    `yaml:"context_limit,omitempty" json:"context_limit,omitempty"`
+	MaxOutput    int    `yaml:"max_output,omitempty" json:"max_output,omitempty"`
+	PricingTag   string `yaml:"pricing_tag,omitempty" json:"pricing_tag,omitempty"`
+	// InputCost / OutputCost price the alias in US dollars per 1M prompt /
+	// completion tokens. They ride along on the request as provider.WithCost
+	// (llmhub lanes) and back-fill the recorded usage cost when the upstream
+	// reports none, so accounting works on lanes that never price themselves.
+	InputCost       float64            `yaml:"input_cost,omitempty" json:"input_cost,omitempty"`
+	OutputCost      float64            `yaml:"output_cost,omitempty" json:"output_cost,omitempty"`
 	BenchmarkScores map[string]float64 `yaml:"benchmarks,omitempty" json:"benchmarks,omitempty"`
 }
 

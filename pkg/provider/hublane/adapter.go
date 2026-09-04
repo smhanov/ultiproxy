@@ -136,6 +136,11 @@ func (a *Adapter) hubOpts(cfg *provider.RequestConfig) []llmhub.Option {
 	for k, v := range cfg.Headers {
 		opts = append(opts, llmhub.WithHeader(k, v))
 	}
+	if cfg.InputCostPerMillion > 0 || cfg.OutputCostPerMillion > 0 {
+		// Per-million-token pricing (usually from a model alias) so llmhub can
+		// estimate cost when the upstream does not report one.
+		opts = append(opts, llmhub.WithCost(cfg.InputCostPerMillion, cfg.OutputCostPerMillion))
+	}
 
 	extra := make(map[string]json.RawMessage)
 	for k, v := range cfg.ExtraBody {

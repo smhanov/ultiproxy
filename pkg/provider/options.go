@@ -22,6 +22,11 @@ type RequestConfig struct {
 	Timeout         time.Duration
 	// ClientKeyHash identifies the downstream API key owner for accounting.
 	ClientKeyHash string
+	// InputCostPerMillion / OutputCostPerMillion price a request in US dollars
+	// per 1M prompt / completion tokens. Used for cost accounting when the
+	// upstream does not report a cost itself.
+	InputCostPerMillion  float64
+	OutputCostPerMillion float64
 }
 
 // ApplyOptions applies opts to cfg in order.
@@ -78,6 +83,16 @@ func WithExtraBody(kv map[string]any) Option {
 		for k, v := range kv {
 			c.ExtraBody[k] = v
 		}
+	}
+}
+
+// WithCost sets per-million-token pricing (input and output, US dollars) so
+// usage accounting can attribute a cost to the request. A cost reported by the
+// upstream always takes precedence over these rates.
+func WithCost(inputCostPerMillion, outputCostPerMillion float64) Option {
+	return func(c *RequestConfig) {
+		c.InputCostPerMillion = inputCostPerMillion
+		c.OutputCostPerMillion = outputCostPerMillion
 	}
 }
 

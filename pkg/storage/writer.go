@@ -166,6 +166,10 @@ func (w *Writer) enqueue(item any) error {
 }
 
 // TrackRequest enqueues a request record non-blockingly.
+//
+// A record with a positive ID is upserted, so a caller may open the row early
+// (before any attempt/usage rows that reference it) and write the terminal
+// outcome later.
 func (w *Writer) TrackRequest(req RequestRecord) error {
 	return w.enqueue(req)
 }
@@ -248,9 +252,29 @@ func (w *Writer) writeBatch(batch []any) {
 	}
 	defer tx.Rollback()
 
+	// The requests row is written as an upsert: callers open it (id only, plus
+	// what is known at dispatch start) before recording attempts/usage against
+	// it, then re-write it with the terminal outcome. request_attempts and
+	// usage reference requests(id) with a foreign key, so the parent has to be
+	// in place before the children even when a batch flushes one item at a
+	// time. Rows without an explicit id get a fresh auto rowid and never
+	// conflict.
 	reqStmt, _ := tx.Prepare(`
 INSERT INTO requests (id, client_key_hash, logical_id, requested_model, resolved_model, provider, created_at, completed_at, finish_reason, stream_complete, error_class, ttft_ms, total_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+    client_key_hash = excluded.client_key_hash,
+    logical_id = excluded.logical_id,
+    requested_model = excluded.requested_model,
+    resolved_model = excluded.resolved_model,
+    provider = excluded.provider,
+    created_at = excluded.created_at,
+    completed_at = excluded.completed_at,
+    finish_reason = excluded.finish_reason,
+    stream_complete = excluded.stream_complete,
+    error_class = excluded.error_class,
+    ttft_ms = excluded.ttft_ms,
+    total_ms = excluded.total_ms;
 `)
 	if reqStmt != nil {
 		defer reqStmt.Close()
