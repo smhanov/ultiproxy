@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/smhanov/ultiproxy/pkg/ir"
+	"github.com/smhanov/ultiproxy/pkg/provider"
 )
 
 // TestOpenCode_StreamToolCallReassembly verifies that fragmented streaming tool
@@ -475,4 +478,128 @@ func TestOpenCode_UnknownModelIs404(t *testing.T) {
 	if h.FakeUpstream.RequestCount() != 0 {
 		t.Errorf("expected 0 upstream requests across all fakes, got %d", h.FakeUpstream.RequestCount())
 	}
+}
+
+type countingInferenceProvider struct {
+	provider.InferenceProvider
+	calls int
+}
+
+func (c *countingInferenceProvider) Generate(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (*ir.Response, error) {
+	c.calls++
+	return c.InferenceProvider.Generate(ctx, msgs, opts...)
+}
+
+func (c *countingInferenceProvider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (<-chan ir.Event, error) {
+	c.calls++
+	return c.InferenceProvider.Stream(ctx, msgs, opts...)
+}
+
+// TestCapabilityGateOnTools verifies that requests carrying tools routed to a provider
+// lacking tools capability return HTTP 409 Conflict without invoking upstream or provider,
+// while requests routed to a tools-capable provider succeed and forward tools.
+func TestCapabilityGateOnTools(t *testing.T) {
+	fake := NewFakeUpstream()
+
+	fpNoTools, err := NewFakeProvider("notools", fake)
+	if err != nil {
+		t.Fatalf("failed to create fake provider: %v", err)
+	}
+	countingNoTools := &countingInferenceProvider{InferenceProvider: fpNoTools}
+
+	noToolsBundle := provider.Provider{
+		Inference: countingNoTools,
+		Capabilities: provider.Capabilities{
+			Chat:  true,
+			Tools: false,
+		},
+	}
+
+	h := NewTestHarness(t, WithFakeUpstream(fake), WithProvider(noToolsBundle))
+
+	toolsReq := map[string]any{
+		"model": "notools/test-model",
+		"messages": []map[string]any{
+			{"role": "user", "content": "Run tool"},
+		},
+		"tools": []any{
+			map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        "calculator",
+					"description": "Calculate math expressions",
+					"parameters": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"expression": map[string]any{"type": "string"},
+						},
+						"required": []string{"expression"},
+					},
+				},
+			},
+		},
+	}
+
+	// Case a: Provider bundle declaring Capabilities.Tools=false + a request WITH tools
+	// -> HTTP 409, error type "model_does_not_support_tools", ZERO upstream requests,
+	// and Inference.Stream/Generate must NOT be called.
+	t.Run("tools_requested_on_provider_without_tools_capability", func(t *testing.T) {
+		resp, body, err := h.PostChat(context.Background(), toolsReq)
+		if err != nil {
+			t.Fatalf("PostChat failed: %v", err)
+		}
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("expected status 409 Conflict, got %d: %v", resp.StatusCode, body)
+		}
+		errObj, ok := body["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected error object in body, got %#v", body)
+		}
+		if errObj["type"] != "model_does_not_support_tools" {
+			t.Errorf("expected error type %q, got %v", "model_does_not_support_tools", errObj["type"])
+		}
+		expectedMsg := "model notools/test-model does not support tools"
+		if errObj["message"] != expectedMsg {
+			t.Errorf("expected error message %q, got %v", expectedMsg, errObj["message"])
+		}
+		if h.FakeUpstream.RequestCount() != 0 {
+			t.Errorf("expected 0 upstream requests, got %d", h.FakeUpstream.RequestCount())
+		}
+		if countingNoTools.calls != 0 {
+			t.Errorf("expected 0 provider inference calls, got %d", countingNoTools.calls)
+		}
+	})
+
+	// Case b: Same tools request routed to a Tools:true lane -> NOT gated
+	// (tools reach upstream; assert the upstream request contains the tools payload as today).
+	t.Run("tools_requested_on_provider_with_tools_capability", func(t *testing.T) {
+		h.FakeUpstream.QueueChatCompletion("ok")
+
+		toolsReqWithTools := map[string]any{
+			"model":    "opencode/test-model",
+			"messages": toolsReq["messages"],
+			"tools":    toolsReq["tools"],
+		}
+
+		resp, body, err := h.PostChat(context.Background(), toolsReqWithTools)
+		if err != nil {
+			t.Fatalf("PostChat failed: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200 OK, got %d: %v", resp.StatusCode, body)
+		}
+		if h.FakeUpstream.RequestCount() != 1 {
+			t.Fatalf("expected 1 upstream request, got %d", h.FakeUpstream.RequestCount())
+		}
+		rec := h.FakeUpstream.LastRequest()
+		if rec == nil {
+			t.Fatal("expected upstream request to be recorded")
+		}
+		if len(rec.Tools) != 1 {
+			t.Fatalf("expected 1 tool upstream, got %d", len(rec.Tools))
+		}
+		if !rec.HasTool("calculator") {
+			t.Errorf("expected upstream to receive calculator tool")
+		}
+	})
 }

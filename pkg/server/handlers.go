@@ -108,6 +108,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.dispatchRequest(w, r, decoded.Messages, decoded.Options, decoded.Model, decoded.Stream,
+		decoded.ToolsRequested,
 		func(writer io.Writer) streamEventEncoder {
 			return codec.NewOpenAIStreamEncoder(writer, decoded.Model, decoded.IncludeUsage)
 		},
@@ -131,6 +132,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.dispatchRequest(w, r, decoded.Messages, decoded.Options, decoded.Model, decoded.Stream,
+		decoded.ToolsRequested,
 		func(writer io.Writer) streamEventEncoder {
 			return codec.NewAnthropicStreamEncoder(writer, decoded.Model)
 		},
@@ -147,6 +149,7 @@ func (s *Server) dispatchRequest(
 	options []provider.Option,
 	model string,
 	stream bool,
+	toolsRequested bool,
 	createEncoder func(io.Writer) streamEventEncoder,
 	encodeResponse func(*ir.Response, string) ([]byte, error),
 ) {
@@ -196,6 +199,18 @@ func (s *Server) dispatchRequest(
 		if !ok || prov.Inference == nil {
 			failedProviders[provName] = true
 			continue
+		}
+
+		if toolsRequested && !prov.Capabilities.Tools {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"message": fmt.Sprintf("model %s does not support tools", model),
+					"type":    "model_does_not_support_tools",
+				},
+			})
+			return
 		}
 
 		opts := append(options, provider.WithClientKeyHash(clientKeyHash))

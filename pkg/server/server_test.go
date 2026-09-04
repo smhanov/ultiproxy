@@ -469,3 +469,81 @@ func TestServer_Upstream429ErrorPreserved(t *testing.T) {
 		t.Errorf("expected error body to contain upstream error message, got: %s", rec.Body.String())
 	}
 }
+
+func TestServer_CapabilityGateOnTools(t *testing.T) {
+	prov := &fakeInferenceProvider{
+		name: "notools",
+	}
+
+	registry := provider.NewRegistry()
+	registry.Register(provider.Provider{
+		Inference: prov,
+		Capabilities: provider.Capabilities{
+			Chat:     true,
+			Messages: true,
+			Tools:    false,
+		},
+	})
+
+	srv := NewServer(nil, registry)
+
+	// 1. OpenAI format with tools -> 409
+	chatBody := `{"model":"notools/gpt-4o","messages":[{"role":"user","content":"Hi"}],"tools":[{"type":"function","function":{"name":"f"}}],"stream":false}`
+	chatReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chatBody))
+	chatRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(chatRec, chatReq)
+
+	if chatRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict, got %d: %s", chatRec.Code, chatRec.Body.String())
+	}
+	if prov.calls != 0 {
+		t.Errorf("expected 0 provider calls, got %d", prov.calls)
+	}
+	var chatErrResp map[string]any
+	if err := json.Unmarshal(chatRec.Body.Bytes(), &chatErrResp); err != nil {
+		t.Fatalf("failed to parse JSON error: %v", err)
+	}
+	errObj, _ := chatErrResp["error"].(map[string]any)
+	if errObj["type"] != "model_does_not_support_tools" {
+		t.Errorf("expected type model_does_not_support_tools, got %v", errObj["type"])
+	}
+	if errObj["message"] != "model notools/gpt-4o does not support tools" {
+		t.Errorf("expected message 'model notools/gpt-4o does not support tools', got %v", errObj["message"])
+	}
+
+	// 2. Anthropic format with tools -> 409
+	prov.calls = 0
+	msgBody := `{"model":"notools/claude-3","messages":[{"role":"user","content":"Hi"}],"max_tokens":100,"tools":[{"name":"calc","description":"calc","input_schema":{"type":"object"}}]}`
+	msgReq := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(msgBody))
+	msgRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(msgRec, msgReq)
+
+	if msgRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict, got %d: %s", msgRec.Code, msgRec.Body.String())
+	}
+	if prov.calls != 0 {
+		t.Errorf("expected 0 provider calls, got %d", prov.calls)
+	}
+	var msgErrResp map[string]any
+	if err := json.Unmarshal(msgRec.Body.Bytes(), &msgErrResp); err != nil {
+		t.Fatalf("failed to parse JSON error: %v", err)
+	}
+	msgErrObj, _ := msgErrResp["error"].(map[string]any)
+	if msgErrObj["type"] != "model_does_not_support_tools" {
+		t.Errorf("expected type model_does_not_support_tools, got %v", msgErrObj["type"])
+	}
+
+	// 3. Request WITHOUT tools to the same provider -> 200 OK
+	prov.calls = 0
+	noToolsBody := `{"model":"notools/gpt-4o","messages":[{"role":"user","content":"Hi"}]}`
+	noToolsReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(noToolsBody))
+	noToolsRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(noToolsRec, noToolsReq)
+
+	if noToolsRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", noToolsRec.Code, noToolsRec.Body.String())
+	}
+	if prov.calls != 1 {
+		t.Errorf("expected 1 provider call for non-tools request, got %d", prov.calls)
+	}
+}

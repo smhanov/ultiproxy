@@ -78,11 +78,12 @@ type OpenAIFunctionCall struct {
 
 // ChatCompletionDecoded contains the parsed messages, options, and metadata from an OpenAI request.
 type ChatCompletionDecoded struct {
-	Messages     []*ir.Message
-	Options      []provider.Option
-	Model        string
-	Stream       bool
-	IncludeUsage bool
+	Messages       []*ir.Message
+	Options        []provider.Option
+	Model          string
+	Stream         bool
+	IncludeUsage   bool
+	ToolsRequested bool
 }
 
 // DecodeChatCompletionRequest translates an incoming OpenAI chat completions JSON payload into IR messages and provider options.
@@ -256,11 +257,12 @@ func DecodeChatCompletionRequest(body []byte) (*ChatCompletionDecoded, error) {
 	}
 
 	return &ChatCompletionDecoded{
-		Messages:     irMessages,
-		Options:      opts,
-		Model:        req.Model,
-		Stream:       req.Stream,
-		IncludeUsage: includeUsage,
+		Messages:       irMessages,
+		Options:        opts,
+		Model:          req.Model,
+		Stream:         req.Stream,
+		IncludeUsage:   includeUsage,
+		ToolsRequested: len(req.Tools) > 0,
 	}, nil
 }
 

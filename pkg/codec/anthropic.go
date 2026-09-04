@@ -73,10 +73,11 @@ type AnthropicCacheControl struct {
 
 // MessagesDecoded contains translated IR messages and options for Anthropic requests.
 type MessagesDecoded struct {
-	Messages []*ir.Message
-	Options  []provider.Option
-	Model    string
-	Stream   bool
+	Messages       []*ir.Message
+	Options        []provider.Option
+	Model          string
+	Stream         bool
+	ToolsRequested bool
 }
 
 // DecodeMessagesRequest translates Anthropic /v1/messages JSON into IR messages and provider options.
@@ -256,10 +257,11 @@ func DecodeMessagesRequest(body []byte) (*MessagesDecoded, error) {
 	}
 
 	return &MessagesDecoded{
-		Messages: irMessages,
-		Options:  opts,
-		Model:    req.Model,
-		Stream:   req.Stream,
+		Messages:       irMessages,
+		Options:        opts,
+		Model:          req.Model,
+		Stream:         req.Stream,
+		ToolsRequested: len(req.Tools) > 0,
 	}, nil
 }
 

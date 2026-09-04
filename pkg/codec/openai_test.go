@@ -84,6 +84,9 @@ func TestDecodeChatCompletionRequest(t *testing.T) {
 	if !decoded.IncludeUsage {
 		t.Errorf("expected IncludeUsage=true")
 	}
+	if !decoded.ToolsRequested {
+		t.Errorf("expected ToolsRequested=true")
+	}
 
 	if len(decoded.Messages) != 4 {
 		t.Fatalf("expected 4 messages, got %d", len(decoded.Messages))
@@ -295,5 +298,8 @@ func TestDecodeServerInputFixture(t *testing.T) {
 	}
 	if len(decoded.Messages) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(decoded.Messages))
+	}
+	if decoded.ToolsRequested {
+		t.Errorf("expected ToolsRequested=false")
 	}
 }

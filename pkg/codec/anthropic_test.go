@@ -66,6 +66,9 @@ func TestDecodeMessagesRequest(t *testing.T) {
 	if !decoded.Stream {
 		t.Errorf("expected stream=true")
 	}
+	if !decoded.ToolsRequested {
+		t.Errorf("expected ToolsRequested=true")
+	}
 
 	// 1 system message + 3 messages = 4 messages
 	if len(decoded.Messages) != 4 {
