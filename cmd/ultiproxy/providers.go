@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/smhanov/llmhub" // dependency retained for upcoming integration
+
 	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/provider/antigravity"
