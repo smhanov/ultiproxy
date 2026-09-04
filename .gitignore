@@ -1,1 +1,4 @@
 /plans/
+
+# local credential safekeeping (never commit)
+.env
