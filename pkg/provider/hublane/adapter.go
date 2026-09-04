@@ -2,6 +2,7 @@ package hublane
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/smhanov/llmhub"
 	"github.com/smhanov/ultiproxy/pkg/ir"
@@ -135,6 +136,27 @@ func (a *Adapter) hubOpts(cfg *provider.RequestConfig) []llmhub.Option {
 	for k, v := range cfg.Headers {
 		opts = append(opts, llmhub.WithHeader(k, v))
 	}
+
+	extra := make(map[string]json.RawMessage)
+	for k, v := range cfg.ExtraBody {
+		if k == "tools" {
+			continue
+		}
+		raw, err := json.Marshal(v)
+		if err == nil {
+			extra[k] = json.RawMessage(raw)
+		}
+	}
+	if cfg.ReasoningEffort != "" {
+		raw, err := json.Marshal(cfg.ReasoningEffort)
+		if err == nil {
+			extra["reasoning_effort"] = json.RawMessage(raw)
+		}
+	}
+	if len(extra) > 0 {
+		opts = append(opts, llmhub.WithExtraBody(extra))
+	}
+
 	return opts
 }
 

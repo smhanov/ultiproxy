@@ -10,9 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/smhanov/llmhub"
+	hubzai "github.com/smhanov/llmhub/providers/zai"
 	"github.com/smhanov/ultiproxy/pkg/ir"
 	"github.com/smhanov/ultiproxy/pkg/provider"
-	"github.com/smhanov/ultiproxy/pkg/provider/internal/openai"
+	"github.com/smhanov/ultiproxy/pkg/provider/hublane"
 )
 
 const (
@@ -45,6 +47,7 @@ type Config struct {
 
 // Provider implements provider.InferenceProvider and provider.QuotaProvider.
 type Provider struct {
+	adapter    *hublane.Adapter
 	cfg        Config
 	httpClient *http.Client
 	baseURL    string
@@ -67,17 +70,33 @@ func New(cfg Config) (*Provider, error) {
 		cfg.APIKey = os.Getenv("ZAI_API_KEY")
 	}
 
-	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = http.DefaultClient
+	client := cfg.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+		cfg.HTTPClient = client
 	}
 
-	return &Provider{
+	p := &Provider{
 		cfg:        cfg,
-		httpClient: cfg.HTTPClient,
+		httpClient: client,
 		baseURL:    cfg.BaseURL,
 		quotaURL:   cfg.QuotaURL,
 		apiKey:     cfg.APIKey,
-	}, nil
+	}
+
+	var hubProv llmhub.Provider
+	var err error
+	if strings.Contains(cfg.BaseURL, "coding") {
+		hubProv, err = hubzai.NewCodingPlan(cfg.APIKey, llmhub.WithBaseURL(cfg.BaseURL), llmhub.WithHTTPClient(client))
+	} else {
+		hubProv, err = hubzai.New(cfg.APIKey, llmhub.WithBaseURL(cfg.BaseURL), llmhub.WithHTTPClient(client))
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	p.adapter = hublane.New(hubProv, hublane.WithCapabilities(Capabilities()), hublane.WithQuotaProvider(p))
+	return p, nil
 }
 
 // Name returns the provider identifier.
@@ -123,42 +142,11 @@ func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...pro
 		model = DefaultModel
 	}
 
+	// Z.ai has model-specific max-token defaults; compute here and forward.
 	maxTokens := p.resolveMaxTokens(model, reqConfig.MaxTokens)
+	opts = append(opts, provider.WithMaxTokens(maxTokens), provider.WithModel(model))
 
-	// Vision is true (glm-5.3-flash etc. support image_url parts)
-	chatMsgs := openai.ConvertMessages(msgs, openai.ConvertOptions{
-		AllowVision:   true,
-		EchoReasoning: true,
-	})
-
-	reqBody := openai.ChatCompletionRequest{
-		Model:           model,
-		Messages:        chatMsgs,
-		Stream:          false,
-		MaxTokens:       maxTokens,
-		Temperature:     reqConfig.Temperature,
-		ReasoningEffort: reqConfig.ReasoningEffort,
-		Extra:           reqConfig.ExtraBody,
-	}
-
-	bodyReader, err := openai.BuildRequestBody(reqBody)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bodyReader)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	}
-	for k, v := range reqConfig.Headers {
-		req.Header.Set(k, v)
-	}
-
-	return openai.ExecuteGenerate(ctx, p.httpClient, req)
+	return p.adapter.Generate(ctx, msgs, opts...)
 }
 
 // Stream implements provider.InferenceProvider.
@@ -169,41 +157,11 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 		model = DefaultModel
 	}
 
+	// Z.ai has model-specific max-token defaults; compute here and forward.
 	maxTokens := p.resolveMaxTokens(model, reqConfig.MaxTokens)
+	opts = append(opts, provider.WithMaxTokens(maxTokens), provider.WithModel(model))
 
-	chatMsgs := openai.ConvertMessages(msgs, openai.ConvertOptions{
-		AllowVision:   true,
-		EchoReasoning: true,
-	})
-
-	reqBody := openai.ChatCompletionRequest{
-		Model:           model,
-		Messages:        chatMsgs,
-		Stream:          true,
-		MaxTokens:       maxTokens,
-		Temperature:     reqConfig.Temperature,
-		ReasoningEffort: reqConfig.ReasoningEffort,
-		Extra:           reqConfig.ExtraBody,
-	}
-
-	bodyReader, err := openai.BuildRequestBody(reqBody)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bodyReader)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	}
-	for k, v := range reqConfig.Headers {
-		req.Header.Set(k, v)
-	}
-
-	return openai.ExecuteStream(ctx, p.httpClient, req)
+	return p.adapter.Stream(ctx, msgs, opts...)
 }
 
 // Quota implements provider.QuotaProvider.
