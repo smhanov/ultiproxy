@@ -45,3 +45,16 @@ type FreebuffActor interface {
 	Acquire(ctx context.Context) error
 	Release()
 }
+
+// freebuffQuotaSource is the actor subset needed to report freebuff quota.
+// Satisfied by *freebuffActorAdapter in cmd (wrapping *FreebuffAccountActor).
+type freebuffQuotaSource interface {
+	FetchUsage(ctx context.Context, fingerprintID string) ([]byte, error)
+	SessionInfo(ctx context.Context) (instanceID, model string, err error)
+}
+
+// freebuffInstanceIDer is implemented by freebuff actors that expose their
+// instance id (used for the x-freebuff-instance-id header).
+type freebuffInstanceIDer interface {
+	InstanceID() string
+}

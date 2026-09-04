@@ -146,7 +146,7 @@ func New(cfg Config) (*Provider, error) {
 	hublaneOpts := []hublane.AdapterOption{
 		hublane.WithCapabilities(caps),
 	}
-	if cfg.Quirks.CreditsQuotaObserver != "" {
+	if cfg.Quirks.CreditsQuotaObserver != "" || cfg.Quirks.FreebuffActor != nil {
 		hublaneOpts = append(hublaneOpts, hublane.WithQuotaProvider(p))
 	}
 	if cfg.Quirks.AuthViaOAuthManager || cfg.Quirks.AuthViaSupabaseRefresh {
@@ -187,7 +187,7 @@ func (p *Provider) ProviderBundle() provider.Provider {
 		Inference:    p,
 		Capabilities: p.Capabilities(),
 	}
-	if p.cfg.Quirks.CreditsQuotaObserver != "" {
+	if p.cfg.Quirks.CreditsQuotaObserver != "" || p.cfg.Quirks.FreebuffActor != nil {
 		bundle.Quota = p
 	}
 	if p.cfg.Quirks.AuthViaOAuthManager || p.cfg.Quirks.AuthViaSupabaseRefresh {
@@ -306,7 +306,31 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 		}
 	}
 
-	// 5. FreebuffDefaultTool (Buffy system prompt + default tool + codebuff_metadata)
+	// 5. Freebuff headers (x-freebuff-instance-id, x-freebuff-acting-user-id,
+	// User-Agent) — ported from the pre-F2 freebuff lane's setHeaders. Codebuff
+	// requires these; without them the Actor rejects the request.
+	if p.cfg.Quirks.FreebuffActor != nil {
+		opts = append(opts, provider.WithHeader("User-Agent", "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.25 runtime/node.js/v22.23.2"))
+		if inst, ok := p.cfg.Quirks.FreebuffActor.(freebuffInstanceIDer); ok {
+			if id := inst.InstanceID(); id != "" {
+				opts = append(opts, provider.WithHeader("x-freebuff-instance-id", id))
+			}
+		}
+		opts = append(opts, provider.WithHeader("x-freebuff-acting-user-id", "adcc6f59-fffd-4735-8c09-703eb3158941"))
+		tok := p.cfg.APIKey
+		if tok == "" {
+			if ts := p.cfg.TokenSource; ts != nil {
+				if t, err := ts.Token(ctx); err == nil && t != nil {
+					tok = t.AccessToken
+				}
+			}
+		}
+		if tok != "" {
+			opts = append(opts, provider.WithHeader("Authorization", "Bearer "+tok))
+		}
+	}
+
+	// 6. FreebuffDefaultTool (Buffy system prompt + default tool + codebuff_metadata)
 	if p.cfg.Quirks.FreebuffDefaultTool {
 		hasSystem := false
 		for _, m := range msgs {
@@ -602,6 +626,11 @@ func (p *Provider) FetchModels(ctx context.Context) ([]string, error) {
 
 // Quota implements provider.QuotaProvider.
 func (p *Provider) Quota(ctx context.Context) (*provider.QuotaSnapshot, error) {
+	// Freebuff routes quota through its account actor (FetchUsage), not the
+	// grpc-web credits observer — exactly like the pre-F2 freebuff lane did.
+	if p.cfg.Quirks.FreebuffActor != nil {
+		return freebuffQuota(ctx, p.cfg.Quirks.FreebuffActor)
+	}
 	if p.cfg.Quirks.CreditsQuotaObserver == "" {
 		return nil, errors.New("quota observer not enabled")
 	}

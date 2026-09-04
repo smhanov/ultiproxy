@@ -436,6 +436,16 @@ func (a *fakeActor) InstanceID() string {
 	return a.instanceID
 }
 
+// FetchUsage returns a canned freebuff usage payload for quota tests.
+func (a *fakeActor) FetchUsage(ctx context.Context, fingerprintID string) ([]byte, error) {
+	return []byte(`{"dayUsed":10,"dayLimit":100,"weekUsed":30,"weekLimit":300,"monthUsed":50,"monthLimit":500}`), nil
+}
+
+// SessionInfo returns a canned session (instance + model) for quota Detail.
+func (a *fakeActor) SessionInfo(ctx context.Context) (string, string, error) {
+	return a.instanceID, "test-model", nil
+}
+
 func TestOpenAICompat_FreebuffActorLock(t *testing.T) {
 	var mu sync.Mutex
 	var payloads []map[string]any
@@ -767,5 +777,45 @@ func TestOpenAICompat_Quirks_UnsetByDefault(t *testing.T) {
 	}
 	if bare.Name() != "openaicompat" {
 		t.Errorf("expected default name 'openaicompat', got %s", bare.Name())
+	}
+}
+
+// TestOpenAICompat_FreebuffQuota verifies the freebuff actor quota path
+// (ported from the pre-F2 freebuff lane): Quota() calls actor.FetchUsage,
+// normalizes via ParseFreebuffUsageSnapshot, and attaches a Detail string
+// from the actor session. Regression guard for the F2a rewire which lost
+// freebuff's Quota provider.
+func TestOpenAICompat_FreebuffQuota(t *testing.T) {
+	actor := &fakeActor{instanceID: "fb-inst-007"}
+
+	p, err := New(Config{
+		BaseURL:    "https://codebuff.invalid",
+		APIKey:     "tok-1",
+		HTTPClient: http.DefaultClient,
+		Quirks: Quirks{
+			FreebuffActor: actor,
+		},
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	bundle := p.ProviderBundle()
+	if bundle.Quota == nil {
+		t.Fatal("expected Quota provider attached when FreebuffActor is set")
+	}
+
+	snap, err := p.Quota(context.Background())
+	if err != nil {
+		t.Fatalf("Quota failed: %v", err)
+	}
+	if len(snap.Windows) != 3 {
+		t.Fatalf("expected 3 quota windows, got %d", len(snap.Windows))
+	}
+	if snap.Windows[0].Label != "Daily" {
+		t.Errorf("expected Daily window first, got %q", snap.Windows[0].Label)
+	}
+	if snap.Detail != "instance: fb-inst-007, model: test-model" {
+		t.Errorf("expected detail with instance+model, got %q", snap.Detail)
 	}
 }

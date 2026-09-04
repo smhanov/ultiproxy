@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -330,4 +331,141 @@ func ParseGrokCreditsResponse(data []byte, now time.Time) (*provider.QuotaSnapsh
 		Windows:    windows,
 		Detail:     strings.Join(detailParts, " · "),
 	}, nil
+}
+
+// ----------------------------------------------------------------------------
+// Freebuff quota (ported verbatim from pkg/provider/freebuff — that package is
+// deleted in Phase F2b; the account actor stays in pkg/spikes/freebuff).
+// ----------------------------------------------------------------------------
+
+type freebuffUsagePayload struct {
+	DayUsed    float64 `json:"dayUsed"`
+	DayLimit   float64 `json:"dayLimit"`
+	WeekUsed   float64 `json:"weekUsed"`
+	WeekLimit  float64 `json:"weekLimit"`
+	MonthUsed  float64 `json:"monthUsed"`
+	MonthLimit float64 `json:"monthLimit"`
+	ResetAt    string  `json:"resetAt"`
+
+	// snake_case fallback
+	DayUsedSnake    float64 `json:"day_used"`
+	DayLimitSnake   float64 `json:"day_limit"`
+	WeekUsedSnake   float64 `json:"week_used"`
+	WeekLimitSnake  float64 `json:"week_limit"`
+	MonthUsedSnake  float64 `json:"month_used"`
+	MonthLimitSnake float64 `json:"month_limit"`
+	ResetAtSnake    string  `json:"reset_at"`
+}
+
+// ParseFreebuffUsageSnapshot parses freebuff usage response bytes into a
+// normalized QuotaSnapshot (ported verbatim from pkg/provider/freebuff).
+func ParseFreebuffUsageSnapshot(data []byte, now time.Time) (*provider.QuotaSnapshot, error) {
+	var u freebuffUsagePayload
+	if err := json.Unmarshal(data, &u); err != nil {
+		return nil, fmt.Errorf("failed to parse freebuff usage json: %w", err)
+	}
+
+	dayUsed := u.DayUsed
+	if dayUsed == 0 && u.DayUsedSnake != 0 {
+		dayUsed = u.DayUsedSnake
+	}
+	dayLimit := u.DayLimit
+	if dayLimit == 0 && u.DayLimitSnake != 0 {
+		dayLimit = u.DayLimitSnake
+	}
+
+	weekUsed := u.WeekUsed
+	if weekUsed == 0 && u.WeekUsedSnake != 0 {
+		weekUsed = u.WeekUsedSnake
+	}
+	weekLimit := u.WeekLimit
+	if weekLimit == 0 && u.WeekLimitSnake != 0 {
+		weekLimit = u.WeekLimitSnake
+	}
+
+	monthUsed := u.MonthUsed
+	if monthUsed == 0 && u.MonthUsedSnake != 0 {
+		monthUsed = u.MonthUsedSnake
+	}
+	monthLimit := u.MonthLimit
+	if monthLimit == 0 && u.MonthLimitSnake != 0 {
+		monthLimit = u.MonthLimitSnake
+	}
+
+	resetStr := u.ResetAt
+	if resetStr == "" {
+		resetStr = u.ResetAtSnake
+	}
+	var resetAt time.Time
+	var secRem int64
+	if resetStr != "" {
+		if t, err := time.Parse(time.RFC3339, resetStr); err == nil {
+			resetAt = t
+			secRem = int64(t.Sub(now).Seconds())
+			if secRem < 0 {
+				secRem = 0
+			}
+		}
+	}
+
+	calcPct := func(used, limit float64) float64 {
+		if limit <= 0 {
+			return 0
+		}
+		return (used / limit) * 100.0
+	}
+
+	windows := []provider.QuotaWindow{
+		{
+			Label:            "Daily",
+			UsedPct:          calcPct(dayUsed, dayLimit),
+			Remaining:        dayLimit - dayUsed,
+			Limit:            dayLimit,
+			Unit:             "requests",
+			ResetAt:          resetAt,
+			SecondsRemaining: secRem,
+		},
+		{
+			Label:     "Weekly",
+			UsedPct:   calcPct(weekUsed, weekLimit),
+			Remaining: weekLimit - weekUsed,
+			Limit:     weekLimit,
+			Unit:      "requests",
+		},
+		{
+			Label:     "Monthly",
+			UsedPct:   calcPct(monthUsed, monthLimit),
+			Remaining: monthLimit - monthUsed,
+			Limit:     monthLimit,
+			Unit:      "requests",
+		},
+	}
+
+	return &provider.QuotaSnapshot{
+		ObservedAt: now,
+		Windows:    windows,
+	}, nil
+}
+
+// freebuffQuota queries usage via the injected actor and returns a normalized
+// QuotaSnapshot (ported from pkg/provider/freebuff.Provider.Quota).
+func freebuffQuota(ctx context.Context, actor any) (*provider.QuotaSnapshot, error) {
+	src, ok := actor.(freebuffQuotaSource)
+	if !ok {
+		return nil, fmt.Errorf("openaicompat: freebuff actor does not implement quota source (got %T)", actor)
+	}
+
+	rawUsage, err := src.FetchUsage(ctx, "cli-usage")
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch usage from actor: %w", err)
+	}
+
+	snapshot, err := ParseFreebuffUsageSnapshot(rawUsage, time.Now())
+	if err != nil {
+		return nil, err
+	}
+
+	instanceID, model, _ := src.SessionInfo(ctx)
+	snapshot.Detail = fmt.Sprintf("instance: %s, model: %s", instanceID, model)
+	return snapshot, nil
 }
