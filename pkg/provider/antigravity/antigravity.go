@@ -85,6 +85,17 @@ type Provider struct {
 
 	mu        sync.RWMutex
 	liveToken string
+	// pendingPKCE holds the in-flight authorization-code flow for a two-phase
+	// MCP-driven login: the verifier must survive between StartLogin and
+	// CompleteLogin. Guarded by mu.
+	pendingPKCE *antigravityPKCE
+}
+
+// antigravityPKCE carries the PKCE state + auth config between the two login
+// phases.
+type antigravityPKCE struct {
+	cfg      oauth.AuthCodeConfig
+	verifier string
 }
 
 // New creates a new Google Antigravity adapter.
@@ -1203,25 +1214,20 @@ func ParseQuotaSummaryJSON(data []byte) (*provider.QuotaSnapshot, error) {
 // AuthProvider
 // -----------------------------------------------------------------------------
 
+// Login performs the full Google PKCE authorization-code flow, blocking on
+// user input. The interactive MCP surface uses StartLogin + CompleteLogin
+// instead; this keeps the legacy CLI behavior (prints URL, reads the code
+// that appears in the browser's callback/success page).
 func (p *Provider) Login(ctx context.Context) error {
-	pkce, err := oauth.NewPKCE()
+	info, err := p.StartLogin(ctx)
 	if err != nil {
-		return fmt.Errorf("antigravity: pkce: %w", err)
+		return err
 	}
-	cfg := oauth.AuthCodeConfig{
-		ClientID:     p.clientID,
-		ClientSecret: p.clientSecret,
-		AuthURL:      p.authURL,
-		TokenURL:     p.tokenURL,
-		RedirectURI:  p.redirectURI,
-		Scope:        p.scope,
-		HTTPClient:   p.httpClient,
-	}
-	authURL := oauth.AuthorizationURL(cfg, pkce)
+	// For the legacy path, print the URL ourselves if no callback is wired.
 	if p.onAuthURL != nil {
-		p.onAuthURL(authURL)
+		p.onAuthURL(info.VerificationURI)
 	} else {
-		fmt.Fprintf(os.Stderr, "Open this URL, complete Google consent as the target account, then paste the code from the callback page:\n%s\n\nAuthorization code: ", authURL)
+		fmt.Fprintf(os.Stderr, "Open this URL, complete Google consent as the target account, then paste the code from the callback page:\n%s\n\nAuthorization code: ", info.VerificationURI)
 	}
 
 	read := p.readCode
@@ -1238,17 +1244,62 @@ func (p *Provider) Login(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("antigravity: read authorization code: %w", err)
 	}
-	code = strings.TrimSpace(code)
-	if code == "" {
+	return p.CompleteLogin(ctx, strings.TrimSpace(code))
+}
+
+// StartLogin implements provider.InteractiveAuthProvider: generates the PKCE
+// verifier + Google consent URL and stores the pending flow, without blocking
+// on the human. CompleteLogin must be called with the authorization code that
+// appears in the browser after consent.
+func (p *Provider) StartLogin(ctx context.Context) (*provider.LoginStartInfo, error) {
+	pkce, err := oauth.NewPKCE()
+	if err != nil {
+		return nil, fmt.Errorf("antigravity: pkce: %w", err)
+	}
+	cfg := oauth.AuthCodeConfig{
+		ClientID:     p.clientID,
+		ClientSecret: p.clientSecret,
+		AuthURL:      p.authURL,
+		TokenURL:     p.tokenURL,
+		RedirectURI:  p.redirectURI,
+		Scope:        p.scope,
+		HTTPClient:   p.httpClient,
+	}
+	authURL := oauth.AuthorizationURL(cfg, pkce)
+
+	p.mu.Lock()
+	p.pendingPKCE = &antigravityPKCE{cfg: cfg, verifier: pkce.Verifier}
+	p.mu.Unlock()
+
+	return &provider.LoginStartInfo{
+		Kind:            provider.LoginFlowAuthCode,
+		VerificationURI: authURL,
+		ExpiresIn:       600,
+	}, nil
+}
+
+// CompleteLogin implements provider.InteractiveAuthProvider: exchanges the
+// authorization code (from the browser callback/success page) using the stored
+// PKCE verifier, then persists the credential.
+func (p *Provider) CompleteLogin(ctx context.Context, authorizationCode string) error {
+	if authorizationCode == "" {
 		return errors.New("antigravity: empty authorization code")
 	}
 
-	tokResp, err := oauth.ExchangeCode(ctx, cfg, code, pkce.Verifier)
+	p.mu.RLock()
+	pending := p.pendingPKCE
+	p.mu.RUnlock()
+	if pending == nil {
+		return errors.New("antigravity: no pending login — call StartLogin first")
+	}
+
+	tokResp, err := oauth.ExchangeCode(ctx, pending.cfg, authorizationCode, pending.verifier)
 	if err != nil {
 		return fmt.Errorf("antigravity: code exchange failed: %w", err)
 	}
 
 	p.mu.Lock()
+	p.pendingPKCE = nil
 	p.liveToken = tokResp.AccessToken
 	p.mu.Unlock()
 

@@ -3,7 +3,9 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/smhanov/ultiproxy/pkg/provider"
 )
@@ -53,13 +55,36 @@ var standardTools = []Tool{
 	},
 	{
 		Name:        "initiate_oauth_login",
-		Description: "Initiate OAuth login flow for a provider",
+		Description: "Start the OAuth login flow for a provider. Returns the sign-in URL (and user code for device flows) WITHOUT blocking; then call check_oauth_login to poll device flows or submit_oauth_code to finish auth-code flows.",
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
 				"provider": {Type: "string", Description: "Provider name"},
 			},
 			Required: []string{"provider"},
+		},
+	},
+	{
+		Name:        "check_oauth_login",
+		Description: "Poll a pending OAuth login (device flows: xai etc.) until the user approves; returns completed or pending. Also finalizes auth-code flows whose token exchange can complete server-side.",
+		InputSchema: &InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"provider": {Type: "string", Description: "Provider name"},
+			},
+			Required: []string{"provider"},
+		},
+	},
+	{
+		Name:        "submit_oauth_code",
+		Description: "Submit the authorization code from the browser (auth-code flows: antigravity) to finish OAuth login.",
+		InputSchema: &InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"provider": {Type: "string", Description: "Provider name"},
+				"code":     {Type: "string", Description: "Authorization code from the browser callback/success page"},
+			},
+			Required: []string{"provider", "code"},
 		},
 	},
 	{
@@ -190,6 +215,10 @@ func (s *Server) handleCallTool(ctx context.Context, rawParams json.RawMessage) 
 		return s.toolGetClientUsage(ctx, params.Arguments)
 	case "initiate_oauth_login":
 		return s.toolInitiateOAuthLogin(ctx, params.Arguments)
+	case "check_oauth_login":
+		return s.toolCheckOAuthLogin(ctx, params.Arguments)
+	case "submit_oauth_code":
+		return s.toolSubmitOAuthCode(ctx, params.Arguments)
 	case "list_model_aliases":
 		return s.toolListModelAliases(ctx)
 	case "set_model_alias":
@@ -391,6 +420,33 @@ func (s *Server) toolInitiateOAuthLogin(ctx context.Context, argsRaw json.RawMes
 		}, nil
 	}
 
+	// Two-phase interactive flow: return the sign-in URL immediately so an
+	// agent (or FC browser) can present it without blocking.
+	if interactive, ok := prov.Auth.(provider.InteractiveAuthProvider); ok {
+		info, err := interactive.StartLogin(ctx)
+		if err != nil {
+			return &CallToolResult{
+				Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("oauth login error: %v", err)}},
+				IsError: true,
+			}, nil
+		}
+		res := map[string]any{
+			"status":             "awaiting_user",
+			"provider":           args.Provider,
+			"kind":               info.Kind,
+			"url":                info.VerificationURI,
+			"expires_in_seconds": info.ExpiresIn,
+		}
+		if info.UserCode != "" {
+			res["user_code"] = info.UserCode
+		}
+		b, _ := json.MarshalIndent(res, "", "  ")
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: string(b)}},
+		}, nil
+	}
+
+	// Legacy blocking providers: run the full flow (may block on stdin).
 	if err := prov.Auth.Login(ctx); err != nil {
 		return &CallToolResult{
 			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("oauth login error: %v", err)}},
@@ -406,6 +462,116 @@ func (s *Server) toolInitiateOAuthLogin(ctx context.Context, argsRaw json.RawMes
 	return &CallToolResult{
 		Content: []ToolContent{{Type: "text", Text: string(b)}},
 	}, nil
+}
+
+// toolCheckOAuthLogin polls a pending device flow (CompleteLogin with a short
+// context). It does NOT block forever: returns pending when the user has not
+// approved yet, completed when the token is stored.
+func (s *Server) toolCheckOAuthLogin(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {
+	var args struct {
+		Provider string `json:"provider"`
+	}
+	_ = json.Unmarshal(argsRaw, &args)
+	if args.Provider == "" {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: provider argument is required"}},
+			IsError: true,
+		}, nil
+	}
+	if s.registry == nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: provider registry not configured"}},
+			IsError: true,
+		}, nil
+	}
+	prov, ok := s.registry.Get(args.Provider)
+	if !ok || prov.Auth == nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("provider %q has no auth provider", args.Provider)}},
+			IsError: true,
+		}, nil
+	}
+	interactive, ok := prov.Auth.(provider.InteractiveAuthProvider)
+	if !ok {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("provider %q does not support interactive login", args.Provider)}},
+			IsError: true,
+		}, nil
+	}
+
+	// Bounded poll: device flows typically take the human 10-120s after
+	// opening the URL. CompleteLogin internally polls with short sleeps; a
+	// ctx timeout keeps one MCP call from hanging indefinitely.
+	pollCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	// CompleteLogin for device flows ignores the code and polls; for
+	// auth-code flows the code is required, so do not finalize here.
+	if err := interactive.CompleteLogin(pollCtx, ""); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			b, _ := json.MarshalIndent(map[string]any{
+				"status":   "pending",
+				"provider": args.Provider,
+			}, "", "  ")
+			return &CallToolResult{Content: []ToolContent{{Type: "text", Text: string(b)}}}, nil
+		}
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("oauth login error: %v", err)}},
+			IsError: true,
+		}, nil
+	}
+
+	b, _ := json.MarshalIndent(map[string]any{
+		"status":   "completed",
+		"provider": args.Provider,
+	}, "", "  ")
+	return &CallToolResult{Content: []ToolContent{{Type: "text", Text: string(b)}}}, nil
+}
+
+// toolSubmitOAuthCode finishes an auth-code flow (antigravity) with the code
+// the user copied from the browser after consent.
+func (s *Server) toolSubmitOAuthCode(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {
+	var args struct {
+		Provider string `json:"provider"`
+		Code     string `json:"code"`
+	}
+	_ = json.Unmarshal(argsRaw, &args)
+	if args.Provider == "" || args.Code == "" {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: provider and code are required"}},
+			IsError: true,
+		}, nil
+	}
+	if s.registry == nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: provider registry not configured"}},
+			IsError: true,
+		}, nil
+	}
+	prov, ok := s.registry.Get(args.Provider)
+	if !ok || prov.Auth == nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("provider %q has no auth provider", args.Provider)}},
+			IsError: true,
+		}, nil
+	}
+	interactive, ok := prov.Auth.(provider.InteractiveAuthProvider)
+	if !ok {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("provider %q does not support interactive login", args.Provider)}},
+			IsError: true,
+		}, nil
+	}
+	if err := interactive.CompleteLogin(ctx, args.Code); err != nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("oauth login error: %v", err)}},
+			IsError: true,
+		}, nil
+	}
+	b, _ := json.MarshalIndent(map[string]any{
+		"status":   "completed",
+		"provider": args.Provider,
+	}, "", "  ")
+	return &CallToolResult{Content: []ToolContent{{Type: "text", Text: string(b)}}}, nil
 }
 
 // Ensure unused import compiles cleanly

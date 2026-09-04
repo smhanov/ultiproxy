@@ -21,6 +21,14 @@ import (
 	"github.com/smhanov/ultiproxy/pkg/provider/internal/oauth"
 )
 
+// xaiPendingFlow carries the in-flight xAI device authorization between the
+// two-phase MCP login calls.
+type xaiPendingFlow struct {
+	cfg        oauth.DeviceFlowConfig
+	deviceCode string
+	interval   int
+}
+
 // Provider implements provider.InferenceProvider and optionally provider.QuotaProvider and provider.AuthProvider.
 type Provider struct {
 	adapter    *hublane.Adapter
@@ -32,6 +40,9 @@ type Provider struct {
 
 	mu     sync.RWMutex
 	models []string
+	// pendingXAI holds the in-flight device authorization for a two-phase
+	// MCP-driven login. Guarded by mu.
+	pendingXAI *xaiPendingFlow
 }
 
 // New creates a new OpenAI-compatible provider.
@@ -659,9 +670,20 @@ func (p *Provider) Login(ctx context.Context) error {
 	return provider.ErrNotImplemented
 }
 
-// loginXAI performs the xAI device authorization flow (ported from
-// xai Provider.Login).
+// loginXAI runs the full xAI device-authorization flow to completion. Used by
+// the legacy blocking Login(); MCP-driven flows call StartLogin then
+// CompleteLogin instead.
 func (p *Provider) loginXAI(ctx context.Context) error {
+	if _, err := p.startXAI(ctx); err != nil {
+		return err
+	}
+	return p.completeXAI(ctx)
+}
+
+// startXAI requests the device authorization code and returns the sign-in URL
+// + user code without blocking on the human. The pending flow is kept so
+// CompleteLogin can finish it later.
+func (p *Provider) startXAI(ctx context.Context) (*provider.LoginStartInfo, error) {
 	deviceURL := p.cfg.DeviceAuthURL
 	if deviceURL == "" {
 		deviceURL = defaultXAIDeviceURL
@@ -679,20 +701,45 @@ func (p *Provider) loginXAI(ctx context.Context) error {
 
 	dcr, err := oauth.RequestDeviceCode(ctx, cfg)
 	if err != nil {
-		return fmt.Errorf("openaicompat: xai login device code failed: %w", err)
+		return nil, fmt.Errorf("openaicompat: xai login device code failed: %w", err)
 	}
 
-	tokResp, err := oauth.PollToken(ctx, cfg, dcr.DeviceCode, dcr.Interval)
+	p.mu.Lock()
+	p.pendingXAI = &xaiPendingFlow{cfg: cfg, deviceCode: dcr.DeviceCode, interval: dcr.Interval}
+	p.mu.Unlock()
+
+	return &provider.LoginStartInfo{
+		Kind:            provider.LoginFlowDevice,
+		VerificationURI: dcr.VerificationURI,
+		UserCode:        dcr.UserCode,
+		ExpiresIn:       dcr.ExpiresIn,
+	}, nil
+}
+
+// completeXAI polls the device authorization until the human approves, then
+// persists the credential into the auth manager.
+func (p *Provider) completeXAI(ctx context.Context) error {
+	p.mu.RLock()
+	pending := p.pendingXAI
+	p.mu.RUnlock()
+	if pending == nil {
+		return errors.New("openaicompat: xai: no pending device flow — call StartLogin first")
+	}
+
+	tokResp, err := oauth.PollToken(ctx, pending.cfg, pending.deviceCode, pending.interval)
 	if err != nil {
 		return fmt.Errorf("openaicompat: xai login token poll failed: %w", err)
 	}
+	p.mu.Lock()
+	p.pendingXAI = nil
+	p.mu.Unlock()
 
 	// Persist so Token() (via the OAuth manager TokenSource) can serve it later.
 	dataDir := p.cfg.DataDir
 	if dataDir == "" {
 		dataDir = filepath.Join(os.TempDir(), "ultiproxy-xai-auth")
 	}
-	refresher := oauth.MakeRefresher(p.httpClient, tokenURL, defaultXAIClientID, "")
+	refresher := oauth.MakeRefresher(p.httpClient, pending.cfg.TokenURL, defaultXAIClientID, "")
 	mgr, err := auth.NewManager(dataDir, refresher)
 	if err != nil {
 		return fmt.Errorf("openaicompat: xai login credential store: %w", err)
@@ -746,6 +793,28 @@ func (p *Provider) loginFreebuff(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// StartLogin implements provider.InteractiveAuthProvider: returns the xAI
+// device sign-in URL + user code without blocking (used by MCP tools). No
+// pending flow is kept for freebuff/plain lanes — they return ErrNotImplemented.
+func (p *Provider) StartLogin(ctx context.Context) (*provider.LoginStartInfo, error) {
+	if p.cfg.Quirks.AuthViaOAuthManager {
+		return p.startXAI(ctx)
+	}
+	return nil, provider.ErrNotImplemented
+}
+
+// CompleteLogin implements provider.InteractiveAuthProvider. For xai it
+// polls the device authorization until approval; authorizationCode is unused.
+func (p *Provider) CompleteLogin(ctx context.Context, authorizationCode string) error {
+	if p.cfg.Quirks.AuthViaOAuthManager {
+		return p.completeXAI(ctx)
+	}
+	if p.cfg.Quirks.FreebuffActor != nil {
+		return p.loginFreebuff(ctx)
+	}
+	return provider.ErrNotImplemented
 }
 
 // Token implements provider.AuthProvider.

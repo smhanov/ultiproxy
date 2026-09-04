@@ -17,18 +17,21 @@ import (
 
 // Server represents the Ultiproxy dual HTTP surface server.
 type Server struct {
-	cfg        *Config
-	registry   *provider.Registry
-	router     Router
-	sm         *state.StateManager
-	writer     *storage.Writer
-	mcpServer  *mcp.Server
-	auth       *AuthMiddleware
-	catalog    *ModelCatalog
-	timeouts   *TimeoutManager
-	providers  *RuntimeProviderStore
-	httpServer *http.Server
-	mux        *http.ServeMux
+	cfg       *Config
+	registry  *provider.Registry
+	router    Router
+	sm        *state.StateManager
+	writer    *storage.Writer
+	mcpServer *mcp.Server
+	auth      *AuthMiddleware
+	catalog   *ModelCatalog
+	timeouts  *TimeoutManager
+	providers *RuntimeProviderStore
+	// mcpLaneBuilder bridges the runtime store's LaneBuilder into the MCP
+	// add_provider custom-kind path (antigravity).
+	mcpLaneBuilder func(name, kind string) (provider.Provider, error)
+	httpServer     *http.Server
+	mux            *http.ServeMux
 }
 
 // Option configures Server.
@@ -106,6 +109,18 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 	if s.providers == nil {
 		s.providers = NewRuntimeProviderStore(filepath.Join(cfg.DataDir, "providers.json"))
 	}
+	if s.providers.DefaultDataDir == "" {
+		s.providers.DefaultDataDir = cfg.DataDir
+	}
+	// Wire the custom-lane builder (antigravity etc.) into MCP add_provider /
+	// restore. The store's LaneBuilder and the MCP custom builder both come
+	// from the same constructor; the router/catalog resolve lanes after this.
+	if s.providers.LaneBuilder != nil {
+		laneBuilder := s.providers.LaneBuilder
+		s.mcpLaneBuilder = func(name, kind string) (provider.Provider, error) {
+			return laneBuilder(name, kind, s.providers.DefaultDataDir)
+		}
+	}
 	s.providers.Restore(registry)
 
 	// Default router needs the catalog so unknown models can be rejected
@@ -136,6 +151,9 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		}
 		if s.providers != nil {
 			mcpOpts = append(mcpOpts, mcp.WithProviderStore(s.providers))
+		}
+		if s.mcpLaneBuilder != nil {
+			mcpOpts = append(mcpOpts, mcp.WithCustomLaneBuilder(s.mcpLaneBuilder))
 		}
 		s.mcpServer = mcp.NewServer(registry, stateSrc, mcpOpts...)
 	}

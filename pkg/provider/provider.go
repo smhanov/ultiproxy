@@ -70,6 +70,41 @@ type AuthProvider interface {
 	Refresh(ctx context.Context) error
 }
 
+// LoginFlowKind identifies the interactive OAuth flow a provider uses.
+type LoginFlowKind string
+
+const (
+	// LoginFlowDevice is the OAuth device-code flow: the user opens
+	// VerificationURI and enters UserCode, then poll for approval.
+	LoginFlowDevice LoginFlowKind = "device"
+	// LoginFlowAuthCode is a browser authorization-code flow: the user opens
+	// VerificationURI (a consent URL), approves, and the callback page shows a
+	// code the agent submits via CompleteLogin (or the redirect captures it).
+	LoginFlowAuthCode LoginFlowKind = "auth_code"
+)
+
+// LoginStartInfo is returned by StartLogin. The caller (agent/UI) presents
+// the URL + code to the user (or opens the URL in a browser), then calls
+// CompleteLogin. It must not block on human action.
+type LoginStartInfo struct {
+	Kind            LoginFlowKind `json:"kind"`
+	VerificationURI string        `json:"verification_uri"`
+	UserCode        string        `json:"user_code,omitempty"`
+	ExpiresIn       int           `json:"expires_in_seconds,omitempty"`
+}
+
+// InteractiveAuthProvider is the two-phase login surface MCP tools use so an
+// agent can drive OAuth: StartLogin returns the sign-in URL immediately
+// (non-blocking); CompleteLogin finishes the flow once the human has acted —
+// for device flows it polls for approval, for auth-code flows it submits the
+// authorization code. Providers that implement only AuthProvider keep the
+// legacy blocking Login() path.
+type InteractiveAuthProvider interface {
+	AuthProvider
+	StartLogin(ctx context.Context) (*LoginStartInfo, error)
+	CompleteLogin(ctx context.Context, authorizationCode string) error
+}
+
 // Capabilities describes what an InferenceProvider supports, used by the
 // router for capability negotiation before dispatch.
 type Capabilities struct {

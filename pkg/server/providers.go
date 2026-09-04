@@ -67,6 +67,7 @@ type storedQuirks struct {
 
 // storedProvider is the JSON-able projection of openaicompat.Config.
 type storedProvider struct {
+	Kind          string       `json:"kind,omitempty"` // "" or "openaicompat" | "antigravity"
 	Name          string       `json:"name"`
 	BaseURL       string       `json:"base_url"`
 	APIKey        string       `json:"api_key,omitempty"`
@@ -143,12 +144,26 @@ func (s storedProvider) toConfig(actorBuilder func(openaicompat.Config) any) ope
 // OpenAI-compatible lanes with JSON persistence, mirroring ModelCatalog.
 // A nil/empty path means in-memory only (no persistence).
 type RuntimeProviderStore struct {
-	mu           sync.RWMutex
-	path         string
-	providers    map[string]openaicompat.Config
-	restored     bool
-	ActorBuilder func(openaicompat.Config) any // optional freebuff actor reconstruction hook (set by cmd)
+	mu        sync.RWMutex
+	path      string
+	providers map[string]openaicompat.Config
+	custom    map[string]storedProvider // non-openaicompat kinds (kind != "")
+	restored  bool
+	// DefaultDataDir is the server's general data directory. Runtime lanes do
+	// NOT carry their own data dir; credential state lives under
+	// <DefaultDataDir>/credentials/<lane> exactly like compile-time lanes.
+	DefaultDataDir string
+	ActorBuilder   func(openaicompat.Config) any // optional freebuff actor reconstruction hook (set by cmd)
+	// LaneBuilder constructs compile-time-wired lane kinds that are not
+	// openai-compatible (e.g. antigravity) from their stored identity. It
+	// receives the lane name, kind and the server's general DataDir and
+	// returns the provider bundle. When nil, custom kinds can be stored but
+	// not restored.
+	LaneBuilder func(name, kind, dataDir string) (provider.Provider, error)
 }
+
+// RuntimeProviderKind is the persisted provider kind discriminator.
+const RuntimeProviderKindOpenAICompat = "openaicompat"
 
 // NewRuntimeProviderStore builds a runtime provider store. When path is
 // non-empty and the file exists, its entries are preloaded into memory (same
@@ -157,6 +172,7 @@ func NewRuntimeProviderStore(path string) *RuntimeProviderStore {
 	s := &RuntimeProviderStore{
 		path:      path,
 		providers: make(map[string]openaicompat.Config),
+		custom:    make(map[string]storedProvider),
 	}
 	if path == "" {
 		return s
@@ -165,7 +181,11 @@ func NewRuntimeProviderStore(path string) *RuntimeProviderStore {
 		var stored map[string]storedProvider
 		if json.Unmarshal(data, &stored) == nil {
 			for name, sp := range stored {
-				s.providers[name] = sp.toConfig(s.ActorBuilder)
+				if sp.Kind != "" && sp.Kind != RuntimeProviderKindOpenAICompat {
+					s.custom[name] = sp
+				} else {
+					s.providers[name] = sp.toConfig(s.ActorBuilder)
+				}
 			}
 		}
 	}
@@ -222,8 +242,11 @@ func (s *RuntimeProviderStore) Sorted() []string {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	names := make([]string, 0, len(s.providers))
+	names := make([]string, 0, len(s.providers)+len(s.custom))
 	for k := range s.providers {
+		names = append(names, k)
+	}
+	for k := range s.custom {
 		names = append(names, k)
 	}
 	sort.Strings(names)
@@ -238,6 +261,10 @@ func (s *RuntimeProviderStore) Has(name string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	_, ok := s.providers[name]
+	if ok {
+		return true
+	}
+	_, ok = s.custom[name]
 	return ok
 }
 
@@ -262,11 +289,45 @@ func (s *RuntimeProviderStore) Add(cfg openaicompat.Config) error {
 	if err := validateProviderConfig(cfg); err != nil {
 		return err
 	}
+	// Runtime lanes never carry their own data dir: credential state lives
+	// under the server's general DataDir, mirroring compile-time lanes.
+	if cfg.DataDir == "" && s.DefaultDataDir != "" {
+		cfg.DataDir = filepath.Join(s.DefaultDataDir, "credentials", cfg.Name)
+	}
 	s.mu.Lock()
 	if s.providers == nil {
 		s.providers = make(map[string]openaicompat.Config)
 	}
+	delete(s.custom, cfg.Name)
 	s.providers[cfg.Name] = cfg
+	s.mu.Unlock()
+	return s.persist()
+}
+
+// AddCustom stores a non-OpenAI-compatible lane (kind only), replacing any
+// existing entry with the same name, then persists. Name validation stays the
+// same; BaseURL is not required for compile-time-wired kinds. Credential
+// storage is the server's general DataDir, not a per-lane dir.
+func (s *RuntimeProviderStore) AddCustom(name, kind string) error {
+	if s == nil {
+		return errors.New("runtime provider store not configured")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("provider name is required")
+	}
+	if !providerNamePattern.MatchString(name) {
+		return fmt.Errorf("provider name %q must match %s (lowercase letters, digits, _ and -)", name, providerNamePattern.String())
+	}
+	if kind == "" || kind == RuntimeProviderKindOpenAICompat {
+		return fmt.Errorf("custom provider kind %q invalid (use %q only for openai-compatible lanes)", kind, RuntimeProviderKindOpenAICompat)
+	}
+	s.mu.Lock()
+	if s.custom == nil {
+		s.custom = make(map[string]storedProvider)
+	}
+	delete(s.providers, name)
+	s.custom[name] = storedProvider{Kind: kind, Name: name}
 	s.mu.Unlock()
 	return s.persist()
 }
@@ -281,6 +342,11 @@ func (s *RuntimeProviderStore) Remove(name string) error {
 	_, ok := s.providers[name]
 	if ok {
 		delete(s.providers, name)
+	} else {
+		_, ok = s.custom[name]
+		if ok {
+			delete(s.custom, name)
+		}
 	}
 	s.mu.Unlock()
 	if !ok {
@@ -316,8 +382,13 @@ func (s *RuntimeProviderStore) Load() (map[string]openaicompat.Config, error) {
 	}
 	s.mu.Lock()
 	s.providers = make(map[string]openaicompat.Config, len(stored))
+	s.custom = make(map[string]storedProvider, len(stored))
 	for name, sp := range stored {
-		s.providers[name] = sp.toConfig(s.ActorBuilder)
+		if sp.Kind != "" && sp.Kind != RuntimeProviderKindOpenAICompat {
+			s.custom[name] = sp
+		} else {
+			s.providers[name] = sp.toConfig(s.ActorBuilder)
+		}
 	}
 	s.mu.Unlock()
 	return s.List(), nil
@@ -337,13 +408,18 @@ func (s *RuntimeProviderStore) Restore(registry *provider.Registry) []string {
 	}
 	s.restored = true
 	snapshot := make(map[string]openaicompat.Config, len(s.providers))
+	customSnap := make(map[string]storedProvider, len(s.custom))
 	builder := s.ActorBuilder
+	laneBuilder := s.LaneBuilder
 	for k, v := range s.providers {
 		snapshot[k] = v
 	}
+	for k, v := range s.custom {
+		customSnap[k] = v
+	}
 	s.mu.Unlock()
 
-	registered := make([]string, 0, len(snapshot))
+	registered := make([]string, 0, len(snapshot)+len(customSnap))
 	for _, name := range sortedConfigNames(snapshot) {
 		cfg := snapshot[name]
 		if builder != nil && cfg.Quirks.FreebuffActor == nil {
@@ -359,7 +435,31 @@ func (s *RuntimeProviderStore) Restore(registry *provider.Registry) []string {
 		registered = append(registered, name)
 		log.Printf("[providers] registered runtime %s", name)
 	}
+	for _, name := range sortedCustomNames(customSnap) {
+		sp := customSnap[name]
+		if laneBuilder == nil {
+			log.Printf("[providers] runtime %s: no LaneBuilder for kind %q — not restored", name, sp.Kind)
+			continue
+		}
+		bundle, err := laneBuilder(name, sp.Kind, s.DefaultDataDir)
+		if err != nil {
+			log.Printf("[providers] runtime %s: %v", name, err)
+			continue
+		}
+		registry.Register(bundle)
+		registered = append(registered, name)
+		log.Printf("[providers] registered runtime %s (kind %s)", name, sp.Kind)
+	}
 	return registered
+}
+
+func sortedCustomNames(m map[string]storedProvider) []string {
+	names := make([]string, 0, len(m))
+	for k := range m {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func sortedConfigNames(m map[string]openaicompat.Config) []string {
@@ -377,9 +477,14 @@ func (s *RuntimeProviderStore) persist() error {
 		return nil
 	}
 	s.mu.RLock()
-	snapshot := make(map[string]storedProvider, len(s.providers))
+	snapshot := make(map[string]storedProvider, len(s.providers)+len(s.custom))
 	for k, v := range s.providers {
-		snapshot[k] = toStoredProvider(v)
+		sp := toStoredProvider(v)
+		sp.Kind = RuntimeProviderKindOpenAICompat
+		snapshot[k] = sp
+	}
+	for k, v := range s.custom {
+		snapshot[k] = v
 	}
 	s.mu.RUnlock()
 

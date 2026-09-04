@@ -15,6 +15,11 @@ import (
 type ProviderStore interface {
 	// Add validates + stores a lane config and persists it (providers.json).
 	Add(cfg openaicompat.Config) error
+	// AddCustom stores a non-OpenAI-compatible lane (kind only) and persists
+	// it. Used for antigravity-like compile-time-wired lanes that the store can
+	// hold but only the server's LaneBuilder can reconstruct. Storage lives in
+	// the server's general DataDir — lanes never carry their own data dir.
+	AddCustom(name, kind string) error
 	// Remove deletes a persisted lane.
 	Remove(name string) error
 	// List returns the stored lane configs keyed by lane name.
@@ -40,9 +45,9 @@ type providerQuirksArgs struct {
 
 type addProviderArgs struct {
 	Name          string             `json:"name"`
+	Kind          string             `json:"kind"` // "" or "openaicompat" | "antigravity"
 	BaseURL       string             `json:"base_url"`
 	APIKey        string             `json:"api_key"`
-	DataDir       string             `json:"data_dir"`
 	WorkspaceID   string             `json:"workspace_id"`
 	SessionCookie string             `json:"session_cookie"`
 	RefreshURL    string             `json:"refresh_url"`
@@ -57,7 +62,6 @@ func (a addProviderArgs) config() openaicompat.Config {
 		Name:          a.Name,
 		BaseURL:       a.BaseURL,
 		APIKey:        a.APIKey,
-		DataDir:       a.DataDir,
 		WorkspaceID:   a.WorkspaceID,
 		SessionCookie: a.SessionCookie,
 		RefreshURL:    a.RefreshURL,
@@ -129,6 +133,35 @@ func (s *Server) toolAddProvider(ctx context.Context, argsRaw json.RawMessage) (
 		"registered": true,
 		"name":       cfg.Name,
 		"lane":       cfg.Name,
+	}), nil
+}
+
+// toolAddCustomProvider registers a runtime lane that is not
+// OpenAI-compatible (kind=antigravity) via the injected builder. The lane
+// persists in providers.json alongside openai-compatible lanes; the original
+// DataDir is stored so the builder can reconstruct auth state on restart.
+func (s *Server) toolAddCustomProvider(ctx context.Context, args addProviderArgs) (*CallToolResult, *JSONRPCError) {
+	if args.Name == "" {
+		return toolError("name is required"), nil
+	}
+	if s.customLaneBuilder == nil {
+		return toolError("custom lanes (kind=%q) are not wired on this server", args.Kind), nil
+	}
+	bundle, err := s.customLaneBuilder(args.Name, args.Kind)
+	if err != nil {
+		return toolError("provider %q failed to build: %v", args.Name, err), nil
+	}
+	if err := s.providers.AddCustom(args.Name, args.Kind); err != nil {
+		return toolError("%v", err), nil
+	}
+	if s.registry != nil {
+		s.registry.Register(bundle)
+	}
+	return toolJSON(map[string]any{
+		"registered": true,
+		"name":       args.Name,
+		"lane":       args.Name,
+		"kind":       args.Kind,
 	}), nil
 }
 

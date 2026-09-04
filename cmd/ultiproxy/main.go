@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/smhanov/ultiproxy/pkg/provider"
+	"github.com/smhanov/ultiproxy/pkg/provider/antigravity"
 	"github.com/smhanov/ultiproxy/pkg/server"
 	"github.com/smhanov/ultiproxy/pkg/state"
 	"github.com/smhanov/ultiproxy/pkg/storage"
@@ -90,7 +91,28 @@ func runServe(configPath, dataDir string) {
 	// catalog resolve provider names, so a restart from the same DataDir
 	// restores them without any config file.
 	providerStore := server.NewRuntimeProviderStore(filepath.Join(cfg.DataDir, "providers.json"))
+	providerStore.DefaultDataDir = cfg.DataDir
 	providerStore.ActorBuilder = runtimeFreebuffActorBuilder(cfg.DataDir)
+	// Custom-wire lanes (antigravity) reconstruct from the server's general
+	// DataDir: credential state lives at <data_dir>/credentials/<lane> exactly
+	// like compile-time lanes, so a runtime-registered lane behaves identically
+	// across restarts with no per-lane config.
+	providerStore.LaneBuilder = func(name, kind, dataDir string) (provider.Provider, error) {
+		switch kind {
+		case "antigravity":
+			credDir := filepath.Join(dataDir, "credentials", "antigravity")
+			if err := os.MkdirAll(credDir, 0o700); err != nil {
+				return provider.Provider{}, fmt.Errorf("antigravity: create credential store: %w", err)
+			}
+			p := antigravity.NewFromState(dataDir, credDir, nil)
+			if p == nil {
+				return provider.Provider{}, fmt.Errorf("antigravity: could not create provider under %s", credDir)
+			}
+			return p.ProviderBundle(), nil
+		default:
+			return provider.Provider{}, fmt.Errorf("unsupported runtime lane kind %q", kind)
+		}
+	}
 	providerStore.Restore(registry)
 
 	srv := server.NewServer(cfg, registry,

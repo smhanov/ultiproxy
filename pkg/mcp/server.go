@@ -13,15 +13,16 @@ import (
 
 // Server implements an MCP server supporting Streamable HTTP on /mcp and legacy /mcp/sse.
 type Server struct {
-	registry    *provider.Registry
-	stateSource StateSource
-	usageSource UsageSource
-	aliases     AliasManager
-	timeouts    TimeoutManager
-	providers   ProviderStore
-	name        string
-	version     string
-	mu          sync.RWMutex
+	registry          *provider.Registry
+	stateSource       StateSource
+	usageSource       UsageSource
+	aliases           AliasManager
+	timeouts          TimeoutManager
+	providers         ProviderStore
+	customLaneBuilder func(name, kind string) (provider.Provider, error)
+	name              string
+	version           string
+	mu                sync.RWMutex
 }
 
 // Option configures MCP server.
@@ -54,6 +55,16 @@ func WithTimeoutManager(tm TimeoutManager) Option {
 func WithProviderStore(ps ProviderStore) Option {
 	return func(s *Server) {
 		s.providers = ps
+	}
+}
+
+// WithCustomLaneBuilder configures construction of runtime-registered lanes
+// that are not OpenAI-compatible (e.g. antigravity). It receives the lane name
+// and kind and returns the provider bundle. Called by add_provider when kind
+// is not the default. Credential storage uses the server's general DataDir.
+func WithCustomLaneBuilder(builder func(name, kind string) (provider.Provider, error)) Option {
+	return func(s *Server) {
+		s.customLaneBuilder = builder
 	}
 }
 
