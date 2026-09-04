@@ -4,14 +4,19 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,6 +46,24 @@ const (
 	DefaultDeviceURL   = "https://oauth2.googleapis.com/device/code"
 	DefaultTokenURL    = "https://oauth2.googleapis.com/token"
 	DefaultScope       = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs"
+)
+
+// Loopback-flow constants: the consent redirect points at a listener we own
+// on localhost, which is the only way to capture the REAL authorization code.
+// The legacy https://antigravity.google/oauth-callback IDE page consumes the
+// code client-side and displays an unrelated companion token that Google's
+// token endpoint rejects with invalid_grant.
+const (
+	// DefaultLoopbackRedirectURI is the redirect_uri sent to Google and served
+	// by the local listener.
+	DefaultLoopbackRedirectURI = "http://localhost:51121/oauth-callback"
+	// LoopbackCallbackPort is the loopback port the callback listener binds.
+	LoopbackCallbackPort = 51121
+	// LoopbackListenAddr is the address the callback listener binds.
+	LoopbackListenAddr = "127.0.0.1:51121"
+	// LoopbackIdleTimeout bounds how long an abandoned login may hold the
+	// loopback port.
+	LoopbackIdleTimeout = 15 * time.Minute
 )
 
 // ErrInvalidToolSchema indicates an invalid tool parameters schema.
@@ -85,18 +108,62 @@ type Provider struct {
 
 	mu        sync.RWMutex
 	liveToken string
-	// pendingPKCE holds the in-flight authorization-code flow for a two-phase
-	// MCP-driven login: the verifier must survive between StartLogin and
-	// CompleteLogin. Guarded by mu.
-	pendingPKCE *antigravityPKCE
+	// pendingAuth holds the in-flight loopback authorization-code flow for a
+	// two-phase MCP-driven login: the CSRF state and the code channel must
+	// survive between StartLogin and CompleteLogin. Guarded by mu.
+	pendingAuth *pendingAntigravityAuth
+	// loopback is the callback listener serving pendingAuth, if any. Guarded by
+	// mu.
+	loopback *loopbackServer
 }
 
-// antigravityPKCE carries the PKCE state + auth config between the two login
+// pendingAntigravityAuth carries the loopback-flow state between the two login
 // phases.
-type antigravityPKCE struct {
-	cfg      oauth.AuthCodeConfig
-	verifier string
+type pendingAntigravityAuth struct {
+	state  string
+	codeCh chan string // buffered 1; the loopback listener delivers the code
 }
+
+// loopbackServer owns the local HTTP listener that catches the browser
+// redirect on http://localhost:<LoopbackCallbackPort>/oauth-callback.
+type loopbackServer struct {
+	ln   net.Listener
+	srv  *http.Server
+	done chan struct{} // closed once Serve returned (port released)
+}
+
+// close releases the loopback port immediately. In-flight responses still
+// complete: only the listening socket is closed, so the browser keeps its
+// "sign-in complete" page.
+func (l *loopbackServer) close() {
+	if l == nil {
+		return
+	}
+	_ = l.ln.Close()
+}
+
+func (l *loopbackServer) alive() bool {
+	if l == nil {
+		return false
+	}
+	select {
+	case <-l.done:
+		return false
+	default:
+		return true
+	}
+}
+
+// loopbackSuccessHTML is the page shown to the browser once the code is in.
+var loopbackSuccessHTML = `<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>ultiproxy sign-in</title></head>
+<body style="font-family: system-ui, -apple-system, sans-serif; text-align: center; padding: 3rem">
+<h2>Sign-in complete.</h2>
+<p>You can close this window and return to ultiproxy.</p>
+</body>
+</html>
+`
 
 // New creates a new Google Antigravity adapter.
 func New(cfg Config) *Provider {
@@ -1214,10 +1281,17 @@ func ParseQuotaSummaryJSON(data []byte) (*provider.QuotaSnapshot, error) {
 // AuthProvider
 // -----------------------------------------------------------------------------
 
-// Login performs the full Google PKCE authorization-code flow, blocking on
-// user input. The interactive MCP surface uses StartLogin + CompleteLogin
-// instead; this keeps the legacy CLI behavior (prints URL, reads the code
-// that appears in the browser's callback/success page).
+// Login performs the full Google authorization-code flow, blocking on user
+// input. The interactive MCP surface uses StartLogin + CompleteLogin instead;
+// this keeps the legacy CLI behavior (prints URL, reads a code from stdin).
+//
+// CAVEAT (loopback flow): the consent URL redirects the browser to
+// http://localhost:51121/oauth-callback, so the automatic capture only works
+// when the browser runs on the same machine as ultiproxy (the normal CLI and
+// `ultiproxy serve` case). It is NOT for remote/headless browsers: those must
+// copy the code out of the browser's localhost URL and hand it to
+// CompleteLogin via the ULTIPROXY_OAUTH_URL_FILE / ULTIPROXY_OAUTH_CODE_FILE
+// harness (or the MCP submit_oauth_code tool).
 func (p *Provider) Login(ctx context.Context) error {
 	info, err := p.StartLogin(ctx)
 	if err != nil {
@@ -1227,7 +1301,7 @@ func (p *Provider) Login(ctx context.Context) error {
 	if p.onAuthURL != nil {
 		p.onAuthURL(info.VerificationURI)
 	} else {
-		fmt.Fprintf(os.Stderr, "Open this URL, complete Google consent as the target account, then paste the code from the callback page:\n%s\n\nAuthorization code: ", info.VerificationURI)
+		fmt.Fprintf(os.Stderr, "Open this URL and complete Google consent as the target account (the browser then redirects to http://localhost:%d/oauth-callback):\n%s\n\nAuthorization code (empty = wait for the browser redirect): ", LoopbackCallbackPort, info.VerificationURI)
 	}
 
 	read := p.readCode
@@ -1242,66 +1316,122 @@ func (p *Provider) Login(ctx context.Context) error {
 	}
 	code, err := read()
 	if err != nil {
+		// Non-interactive stdin: the loopback redirect may still have the code.
+		if captured, ok := p.capturedCode(); ok {
+			return p.CompleteLogin(ctx, captured)
+		}
 		return fmt.Errorf("antigravity: read authorization code: %w", err)
 	}
-	return p.CompleteLogin(ctx, strings.TrimSpace(code))
+	code = strings.TrimSpace(code)
+	if code == "" {
+		// Nothing pasted: wait for the loopback redirect instead.
+		return p.CompleteLogin(ctx, "")
+	}
+	return p.CompleteLogin(ctx, code)
 }
 
-// StartLogin implements provider.InteractiveAuthProvider: generates the PKCE
-// verifier + Google consent URL and stores the pending flow, without blocking
-// on the human. CompleteLogin must be called with the authorization code that
-// appears in the browser after consent.
+// StartLogin implements provider.InteractiveAuthProvider using a loopback
+// flow: a plain client_secret authorization-code grant (NO PKCE) whose
+// redirect_uri is http://localhost:51121/oauth-callback, served by a listener
+// we own. The browser hands the REAL authorization code to that listener; the
+// legacy https://antigravity.google/oauth-callback page instead consumes the
+// code client-side and displays an unrelated companion token that Google's
+// token endpoint always rejects with invalid_grant.
+//
+// StartLogin never blocks: the listener is served from a goroutine and the
+// consent URL is returned immediately. CompleteLogin(ctx, "") waits for the
+// captured code.
 func (p *Provider) StartLogin(ctx context.Context) (*provider.LoginStartInfo, error) {
-	pkce, err := oauth.NewPKCE()
+	state, err := randomLoginState()
 	if err != nil {
-		return nil, fmt.Errorf("antigravity: pkce: %w", err)
+		return nil, fmt.Errorf("antigravity: state: %w", err)
 	}
-	cfg := oauth.AuthCodeConfig{
-		ClientID:     p.clientID,
-		ClientSecret: p.clientSecret,
-		AuthURL:      p.authURL,
-		TokenURL:     p.tokenURL,
-		RedirectURI:  p.redirectURI,
-		Scope:        p.scope,
-		HTTPClient:   p.httpClient,
-	}
-	authURL := oauth.AuthorizationURL(cfg, pkce)
+	pending := &pendingAntigravityAuth{state: state, codeCh: make(chan string, 1)}
 
+	// A previous attempt may still hold the loopback port.
+	p.stopLoopback()
+
+	loop, err := serveLoopback(pending)
+	if err != nil {
+		return nil, err
+	}
 	p.mu.Lock()
-	p.pendingPKCE = &antigravityPKCE{cfg: cfg, verifier: pkce.Verifier}
+	p.pendingAuth = pending
+	p.loopback = loop
 	p.mu.Unlock()
+
+	// Release the port when the caller gives up (the MCP request that started
+	// the flow ends, the CLI login times out, ...). While a flow is still
+	// pending, CompleteLogin re-arms the listener, so a request-scoped context
+	// here does not kill the flow.
+	if ctx != nil && ctx.Done() != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+			case <-loop.done:
+			}
+			loop.close()
+		}()
+	}
+
+	// Authorization-request parameters: access_type, client_id, prompt,
+	// redirect_uri, response_type, scope, state. No code_challenge.
+	params := url.Values{}
+	params.Set("access_type", "offline")
+	params.Set("client_id", p.clientID)
+	params.Set("prompt", "consent")
+	params.Set("redirect_uri", DefaultLoopbackRedirectURI)
+	params.Set("response_type", "code")
+	params.Set("scope", p.scope)
+	params.Set("state", state)
 
 	return &provider.LoginStartInfo{
 		Kind:            provider.LoginFlowAuthCode,
-		VerificationURI: authURL,
+		VerificationURI: p.authURL + "?" + params.Encode(),
 		ExpiresIn:       600,
 	}, nil
 }
 
-// CompleteLogin implements provider.InteractiveAuthProvider: exchanges the
-// authorization code (from the browser callback/success page) using the stored
-// PKCE verifier, then persists the credential.
+// CompleteLogin implements provider.InteractiveAuthProvider.
+//
+// With an empty authorizationCode (the MCP check_oauth_login poll path) it
+// waits for the loopback listener to capture the code from the browser
+// redirect, returning ctx.Err() when the caller's deadline expires (the MCP
+// layer maps that to "pending"). With a code it exchanges it immediately.
 func (p *Provider) CompleteLogin(ctx context.Context, authorizationCode string) error {
-	if authorizationCode == "" {
-		return errors.New("antigravity: empty authorization code")
+	if ctx == nil {
+		ctx = context.Background()
 	}
-
 	p.mu.RLock()
-	pending := p.pendingPKCE
+	pending := p.pendingAuth
 	p.mu.RUnlock()
 	if pending == nil {
 		return errors.New("antigravity: no pending login — call StartLogin first")
 	}
 
-	tokResp, err := oauth.ExchangeCode(ctx, pending.cfg, authorizationCode, pending.verifier)
+	code := strings.TrimSpace(authorizationCode)
+	if code == "" {
+		p.ensureLoopback(pending)
+		captured, err := waitForCode(ctx, pending.codeCh)
+		if err != nil {
+			return err
+		}
+		code = captured
+	}
+
+	tokResp, err := p.exchangeCode(ctx, code)
 	if err != nil {
+		// The code is single-use: drop the listener but keep the pending flow so
+		// the human can re-consent (a new code arrives on the same state).
+		p.stopLoopback()
 		return fmt.Errorf("antigravity: code exchange failed: %w", err)
 	}
 
 	p.mu.Lock()
-	p.pendingPKCE = nil
+	p.pendingAuth = nil
 	p.liveToken = tokResp.AccessToken
 	p.mu.Unlock()
+	p.stopLoopback()
 
 	projectID := p.ProjectID()
 	if pid, err := p.loadCodeAssistProject(ctx, tokResp.AccessToken); err == nil && pid != "" {
@@ -1327,6 +1457,191 @@ func (p *Provider) CompleteLogin(ctx context.Context, authorizationCode string) 
 		}
 	}
 	return nil
+}
+
+// exchangeCode swaps the authorization code for tokens. The form carries:
+// code, client_id, client_secret, redirect_uri, grant_type=authorization_code.
+// No code_verifier (the flow has no PKCE).
+func (p *Provider) exchangeCode(ctx context.Context, code string) (*oauth.TokenResponse, error) {
+	if code == "" {
+		return nil, fmt.Errorf("empty authorization code")
+	}
+	form := url.Values{}
+	form.Set("code", code)
+	form.Set("client_id", p.clientID)
+	form.Set("client_secret", p.clientSecret)
+	form.Set("redirect_uri", DefaultLoopbackRedirectURI)
+	form.Set("grant_type", "authorization_code")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.tokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	client := p.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	var tokResp oauth.TokenResponse
+	if err := json.Unmarshal(body, &tokResp); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if resp.StatusCode >= http.StatusBadRequest || tokResp.AccessToken == "" {
+		preview := string(body)
+		if len(preview) > 512 {
+			preview = preview[:512]
+		}
+		if tokResp.Error != "" {
+			return nil, fmt.Errorf("oauth error: %s (%s) [http %d]", tokResp.Error, tokResp.ErrorDesc, resp.StatusCode)
+		}
+		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, preview)
+	}
+	return &tokResp, nil
+}
+
+// serveLoopback binds 127.0.0.1:<LoopbackCallbackPort> and serves the
+// /oauth-callback handler that captures the authorization code delivered by the
+// browser redirect. The listener stops once the code is captured (see
+// CompleteLogin), after the idle deadline, or when loop.close() is called.
+func serveLoopback(pending *pendingAntigravityAuth) (*loopbackServer, error) {
+	ln, err := net.Listen("tcp", LoopbackListenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("antigravity: port %d busy — is another login running? (%w)", LoopbackCallbackPort, err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth-callback", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if got := q.Get("state"); got != pending.state {
+			http.Error(w, "state mismatch", http.StatusBadRequest)
+			return
+		}
+		code := q.Get("code")
+		if code == "" {
+			msg := strings.TrimSpace(q.Get("error"))
+			if msg == "" {
+				msg = "missing authorization code"
+			}
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
+		select {
+		case pending.codeCh <- code:
+		default: // a code was already captured; keep the first one
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, loopbackSuccessHTML)
+		log.Printf("[antigravity] loopback callback captured code (state ok)")
+	})
+
+	loop := &loopbackServer{
+		ln:   ln,
+		srv:  &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second},
+		done: make(chan struct{}),
+	}
+	go func() {
+		defer close(loop.done)
+		_ = loop.srv.Serve(ln)
+		// Give the browser a moment to drain the success page, then reap the
+		// (idle keep-alive) connection.
+		time.AfterFunc(5*time.Second, func() { _ = loop.srv.Close() })
+	}()
+	// Safety net so an abandoned login cannot hold the loopback port forever.
+	time.AfterFunc(LoopbackIdleTimeout, loop.close)
+	return loop, nil
+}
+
+// ensureLoopback re-arms the callback listener when the flow is still pending
+// but the listener is gone — that happens when StartLogin was called with a
+// request-scoped context (MCP Streamable HTTP) that ended as soon as the
+// sign-in URL was returned.
+func (p *Provider) ensureLoopback(pending *pendingAntigravityAuth) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pendingAuth == nil || p.pendingAuth != pending {
+		return
+	}
+	if p.loopback != nil && p.loopback.alive() {
+		return
+	}
+	if loop, err := serveLoopback(pending); err == nil {
+		p.loopback = loop
+	} else {
+		log.Printf("[antigravity] re-arm loopback listener: %v", err)
+	}
+}
+
+// stopLoopback tears down the callback listener (releasing the loopback port)
+// without touching the pending flow.
+func (p *Provider) stopLoopback() {
+	p.mu.Lock()
+	loop := p.loopback
+	p.loopback = nil
+	p.mu.Unlock()
+	loop.close()
+}
+
+// capturedCode returns a code the loopback listener already captured, if any.
+func (p *Provider) capturedCode() (string, bool) {
+	p.mu.RLock()
+	pending := p.pendingAuth
+	p.mu.RUnlock()
+	if pending == nil {
+		return "", false
+	}
+	select {
+	case code := <-pending.codeCh:
+		return code, true
+	default:
+		return "", false
+	}
+}
+
+// waitForCode blocks until a code shows up on ch or ctx is done. A code that
+// arrives concurrently with cancellation wins.
+func waitForCode(ctx context.Context, ch chan string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case code := <-ch:
+		return code, nil
+	default:
+	}
+	select {
+	case code := <-ch:
+		return code, nil
+	case <-ctx.Done():
+		select {
+		case code := <-ch:
+			return code, nil
+		default:
+		}
+		return "", ctx.Err()
+	}
+}
+
+// randomLoginState returns a fresh random CSRF state token for one login
+// attempt.
+func randomLoginState() (string, error) {
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 func (p *Provider) loadCodeAssistProject(ctx context.Context, tok string) (string, error) {

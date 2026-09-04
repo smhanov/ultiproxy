@@ -129,7 +129,7 @@ func ExchangeCode(ctx context.Context, cfg AuthCodeConfig, code, verifier string
 	}
 	if resp.StatusCode != http.StatusOK || tr.AccessToken == "" {
 		if tr.Error != "" {
-			return nil, fmt.Errorf("oauth error: %s (%s)", tr.Error, tr.ErrorDesc)
+			return nil, fmt.Errorf("oauth error: %s (%s) [http %d, body %.512s]", tr.Error, tr.ErrorDesc, resp.StatusCode, string(body))
 		}
 		return nil, fmt.Errorf("oauth: code exchange returned HTTP %d: %s", resp.StatusCode, string(body))
 	}

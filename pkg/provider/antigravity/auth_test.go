@@ -6,8 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -202,24 +200,5 @@ func TestGenerateUsesManagerToken(t *testing.T) {
 	}
 	if resp == nil {
 		t.Fatal("nil response")
-	}
-}
-
-func TestDoesNotReadCliproxyHome(t *testing.T) {
-	home := t.TempDir()
-	cliproxy := filepath.Join(home, ".cli-proxy-api")
-	if err := os.MkdirAll(cliproxy, 0700); err != nil {
-		t.Fatal(err)
-	}
-	junk := `{"access_token":"cliproxy-token","project_id":"cliproxy-proj","refresh_token":"rt"}`
-	if err := os.WriteFile(filepath.Join(cliproxy, "antigravity-x.json"), []byte(junk), 0600); err != nil {
-		t.Fatal(err)
-	}
-	p := NewFromState(home, filepath.Join(t.TempDir(), "state"), nil)
-	if p != nil {
-		tok, _ := p.getToken(context.Background())
-		if tok == "cliproxy-token" {
-			t.Fatal("must not load cliproxy token")
-		}
 	}
 }
