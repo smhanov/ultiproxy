@@ -10,9 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/smhanov/llmhub"
+	hubopenai "github.com/smhanov/llmhub/providers/openai"
 	"github.com/smhanov/ultiproxy/pkg/ir"
 	"github.com/smhanov/ultiproxy/pkg/provider"
-	"github.com/smhanov/ultiproxy/pkg/provider/internal/openai"
+	"github.com/smhanov/ultiproxy/pkg/provider/hublane"
 )
 
 const (
@@ -30,6 +32,7 @@ type Config struct {
 
 // Provider implements provider.InferenceProvider for vLLM and generic OpenAI-compatible backends.
 type Provider struct {
+	adapter    *hublane.Adapter
 	cfg        Config
 	httpClient *http.Client
 	baseURL    string
@@ -50,13 +53,15 @@ func New(cfg Config) (*Provider, error) {
 		cfg.APIKey = os.Getenv("VLLM_API_KEY")
 	}
 
-	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = http.DefaultClient
+	client := cfg.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+		cfg.HTTPClient = client
 	}
 
 	p := &Provider{
 		cfg:        cfg,
-		httpClient: cfg.HTTPClient,
+		httpClient: client,
 		baseURL:    cfg.BaseURL,
 		apiKey:     cfg.APIKey,
 	}
@@ -65,6 +70,28 @@ func New(cfg Config) (*Provider, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_, _ = p.FetchModels(ctx)
+
+	hubOpts := []llmhub.Option{llmhub.WithHTTPClient(client)}
+	if cfg.BaseURL != "" {
+		hubOpts = append(hubOpts, llmhub.WithBaseURL(cfg.BaseURL))
+	}
+
+	// llmhub's openai provider refuses to start without an API key. vLLM
+	// ignores the Authorization header entirely when no key is configured, so
+	// a placeholder credential is safe for local deployments.
+	hubKey := cfg.APIKey
+	if hubKey == "" {
+		hubKey = "vllm"
+	}
+	if cfg.APIKey != "" {
+		hubOpts = append(hubOpts, llmhub.WithAPIKey(cfg.APIKey))
+	}
+
+	hubProv, err := hubopenai.New(hubKey, hubOpts...)
+	if err != nil {
+		return nil, err
+	}
+	p.adapter = hublane.New(hubProv, hublane.WithCapabilities(Capabilities()))
 
 	return p, nil
 }
@@ -165,78 +192,14 @@ func (p *Provider) resolveModel(requested string) string {
 func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (*ir.Response, error) {
 	reqConfig := provider.NewRequestConfig(opts...)
 	model := p.resolveModel(reqConfig.Model)
-
-	chatMsgs := openai.ConvertMessages(msgs, openai.ConvertOptions{
-		AllowVision:   true,
-		EchoReasoning: true,
-	})
-
-	reqBody := openai.ChatCompletionRequest{
-		Model:           model,
-		Messages:        chatMsgs,
-		Stream:          false,
-		MaxTokens:       reqConfig.MaxTokens,
-		Temperature:     reqConfig.Temperature,
-		ReasoningEffort: reqConfig.ReasoningEffort,
-		Extra:           reqConfig.ExtraBody,
-	}
-
-	bodyReader, err := openai.BuildRequestBody(reqBody)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bodyReader)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	}
-	for k, v := range reqConfig.Headers {
-		req.Header.Set(k, v)
-	}
-
-	return openai.ExecuteGenerate(ctx, p.httpClient, req)
+	opts = append(opts, provider.WithModel(model))
+	return p.adapter.Generate(ctx, msgs, opts...)
 }
 
 // Stream implements provider.InferenceProvider.
 func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (<-chan ir.Event, error) {
 	reqConfig := provider.NewRequestConfig(opts...)
 	model := p.resolveModel(reqConfig.Model)
-
-	chatMsgs := openai.ConvertMessages(msgs, openai.ConvertOptions{
-		AllowVision:   true,
-		EchoReasoning: true,
-	})
-
-	reqBody := openai.ChatCompletionRequest{
-		Model:           model,
-		Messages:        chatMsgs,
-		Stream:          true,
-		MaxTokens:       reqConfig.MaxTokens,
-		Temperature:     reqConfig.Temperature,
-		ReasoningEffort: reqConfig.ReasoningEffort,
-		Extra:           reqConfig.ExtraBody,
-	}
-
-	bodyReader, err := openai.BuildRequestBody(reqBody)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bodyReader)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	}
-	for k, v := range reqConfig.Headers {
-		req.Header.Set(k, v)
-	}
-
-	return openai.ExecuteStream(ctx, p.httpClient, req)
+	opts = append(opts, provider.WithModel(model))
+	return p.adapter.Stream(ctx, msgs, opts...)
 }
