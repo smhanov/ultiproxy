@@ -848,3 +848,18 @@ var (
 	_ provider.QuotaProvider     = (*Provider)(nil)
 	_ provider.AuthProvider      = (*Provider)(nil)
 )
+
+// CachedModels returns the upstream model ids discovered so far (startup
+// discovery for ModelListPassthrough lanes, or the last successful
+// FetchModels) WITHOUT contacting the upstream. Callers that must never fan
+// out (the aggregated /v1/models handler) read this instead of Models().
+func (p *Provider) CachedModels() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.models) == 0 {
+		return nil
+	}
+	out := make([]string, len(p.models))
+	copy(out, p.models)
+	return out
+}

@@ -72,7 +72,7 @@ curl -s http://localhost:9050/v1/messages \
 ### 3. Model Catalog
 - **Route**: `GET /v1/models`
 - **Auth**: `Authorization: Bearer <api-key>`
-- **Description**: Enumerates all models routed by Ultiproxy across active pooled upstreams, annotated with benchmark scores, context lengths, and provider status.
+- **Description**: Enumerates everything Ultiproxy can route: catalog aliases (config + MCP `set_model_alias`, carrying `context_length` / `max_output_tokens` from the alias `context_limit` / `max_output`), one entry per registered lane named exactly `<lane>` (every lane accepts prefix-routed models, including lanes with no model discovery such as `anthropic` / `codex`), and one entry per discovered upstream model on lanes that slurp their upstream `/v1/models` (`model_list_passthrough`), exposed as `<lane>/<model>` — the exact id routing accepts. Listing is served from the discovery cache and never fans out to the upstreams. `context_length` is advisory metadata; `max_output_tokens` is enforced (the request's `max_tokens` is clamped to it).
 - **Response Structure**:
 ```json
 {
@@ -173,7 +173,7 @@ curl -s http://localhost:9050/v1/messages \
 - **Protocol**: JSON-RPC 2.0 over HTTP/SSE.
 - **Exposed Agent Tools**:
   - `list_models`: Returns currently available models, context lengths, and operational states.
-  - `get_quota_status`: Returns remaining request allocations and seconds until quota reset for each provider.
+  - `get_quota_status`: Returns remaining request allocations and seconds until quota reset for each provider. Lanes with no quota surface answer "has no quota mechanism"; a lane that is not logged in (e.g. codex) answers with a snapshot whose `detail` says to run `ultiproxy login codex`.
   - `toggle_model`: Dynamically enables or disables specific upstream providers without restarting the proxy.
   - `get_client_usage`: Fetches token accounting statistics for a specific client key.
   - `initiate_oauth_login`: Triggers headless or browser OAuth authentication flows for providers like GitHub Copilot.

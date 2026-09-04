@@ -19,6 +19,12 @@ import (
 )
 
 // ModelAlias maps a client-visible alias to a provider lane + upstream id.
+//
+// MaxOutput is enforced on the request path: max_tokens is clamped to it in
+// pkg/server/handlers.go (upstreamOptions). ContextLimit is advisory metadata
+// only — it is surfaced to clients through GET /v1/models (context_length) and
+// is not enforced, because estimating prompt tokens would require a
+// provider-specific tokenizer.
 type ModelAlias struct {
 	Provider        string             `yaml:"provider" json:"provider"`
 	Upstream        string             `yaml:"upstream" json:"upstream"`

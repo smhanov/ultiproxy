@@ -624,14 +624,24 @@ func TestOpenAICompat_CreditsQuotaObserver(t *testing.T) {
 		t.Errorf("expected X-Grpc-Web '1', got %q", capturedWebHeader)
 	}
 
-	if len(snap.Windows) < 2 {
-		t.Fatalf("expected at least 2 windows, got %d", len(snap.Windows))
+	// The billing response is distilled into a single "Grok Build" window: the
+	// usage percent is the smallest fixed32 in [0,100] sitting under a field
+	// path that ends in field 1 (15 here — the fixture also carries 45 and two
+	// 100s), and the reset is the earliest timestamp still in the future.
+	if len(snap.Windows) != 1 {
+		t.Fatalf("expected exactly 1 window, got %d: %+v", len(snap.Windows), snap.Windows)
 	}
-	if snap.Windows[0].Label != "5 hour" || snap.Windows[0].UsedPct != 15.0 {
-		t.Errorf("unexpected 5-hour window: %+v", snap.Windows[0])
+	if snap.Windows[0].Label != "Grok Build" {
+		t.Errorf("unexpected window label: %+v", snap.Windows[0])
 	}
-	if snap.Windows[1].Label != "Weekly" || snap.Windows[1].UsedPct != 45.0 {
-		t.Errorf("unexpected Weekly window: %+v", snap.Windows[1])
+	if snap.Windows[0].UsedPct != 15.0 {
+		t.Errorf("UsedPct = %v, want 15 (min percent candidate)", snap.Windows[0].UsedPct)
+	}
+	if snap.Windows[0].Remaining != 85.0 || snap.Windows[0].Limit != 100 || snap.Windows[0].Unit != "%" {
+		t.Errorf("unexpected window scaling: %+v", snap.Windows[0])
+	}
+	if !strings.Contains(snap.Detail, "Grok Build 15% used") {
+		t.Errorf("Detail = %q, want it to report the Grok Build usage", snap.Detail)
 	}
 }
 

@@ -1,7 +1,6 @@
 package openaicompat
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -15,29 +14,81 @@ import (
 	"github.com/smhanov/ultiproxy/pkg/provider"
 )
 
+// ----------------------------------------------------------------------------
+// Grok Build credits quota (xAI) — gRPC-web
+//
+// The Grok web client fetches its credits config from
+// grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig as a gRPC-web call, not as
+// a REST/JSON one: POST an empty protobuf request message (a 5-byte gRPC-web
+// frame: flag byte 0 + big-endian uint32 length 0) with Content-Type
+// application/grpc-web+proto, and read back a gRPC-web framed protobuf
+// response. A JSON body (or none at all) is answered with HTTP 200 and zero
+// bytes, which used to be misread as "no credit pools".
+// ----------------------------------------------------------------------------
+
+// defaultGrokBillingURL is the gRPC-web endpoint the Grok web client calls.
+// The URL itself was always right; only the request wire format was wrong.
 const defaultGrokBillingURL = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
 
-// fetchCreditsQuota queries the gRPC-web Grok credits endpoint and parses the response.
-func fetchCreditsQuota(ctx context.Context, client *http.Client, billingURL, token string) (*provider.QuotaSnapshot, error) {
-	if billingURL == "" || (!strings.HasPrefix(billingURL, "http://") && !strings.HasPrefix(billingURL, "https://")) {
-		billingURL = defaultGrokBillingURL
+// Request shape captured from the Grok web client (connect-es runtime).
+const (
+	grokGRPCWebContentType = "application/grpc-web+proto"
+	grokGRPCWebFlagHeader  = "x-grpc-web"
+	grokGRPCWebFlagValue   = "1"
+	grokUserAgentHeader    = "x-user-agent"
+	grokUserAgentValue     = "connect-es/2.1.1"
+	grokOrigin             = "https://grok.com"
+	grokReferer            = "https://grok.com/?_s=usage"
+
+	// grokGRPCWebEmptyRequest is the gRPC-web frame carrying an empty protobuf
+	// request message: data-frame flag byte 0x00 plus a zero big-endian uint32
+	// payload length — exactly five zero bytes.
+	grokGRPCWebEmptyRequest = "\x00\x00\x00\x00\x00"
+
+	// grokNoCreditPoolsDetail is what a well-formed billing payload that
+	// carries no usable window means: the account has no credits to report.
+	grokNoCreditPoolsDetail = "Grok billing reports no credit pools: the account has no credits (free/no-credit plan) or its spending limit has been reached"
+)
+
+// setGrokGRPCWebHeaders applies the exact header set the Grok web client sends
+// to the billing endpoint. Missing Origin/Referer gets the request silently
+// downgraded to an empty response.
+func setGrokGRPCWebHeaders(req *http.Request, token string) {
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Content-Type", grokGRPCWebContentType)
+	req.Header.Set("Origin", grokOrigin)
+	req.Header.Set("Referer", grokReferer)
+	req.Header.Set(grokGRPCWebFlagHeader, grokGRPCWebFlagValue)
+	req.Header.Set(grokUserAgentHeader, grokUserAgentValue)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
+}
+
+// grokBillingURL resolves the configured credits observer to a usable URL,
+// falling back to the real Grok billing endpoint when it is empty or not an
+// absolute http(s) URL.
+func grokBillingURL(observer string) string {
+	if observer == "" || (!strings.HasPrefix(observer, "http://") && !strings.HasPrefix(observer, "https://")) {
+		return defaultGrokBillingURL
+	}
+	return observer
+}
+
+// fetchCreditsQuota queries the gRPC-web Grok credits endpoint and parses the
+// response.
+func fetchCreditsQuota(ctx context.Context, client *http.Client, billingURL, token string) (*provider.QuotaSnapshot, error) {
+	billingURL = grokBillingURL(billingURL)
 	if client == nil {
 		client = http.DefaultClient
 	}
 
-	emptyFrame := []byte{0x00, 0x00, 0x00, 0x00, 0x00}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, billingURL, bytes.NewReader(emptyFrame))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, billingURL,
+		strings.NewReader(grokGRPCWebEmptyRequest))
 	if err != nil {
 		return nil, fmt.Errorf("openaicompat: create billing request: %w", err)
 	}
-
-	req.Header.Set("Content-Type", "application/grpc-web+proto")
-	req.Header.Set("X-Grpc-Web", "1")
-	req.Header.Set("X-User-Agent", "grpc-web-javascript/0.1")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
+	setGrokGRPCWebHeaders(req, token)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -60,20 +111,27 @@ func fetchCreditsQuota(ctx context.Context, client *http.Client, billingURL, tok
 	return ParseGrokCreditsResponse(body, time.Now().UTC())
 }
 
+// ----------------------------------------------------------------------------
+// protobuf scanning (wire-format walk, no schema needed)
+// ----------------------------------------------------------------------------
+
+// scannedField is one scalar leaf found while walking a protobuf message. Only
+// the shapes the quota heuristics need are recorded: varints and 32-bit floats,
+// each with its full field path so "field 8 sub 1" can be recognised.
 type scannedField struct {
-	Path   []int
-	Wire   int
-	Varint uint64
-	Float  float32
-	Double float64
-	String string
-	Bytes  []byte
+	Path   []int   // field numbers from the message root, e.g. [1, 8, 1]
+	Wire   int     // 0 = varint, 5 = fixed32
+	Varint uint64  // valid when Wire == 0
+	Float  float32 // valid when Wire == 5
 }
 
+// protobufScanner walks arbitrary protobuf bytes and collects every varint and
+// fixed32 value together with its field path.
 type protobufScanner struct {
 	fields []scannedField
 }
 
+// readVarint decodes one base-128 varint starting at idx.
 func readVarint(data []byte, idx int) (uint64, int, bool) {
 	var val uint64
 	var shift uint
@@ -89,8 +147,13 @@ func readVarint(data []byte, idx int) (uint64, int, bool) {
 	return 0, idx, false
 }
 
+const maxProtoDepth = 10
+
+// scan recursively walks data, appending every varint/fixed32 leaf it finds.
+// Malformed input never panics: an unreadable field just stops the walk at that
+// offset and scanning resumes one byte later.
 func (s *protobufScanner) scan(data []byte, path []int, depth int) {
-	if depth > 10 {
+	if depth > maxProtoDepth {
 		return
 	}
 	i := 0
@@ -102,75 +165,86 @@ func (s *protobufScanner) scan(data []byte, path []int, depth int) {
 			continue
 		}
 		fieldNum := int(key >> 3)
+		if fieldNum <= 0 {
+			i = start + 1
+			continue
+		}
 		wireType := int(key & 7)
 		currPath := append(append([]int(nil), path...), fieldNum)
 		i = nextIdx
 
 		switch wireType {
-		case 0: // Varint
+		case 0: // varint
 			val, endIdx, ok := readVarint(data, i)
 			if !ok {
 				i = start + 1
 				continue
 			}
-			s.fields = append(s.fields, scannedField{
-				Path:   currPath,
-				Wire:   0,
-				Varint: val,
-			})
+			s.fields = append(s.fields, scannedField{Path: currPath, Wire: 0, Varint: val})
 			i = endIdx
 
-		case 1: // 64-bit
+		case 1: // 64-bit — not needed by any heuristic, skip the payload
 			if i+8 > len(data) {
 				i = start + 1
 				continue
 			}
-			bits := binary.LittleEndian.Uint64(data[i : i+8])
-			valFloat := math.Float64frombits(bits)
-			s.fields = append(s.fields, scannedField{
-				Path:   currPath,
-				Wire:   1,
-				Double: valFloat,
-			})
 			i += 8
 
-		case 2: // Length-delimited
+		case 2: // length-delimited: recurse (nested messages carry the windows)
 			size, endIdx, ok := readVarint(data, i)
-			if !ok || int(size) > len(data)-endIdx {
+			if !ok || size > uint64(len(data)-endIdx) {
 				i = start + 1
 				continue
 			}
-			subBytes := data[endIdx : endIdx+int(size)]
-			s.fields = append(s.fields, scannedField{
-				Path:   currPath,
-				Wire:   2,
-				String: string(subBytes),
-				Bytes:  subBytes,
-			})
-			s.scan(subBytes, currPath, depth+1)
+			s.scan(data[endIdx:endIdx+int(size)], currPath, depth+1)
 			i = endIdx + int(size)
 
-		case 5: // 32-bit
+		case 5: // fixed32
 			if i+4 > len(data) {
 				i = start + 1
 				continue
 			}
-			bits := binary.LittleEndian.Uint32(data[i : i+4])
-			valFloat := math.Float32frombits(bits)
 			s.fields = append(s.fields, scannedField{
 				Path:  currPath,
 				Wire:  5,
-				Float: valFloat,
+				Float: math.Float32frombits(binary.LittleEndian.Uint32(data[i : i+4])),
 			})
 			i += 4
 
-		default:
+		default: // groups (3/4) and anything unknown: skip a byte
 			i = start + 1
 		}
 	}
 }
 
-// UnframeGRPCWeb extracts all data payloads from a gRPC-web stream.
+// pathEndsWith reports whether path ends with the given field-number suffix.
+func pathEndsWith(path []int, suffix ...int) bool {
+	if len(path) < len(suffix) {
+		return false
+	}
+	return equalInts(path[len(path)-len(suffix):], suffix)
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ----------------------------------------------------------------------------
+// gRPC-web framing
+// ----------------------------------------------------------------------------
+
+// UnframeGRPCWeb extracts every data-frame payload from a gRPC-web stream. A
+// frame is a flag byte followed by a big-endian uint32 length and that many
+// payload bytes; frames with the 0x80 trailer bit set carry gRPC metadata
+// ("grpc-status:0\r\n") and are skipped, never handed to the protobuf walker.
 func UnframeGRPCWeb(data []byte) ([][]byte, error) {
 	var payloads [][]byte
 	i := 0
@@ -180,20 +254,156 @@ func UnframeGRPCWeb(data []byte) ([][]byte, error) {
 		start := i + 5
 		end := start + int(size)
 		if end > len(data) {
+			// truncated frame — keep whatever data frames we already have
 			break
 		}
-		if (flags & 0x80) == 0 {
+		if flags&0x80 == 0 {
 			payloads = append(payloads, data[start:end])
 		}
 		i = end
 	}
-	if len(payloads) == 0 && len(data) > 0 {
-		payloads = append(payloads, data)
-	}
 	return payloads, nil
 }
 
-// ParseGrokCreditsResponse parses gRPC-web binary data into QuotaSnapshot.
+// ----------------------------------------------------------------------------
+// Grok credits protobuf — window extraction
+// ----------------------------------------------------------------------------
+
+// Verified shape of GetGrokCreditsConfig (from a live response):
+//
+//	field 4  message {1: varint seconds} — window start (unix seconds, UTC)
+//	field 5  message {1: varint seconds} — window end / reset
+//	field 8  message {1: varint state}   — 2 == active
+//	          nested {2: {1: start_secs}}, {3: {1: end_secs}}
+//	field 11, field 13 varint             — flags (1 == true)
+//	optional: a usage percent as a fixed32 float 0..100 nested under a field
+//	          whose last path element is 1 (the ai-quota-dashboard heuristic).
+const (
+	// Plausible unix-seconds range for a billing window timestamp: 2023-11
+	// through 2036. Anything outside is a flag, a counter or a state enum.
+	grokUnixSecondsMin int64 = 1700000000
+	grokUnixSecondsMax int64 = 2100000000
+
+	// Field 8 sub-field 1 value that marks a window as active.
+	grokWindowStateActive uint64 = 2
+
+	// The usage percent is carried by a field whose last path element is 1.
+	grokUsagePercentField = 1
+
+	grokCreditsLabel      = "Grok Build"
+	grokCreditsDateLayout = "Jan 2 2006"
+	grokCreditsDayLayout  = "Jan 2"
+)
+
+// grokCreditsWindow is what the billing protobuf boils down to for the quota
+// dashboard: one rate-limit window plus how much of it has been consumed.
+type grokCreditsWindow struct {
+	Start  time.Time // window start; zero when unknown
+	Reset  time.Time // window end / reset; zero when unknown
+	Active bool      // field 8 reported state == 2 (active)
+	Pct    float64   // usage percent 0..100
+	HasPct bool      // a usage percent was actually present in the payload
+}
+
+// parseGrokCredits walks one GetGrokCreditsConfig protobuf message and distils
+// it into a grokCreditsWindow:
+//
+//  1. starts  = varints in the unix-seconds range that are <= now
+//     resets  = varints in the unix-seconds range that are >  now
+//     window start = earliest plausible start, reset = earliest plausible reset
+//  2. pct = smallest fixed32 in [0,100] whose field path ends in field 1
+//     (values <= 1 are fractions and are scaled to percent)
+//  3. active = any field-8 sub-message reporting state 2
+func parseGrokCredits(payload []byte, now time.Time) grokCreditsWindow {
+	scanner := &protobufScanner{}
+	scanner.scan(payload, nil, 0)
+
+	var starts, resets []time.Time
+	for _, f := range scanner.fields {
+		// Only varints can be timestamps here; the fixed32 usage floats are
+		// handled by grokUsagePercent below.
+		if f.Wire != 0 {
+			continue
+		}
+		if f.Varint >= uint64(grokUnixSecondsMin) && f.Varint <= uint64(grokUnixSecondsMax) {
+			ts := time.Unix(int64(f.Varint), 0).UTC()
+			if ts.After(now) {
+				resets = append(resets, ts)
+			} else {
+				starts = append(starts, ts)
+			}
+		}
+	}
+
+	w := grokCreditsWindow{
+		Start: earliestTime(starts),
+		Reset: earliestTime(resets),
+	}
+	w.Active = grokWindowActive(scanner.fields)
+	w.Pct, w.HasPct = grokUsagePercent(scanner.fields)
+	return w
+}
+
+// grokWindowActive reports whether any field-8 sub-message reports the active
+// state (2).
+func grokWindowActive(fields []scannedField) bool {
+	for _, f := range fields {
+		if f.Wire == 0 && pathEndsWith(f.Path, 8, 1) && f.Varint == grokWindowStateActive {
+			return true
+		}
+	}
+	return false
+}
+
+// grokUsagePercent implements the ai-quota-dashboard heuristic: candidates are
+// fixed32 values in [0,100] whose field path ends with field 1, and the usage
+// percent is the smallest of them.
+func grokUsagePercent(fields []scannedField) (float64, bool) {
+	var (
+		best  float64
+		found bool
+	)
+	for _, f := range fields {
+		if f.Wire != 5 || !pathEndsWith(f.Path, grokUsagePercentField) {
+			continue
+		}
+		if math.IsNaN(float64(f.Float)) || math.IsInf(float64(f.Float), 0) {
+			continue
+		}
+		pct := grokPercentFromFloat(f.Float)
+		if pct < 0 || pct > 100 {
+			continue
+		}
+		if !found || pct < best {
+			best, found = pct, true
+		}
+	}
+	return best, found
+}
+
+// grokPercentFromFloat normalises a raw usage float: values <= 1 are fractions
+// (0.68 -> 68%), anything larger is already a percent. The result is rounded to
+// two decimals so float32 representation noise never leaks into a report.
+func grokPercentFromFloat(v float32) float64 {
+	pct := float64(v)
+	if v <= 1 {
+		pct *= 100
+	}
+	return math.Round(pct*100) / 100
+}
+
+func earliestTime(times []time.Time) time.Time {
+	var earliest time.Time
+	for _, t := range times {
+		if earliest.IsZero() || t.Before(earliest) {
+			earliest = t
+		}
+	}
+	return earliest
+}
+
+// ParseGrokCreditsResponse parses a gRPC-web Grok credits response into a
+// QuotaSnapshot with a single "Grok Build" window.
 func ParseGrokCreditsResponse(data []byte, now time.Time) (*provider.QuotaSnapshot, error) {
 	payloads, err := UnframeGRPCWeb(data)
 	if err != nil {
@@ -203,134 +413,70 @@ func ParseGrokCreditsResponse(data []byte, now time.Time) (*provider.QuotaSnapsh
 		}, nil
 	}
 
-	scanner := &protobufScanner{}
+	// Concatenate the data frames: a message may be split across frames.
+	var message []byte
 	for _, p := range payloads {
-		scanner.scan(p, nil, 0)
+		message = append(message, p...)
 	}
 
-	type poolData struct {
-		Name    string
-		UsedPct *float64
-		ResetAt time.Time
-	}
+	window := parseGrokCredits(message, now)
 
-	pools := make(map[string]*poolData)
-	getOrCreatePool := func(name string) *poolData {
-		if p, ok := pools[name]; ok {
-			return p
-		}
-		p := &poolData{Name: name}
-		pools[name] = p
-		return p
-	}
-
-	for _, f := range scanner.fields {
-		if f.Wire == 2 && (strings.Contains(strings.ToLower(f.String), "5 hour") || strings.Contains(strings.ToLower(f.String), "weekly")) {
-			label := "5 hour"
-			if strings.Contains(strings.ToLower(f.String), "weekly") {
-				label = "Weekly"
-			}
-			getOrCreatePool(label)
-		}
-	}
-
-	for _, f := range scanner.fields {
-		for name, p := range pools {
-			isMatch := false
-			if strings.EqualFold(name, "5 hour") && len(f.Path) > 0 && f.Path[0] == 1 {
-				isMatch = true
-			} else if strings.EqualFold(name, "Weekly") && len(f.Path) > 0 && f.Path[0] == 2 {
-				isMatch = true
-			}
-			if isMatch {
-				if f.Wire == 5 && f.Float >= 0 && f.Float <= 100 && p.UsedPct == nil {
-					pct := float64(f.Float)
-					p.UsedPct = &pct
-				}
-				if f.Wire == 0 && f.Varint >= 1700000000 && f.Varint <= 2500000000 {
-					p.ResetAt = time.Unix(int64(f.Varint), 0).UTC()
-				}
-			}
-		}
-	}
-
-	var windows []provider.QuotaWindow
-	order := []string{"5 hour", "Weekly"}
-	for _, name := range order {
-		if p, ok := pools[name]; ok && p.UsedPct != nil {
-			var secRem int64
-			if !p.ResetAt.IsZero() && p.ResetAt.After(now) {
-				secRem = int64(p.ResetAt.Sub(now).Seconds())
-			}
-			used := *p.UsedPct
-			rem := math.Max(0, 100.0-used)
-			windows = append(windows, provider.QuotaWindow{
-				Label:            name,
-				UsedPct:          used,
-				Remaining:        rem,
-				Limit:            100,
-				Unit:             "%",
-				ResetAt:          p.ResetAt,
-				SecondsRemaining: secRem,
-			})
-		}
-	}
-
-	if len(windows) == 0 {
-		var candidates []float64
-		for _, f := range scanner.fields {
-			if f.Wire == 5 && f.Float >= 0 && f.Float <= 100 {
-				candidates = append(candidates, float64(f.Float))
-			}
-		}
-
-		var resets []time.Time
-		for _, f := range scanner.fields {
-			if f.Wire == 0 && f.Varint >= 1700000000 && f.Varint <= 2500000000 {
-				resets = append(resets, time.Unix(int64(f.Varint), 0).UTC())
-			}
-		}
-
-		if len(candidates) > 0 {
-			usedPct := candidates[0]
-			var reset time.Time
-			if len(resets) > 0 {
-				reset = resets[0]
-			}
-			var secRem int64
-			if !reset.IsZero() && reset.After(now) {
-				secRem = int64(reset.Sub(now).Seconds())
-			}
-
-			windows = append(windows, provider.QuotaWindow{
-				Label:            "Grok Build credits",
-				UsedPct:          usedPct,
-				Remaining:        math.Max(0, 100.0-usedPct),
-				Limit:            100,
-				Unit:             "%",
-				ResetAt:          reset,
-				SecondsRemaining: secRem,
-			})
-		}
-	}
-
-	if len(windows) == 0 {
+	// No reset, no usage percent and no active window: a well-formed billing
+	// payload that reports nothing usable. That means the account simply has
+	// no credits to report (free / no-credit plan, or a spending limit already
+	// reached) — a valid observation, not an error.
+	if window.Reset.IsZero() && !window.HasPct && !window.Active {
 		return &provider.QuotaSnapshot{
 			ObservedAt: now,
-			Detail:     "Grok billing response contained no recognizable credit pools (status unknown)",
+			Windows:    []provider.QuotaWindow{},
+			Detail:     grokNoCreditPoolsDetail,
 		}, nil
 	}
 
-	var detailParts []string
-	for _, w := range windows {
-		detailParts = append(detailParts, fmt.Sprintf("%s: %.1f%% used", w.Label, w.UsedPct))
+	pct := window.Pct
+	remaining := math.Max(0, 100-pct)
+	var secondsRemaining int64
+	if !window.Reset.IsZero() {
+		secondsRemaining = int64(window.Reset.Sub(now).Seconds())
+		if secondsRemaining < 0 {
+			secondsRemaining = 0
+		}
+	}
+
+	w := provider.QuotaWindow{
+		Label:            grokCreditsLabel,
+		UsedPct:          pct,
+		Remaining:        remaining,
+		Limit:            100,
+		Unit:             "%",
+		ResetAt:          window.Reset,
+		SecondsRemaining: secondsRemaining,
 	}
 
 	return &provider.QuotaSnapshot{
 		ObservedAt: now,
-		Windows:    windows,
-		Detail:     strings.Join(detailParts, " · "),
+		Windows:    []provider.QuotaWindow{w},
+		Detail:     grokCreditsDetail(window),
 	}, nil
+}
+
+// grokCreditsDetail renders the human-facing one-liner for a Grok Build window.
+func grokCreditsDetail(w grokCreditsWindow) string {
+	if w.HasPct {
+		if w.Reset.IsZero() {
+			return fmt.Sprintf("Grok Build %v%% used", w.Pct)
+		}
+		return fmt.Sprintf("Grok Build %v%% used · resets %s", w.Pct, w.Reset.Format(grokCreditsDateLayout))
+	}
+	if w.Reset.IsZero() {
+		return "Grok Build window active, no usage recorded yet"
+	}
+	if w.Start.IsZero() {
+		return fmt.Sprintf("Grok Build window active, no usage recorded yet (resets %s)",
+			w.Reset.Format(grokCreditsDateLayout))
+	}
+	return fmt.Sprintf("Grok Build window active (%s - %s), no usage recorded yet",
+		w.Start.Format(grokCreditsDayLayout), w.Reset.Format(grokCreditsDateLayout))
 }
 
 // ----------------------------------------------------------------------------

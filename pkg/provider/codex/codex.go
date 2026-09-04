@@ -571,7 +571,21 @@ type whamUsageResponse struct {
 }
 
 // Quota implements provider.QuotaProvider.
+//
+// When the lane has no access token at all (never logged in: no credential
+// store entry, no static token) there is nothing to query, so the result is
+// reported as an observation with empty windows instead of an error — an
+// error here surfaces to MCP get_quota_status as "error getting quota:
+// codex: wham usage request failed: codex: no access token available".
 func (p *Provider) Quota(ctx context.Context) (*provider.QuotaSnapshot, error) {
+	if _, err := p.getToken(ctx); err != nil {
+		return &provider.QuotaSnapshot{
+			ObservedAt: time.Now().UTC(),
+			Windows:    []provider.QuotaWindow{},
+			Detail:     "not logged in — run 'ultiproxy login codex'",
+		}, nil
+	}
+
 	endpoint := p.baseURL + "/backend-api/wham/usage"
 	makeReq := func(tok string) (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)

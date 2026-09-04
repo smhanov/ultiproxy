@@ -14,6 +14,7 @@ import (
 	"github.com/smhanov/ultiproxy/pkg/codec"
 	"github.com/smhanov/ultiproxy/pkg/ir"
 	"github.com/smhanov/ultiproxy/pkg/provider"
+	"github.com/smhanov/ultiproxy/pkg/state"
 	"github.com/smhanov/ultiproxy/pkg/storage"
 )
 
@@ -41,12 +42,42 @@ func stripProviderPrefix(model, providerName string) string {
 	return model
 }
 
+// modelsCacheProvider is implemented by providers that discovered their
+// upstream model list and can hand it back from cache. openaicompat lanes
+// with the ModelListPassthrough quirk populate that cache at construction
+// (and on every explicit FetchModels). The aggregated /v1/models handler
+// reads the cache only, so listing models never fans out to the upstreams.
+type modelsCacheProvider interface {
+	CachedModels() []string
+}
+
+// handleModels serves the aggregated model list.
+//
+// Sources, in order (first occurrence of an id wins):
+//
+//  1. the state snapshot's model map (aliases synced from the catalog, plus
+//     any runtime toggle_model entries), honouring the Enabled flag;
+//  2. the alias catalog itself, so a server built without a state manager
+//     still lists its configured aliases;
+//  3. every registered lane: one entry named exactly "<lane>" (lanes accept
+//     prefix-routed models, and lanes with no model discovery at all —
+//     anthropic, codex, custom kinds — have nothing else to advertise), plus
+//     one entry per cached discovered upstream model as "<lane>/<model>".
+//     Those prefixed ids are exactly what routing accepts. A passthrough
+//     lane whose discovery cache is empty contributes no model entries: no
+//     fake ids are invented for it, and it is never probed on the fly.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	type ModelEntry struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`
 		Created int64  `json:"created"`
 		OwnedBy string `json:"owned_by"`
+		// ContextLength / MaxOutputTokens surface the alias catalog's
+		// context_limit / max_output (OpenAI-style flat limits fields).
+		// ContextLength is advisory metadata: it is reported to clients but
+		// not enforced on the request path.
+		ContextLength   int `json:"context_length,omitempty"`
+		MaxOutputTokens int `json:"max_output_tokens,omitempty"`
 	}
 
 	type ModelsResponse struct {
@@ -54,35 +85,81 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		Data   []ModelEntry `json:"data"`
 	}
 
-	var data []ModelEntry
+	data := []ModelEntry{}
 	seen := make(map[string]bool)
+	add := func(id, ownedBy string, contextLength, maxOutput int) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		data = append(data, ModelEntry{
+			ID:              id,
+			Object:          "model",
+			Created:         1700000000,
+			OwnedBy:         ownedBy,
+			ContextLength:   contextLength,
+			MaxOutputTokens: maxOutput,
+		})
+	}
 
-	// Pull from StateManager if available
+	var snap *state.RuntimeSnapshot
 	if s.sm != nil {
-		snap := s.sm.Snapshot()
-		if snap != nil && snap.Models != nil {
-			var keys []string
-			for k := range snap.Models {
-				keys = append(keys, k)
+		snap = s.sm.Snapshot()
+	}
+
+	// 1. State snapshot models (aliases as synced, plus runtime toggles).
+	if snap != nil && snap.Models != nil {
+		keys := make([]string, 0, len(snap.Models))
+		for k := range snap.Models {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			m := snap.Models[k]
+			if !m.Enabled {
+				continue
 			}
-			sort.Strings(keys)
-			for _, k := range keys {
-				m := snap.Models[k]
-				if m.Enabled {
-					data = append(data, ModelEntry{
-						ID:      m.ID,
-						Object:  "model",
-						Created: 1700000000,
-						OwnedBy: m.Provider,
-					})
-					seen[m.ID] = true
-				}
-			}
+			add(m.ID, m.Provider, m.ContextLimit, m.MaxOutput)
 		}
 	}
 
-	if data == nil {
-		data = []ModelEntry{}
+	// 2. Alias catalog (covers servers built without a state manager).
+	if s.catalog != nil {
+		for _, alias := range s.catalog.Sorted() {
+			entry, ok := s.catalog.Get(alias)
+			if !ok {
+				continue
+			}
+			if snap != nil && snap.Models != nil {
+				if mr, ok := snap.Models[alias]; ok && !mr.Enabled {
+					continue
+				}
+			}
+			add(alias, entry.Provider, entry.ContextLimit, entry.MaxOutput)
+		}
+	}
+
+	// 3. Registered lanes.
+	if s.registry != nil {
+		for _, name := range s.registry.Names() {
+			bundle, ok := s.registry.Get(name)
+			if !ok {
+				continue
+			}
+			add(name, name, 0, 0)
+			if bundle.Inference == nil {
+				continue
+			}
+			cacher, ok := bundle.Inference.(modelsCacheProvider)
+			if !ok {
+				continue
+			}
+			discovered := cacher.CachedModels()
+			sort.Strings(discovered)
+			for _, m := range discovered {
+				add(name+"/"+m, name, 0, 0)
+			}
+		}
 	}
 
 	resp := ModelsResponse{
@@ -213,7 +290,6 @@ func (s *Server) dispatchRequest(
 			return
 		}
 
-		opts := append(options, provider.WithClientKeyHash(clientKeyHash))
 		// Resolve the upstream model id: model aliases map to explicit
 		// upstream names (e.g. "qwenpoint-3.8" -> "Qwen/Qwen3.8-Instruct-AWQ");
 		// otherwise strip a "<provider>/" prefix for prefixed names (e.g.
@@ -221,15 +297,18 @@ func (s *Server) dispatchRequest(
 		// forwards the requested identifier verbatim. Last-apply wins, so this
 		// overrides the codec's WithModel().
 		upstream := ""
+		var alias ModelAlias
+		var hasAlias bool
 		if s.catalog != nil {
-			if u, ok := s.catalog.UpstreamName(model); ok {
-				upstream = u
+			if entry, ok := s.catalog.Get(model); ok {
+				alias, hasAlias = entry, true
+				upstream = entry.Upstream
 			}
 		}
 		if upstream == "" {
 			upstream = stripProviderPrefix(model, provName)
 		}
-		opts = append(opts, provider.WithModel(upstream))
+		opts := upstreamOptions(options, upstream, alias, hasAlias, clientKeyHash)
 
 		// Apply the per-provider request timeout (default or MCP-configured).
 		// Providers honor context cancellation while calling upstream.
@@ -451,6 +530,34 @@ func (s *Server) dispatchRequest(
 
 	// All candidate providers failed before commit
 	renderFailedBeforeCommit(w, lastErr, "all candidate providers failed before commit")
+}
+
+// upstreamOptions builds the provider option slice for one dispatch attempt:
+// the client key hash for accounting, the resolved upstream model id (applied
+// after the codec's own options so it wins), and the catalog alias output cap.
+//
+// A catalog alias MaxOutput clamps max_tokens: a request that asks for more
+// output tokens than the alias allows is reduced to the alias limit, and a
+// request that asks for none inherits the alias limit instead of the lane
+// default. ContextLimit is deliberately NOT enforced on the request path — it
+// is advisory metadata surfaced through /v1/models (context_length), because
+// estimating prompt token counts per provider would require a tokenizer the
+// proxy does not own.
+func upstreamOptions(base []provider.Option, upstream string, alias ModelAlias, hasAlias bool, clientKeyHash string) []provider.Option {
+	opts := make([]provider.Option, 0, len(base)+3)
+	opts = append(opts, base...)
+	opts = append(opts,
+		provider.WithClientKeyHash(clientKeyHash),
+		provider.WithModel(upstream),
+	)
+	if !hasAlias || alias.MaxOutput <= 0 {
+		return opts
+	}
+	cfg := provider.NewRequestConfig(opts...)
+	if cfg.MaxTokens > 0 && cfg.MaxTokens <= alias.MaxOutput {
+		return opts
+	}
+	return append(opts, provider.WithMaxTokens(alias.MaxOutput))
 }
 
 func renderFailedBeforeCommit(w http.ResponseWriter, lastErr error, fallbackMsg string) {

@@ -285,7 +285,16 @@ func (s *Server) toolGetQuotaStatus(ctx context.Context, argsRaw json.RawMessage
 
 	if s.registry != nil {
 		prov, ok := s.registry.Get(args.Provider)
-		if ok && prov.Quota != nil {
+		if ok {
+			if prov.Quota == nil {
+				// Lane is registered but implements no quota mechanism (plain
+				// openaicompat lanes): say so instead of the generic
+				// "not found" message, which reads as a routing bug.
+				return &CallToolResult{
+					Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("provider %q has no quota mechanism (lane registered, upstream exposes no quota/usage endpoint)", args.Provider)}},
+					IsError: true,
+				}, nil
+			}
 			snap, err := prov.Quota.Quota(ctx)
 			if err != nil {
 				return &CallToolResult{
