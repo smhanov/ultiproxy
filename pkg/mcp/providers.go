@@ -44,30 +44,18 @@ type providerQuirksArgs struct {
 }
 
 type addProviderArgs struct {
-	Name          string             `json:"name"`
-	Kind          string             `json:"kind"` // "" or "openaicompat" | "antigravity"
-	BaseURL       string             `json:"base_url"`
-	APIKey        string             `json:"api_key"`
-	WorkspaceID   string             `json:"workspace_id"`
-	SessionCookie string             `json:"session_cookie"`
-	RefreshURL    string             `json:"refresh_url"`
-	TokenFile     string             `json:"token_file"`
-	DeviceAuthURL string             `json:"device_auth_url"`
-	TokenURL      string             `json:"token_url"`
-	Quirks        providerQuirksArgs `json:"quirks"`
+	Name    string             `json:"name"`
+	Kind    string             `json:"kind"` // "" or "openaicompat" | "antigravity"
+	BaseURL string             `json:"base_url"`
+	APIKey  string             `json:"api_key"`
+	Quirks  providerQuirksArgs `json:"quirks"`
 }
 
 func (a addProviderArgs) config() openaicompat.Config {
 	return openaicompat.Config{
-		Name:          a.Name,
-		BaseURL:       a.BaseURL,
-		APIKey:        a.APIKey,
-		WorkspaceID:   a.WorkspaceID,
-		SessionCookie: a.SessionCookie,
-		RefreshURL:    a.RefreshURL,
-		TokenFile:     a.TokenFile,
-		DeviceAuthURL: a.DeviceAuthURL,
-		TokenURL:      a.TokenURL,
+		Name:    a.Name,
+		BaseURL: a.BaseURL,
+		APIKey:  a.APIKey,
 		Quirks: openaicompat.Quirks{
 			CodingPlanPath:         a.Quirks.CodingPlanPath,
 			MaxTokensByModel:       a.Quirks.MaxTokensByModel,
@@ -108,8 +96,16 @@ func (s *Server) toolAddProvider(ctx context.Context, argsRaw json.RawMessage) (
 	if err := json.Unmarshal(argsRaw, &args); err != nil {
 		return toolError("invalid arguments: %v", err), nil
 	}
-	if args.Name == "" || args.BaseURL == "" {
-		return toolError("name and base_url are required"), nil
+	if args.Name == "" {
+		return toolError("name is required"), nil
+	}
+	// Custom-wire lanes (antigravity) do not carry base_url; route them to the
+	// injected builder before the openai-compat path.
+	if args.Kind != "" && args.Kind != "openaicompat" {
+		return s.toolAddCustomProvider(ctx, args)
+	}
+	if args.BaseURL == "" {
+		return toolError("base_url is required"), nil
 	}
 
 	cfg := args.config()
