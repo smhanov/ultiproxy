@@ -642,8 +642,118 @@ func (p *Provider) Quota(ctx context.Context) (*provider.QuotaSnapshot, error) {
 }
 
 // Login implements provider.AuthProvider.
+//
+// Quirk-routed (ported from the pre-F2 xai and freebuff lanes):
+//   - AuthViaOAuthManager: xai device-OAuth flow (RequestDeviceCode -> PollToken ->
+//     persist via auth.Manager under DataDir so Token() can serve it later).
+//   - FreebuffActor != nil: import the Codebuff CLI token from
+//     ~/.config/manicode/credentials.json and push it into the actor.
+//   - otherwise: provider.ErrNotImplemented (plain openai endpoint needs no login).
 func (p *Provider) Login(ctx context.Context) error {
+	if p.cfg.Quirks.AuthViaOAuthManager {
+		return p.loginXAI(ctx)
+	}
+	if p.cfg.Quirks.FreebuffActor != nil {
+		return p.loginFreebuff(ctx)
+	}
 	return provider.ErrNotImplemented
+}
+
+// loginXAI performs the xAI device authorization flow (ported from
+// pkg/provider/xai Provider.Login).
+func (p *Provider) loginXAI(ctx context.Context) error {
+	cfg := oauth.DeviceFlowConfig{
+		ClientID:      defaultXAIClientID,
+		DeviceAuthURL: "https://auth.x.ai/oauth2/device/code",
+		TokenURL:      "https://auth.x.ai/oauth2/token",
+		HTTPClient:    p.httpClient,
+	}
+
+	dcr, err := oauth.RequestDeviceCode(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("openaicompat: xai login device code failed: %w", err)
+	}
+
+	tokResp, err := oauth.PollToken(ctx, cfg, dcr.DeviceCode, dcr.Interval)
+	if err != nil {
+		return fmt.Errorf("openaicompat: xai login token poll failed: %w", err)
+	}
+
+	// Persist so Token() (via the OAuth manager TokenSource) can serve it later.
+	dataDir := p.cfg.DataDir
+	if dataDir == "" {
+		dataDir = filepath.Join(os.TempDir(), "ultiproxy-xai-auth")
+	}
+	refresher := oauth.MakeRefresher(p.httpClient, "https://auth.x.ai/oauth2/token", defaultXAIClientID, "")
+	mgr, err := auth.NewManager(dataDir, refresher)
+	if err != nil {
+		return fmt.Errorf("openaicompat: xai login credential store: %w", err)
+	}
+	expiresIn := tokResp.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 3600
+	}
+	cred := auth.Credential{
+		Provider:     "xai",
+		AccessToken:  tokResp.AccessToken,
+		RefreshToken: tokResp.RefreshToken,
+		ExpiresAt:    time.Now().Add(time.Duration(expiresIn) * time.Second),
+		ClientID:     defaultXAIClientID,
+	}
+	if err := mgr.Store(ctx, defaultXAIClientID, cred); err != nil {
+		return fmt.Errorf("openaicompat: xai login credential store: %w", err)
+	}
+	return nil
+}
+
+// loginFreebuff imports the Codebuff CLI token and pushes it into the actor
+// (ported from pkg/provider/freebuff Provider.Login).
+func (p *Provider) loginFreebuff(ctx context.Context) error {
+	tok, _, _, err := ReadCLIToken()
+	if err != nil {
+		return err
+	}
+	if setter, ok := p.cfg.Quirks.FreebuffActor.(freebuffTokenSetter); ok {
+		setter.SetToken(tok)
+	}
+	p.apiKey = tok
+	p.cfg.APIKey = tok
+	return nil
+}
+
+// ReadCLIToken loads the Codebuff / Freebuff CLI auth token from
+// ~/.config/manicode/credentials.json (ported verbatim from
+// pkg/provider/freebuff). Never prints the token.
+func ReadCLIToken() (token, email, userID string, err error) {
+	data, err := os.ReadFile(manicodeCredentialsPath())
+	if err != nil {
+		return "", "", "", fmt.Errorf("freebuff: CLI credentials not found (%s): %w — run `freebuff` and sign in first", manicodeCredentialsPath(), err)
+	}
+	var parsed map[string]struct {
+		ID        string `json:"id"`
+		Email     string `json:"email"`
+		AuthToken string `json:"authToken"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return "", "", "", fmt.Errorf("freebuff: parse CLI credentials: %w", err)
+	}
+	entry, ok := parsed["default"]
+	if !ok {
+		for _, v := range parsed {
+			entry = v
+			ok = true
+			break
+		}
+	}
+	if !ok || entry.AuthToken == "" {
+		return "", "", "", fmt.Errorf("freebuff: no authToken in CLI credentials")
+	}
+	return entry.AuthToken, entry.Email, entry.ID, nil
+}
+
+func manicodeCredentialsPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "manicode", "credentials.json")
 }
 
 // Token implements provider.AuthProvider.

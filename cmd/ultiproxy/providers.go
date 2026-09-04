@@ -17,7 +17,6 @@ import (
 	"github.com/smhanov/ultiproxy/pkg/provider/antigravity"
 	"github.com/smhanov/ultiproxy/pkg/provider/codex"
 	"github.com/smhanov/ultiproxy/pkg/provider/copilot"
-	"github.com/smhanov/ultiproxy/pkg/provider/freebuff"
 	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 	spikesfreebuff "github.com/smhanov/ultiproxy/pkg/spikes/freebuff"
 )
@@ -46,6 +45,11 @@ func (a *freebuffActorAdapter) InstanceID() string {
 
 func (a *freebuffActorAdapter) StartRun(ctx context.Context, model string) (any, error) {
 	return a.actor.StartRun(ctx, model)
+}
+
+// SetToken pushes a token into the actor (used by the freebuff login flow).
+func (a *freebuffActorAdapter) SetToken(tok string) {
+	a.actor.SetToken(tok)
 }
 
 // FetchUsage forwards to the underlying actor for the freebuff quota path.
@@ -429,7 +433,7 @@ func registerProviders(registry *provider.Registry) {
 	// Never reads ~/workspace/freebuff-proxy/.env.
 	fbTok := firstEnv("ULTIPROXY_FREEBUFF_TOKEN", "FREEBUFF_TOKEN")
 	if fbTok == "" {
-		if tok, _, _, err := freebuff.ReadCLIToken(); err == nil {
+		if tok, _, _, err := openaicompat.ReadCLIToken(); err == nil {
 			fbTok = tok
 		}
 	}

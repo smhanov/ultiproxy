@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,8 +12,8 @@ import (
 
 	"github.com/smhanov/ultiproxy/pkg/provider/antigravity"
 	"github.com/smhanov/ultiproxy/pkg/provider/codex"
-	"github.com/smhanov/ultiproxy/pkg/provider/freebuff"
-	"github.com/smhanov/ultiproxy/pkg/provider/xai"
+	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
+	spikesfreebuff "github.com/smhanov/ultiproxy/pkg/spikes/freebuff"
 )
 
 func runLogin(providerName, dataDir string) {
@@ -77,11 +78,17 @@ func runLogin(providerName, dataDir string) {
 		}
 		fmt.Fprintf(os.Stderr, "Logged in. project=%s credentials=%s\n", p.ProjectID(), filepath.Join(dataDir, "credentials", "antigravity"))
 	case "xai", "grok":
-		mgr, err := newOAuthManager(filepath.Join(dataDir, "credentials", "xai"))
+		p, err := openaicompat.New(openaicompat.Config{
+			Name:    "xai",
+			BaseURL: "https://api.x.ai",
+			DataDir: filepath.Join(dataDir, "credentials", "xai"),
+			Quirks: openaicompat.Quirks{
+				AuthViaOAuthManager: true,
+			},
+		})
 		if err != nil {
-			log.Fatalf("xai credential store: %v", err)
+			log.Fatalf("xai: %v", err)
 		}
-		p := xai.New(xai.Config{AuthManager: mgr, ClientID: xai.DefaultClientID})
 		fmt.Fprintln(os.Stderr, "Ultiproxy xAI device login.")
 		if err := p.Login(ctx); err != nil {
 			log.Fatalf("xai login failed: %v", err)
@@ -99,7 +106,33 @@ func runLogin(providerName, dataDir string) {
 		}
 		fmt.Fprintln(os.Stderr, "Logged in to Codex.")
 	case "freebuff", "codebuff":
-		p, err := freebuff.New(freebuff.Config{DataDir: dataDir})
+		instanceIDFile := filepath.Join(dataDir, "freebuff_instance_id")
+		instanceID := ""
+		if data, err := os.ReadFile(instanceIDFile); err == nil {
+			instanceID = strings.TrimSpace(string(data))
+		}
+		if strings.HasPrefix(instanceID, "fb-inst-") {
+			instanceID = ""
+		}
+		fbActor, err := spikesfreebuff.NewFreebuffAccountActor(
+			"",
+			http.DefaultClient,
+			"",
+			spikesfreebuff.WithBaseURL("https://www.codebuff.com/api/v1"),
+			spikesfreebuff.WithInstanceID(instanceID),
+		)
+		if err != nil {
+			log.Fatalf("freebuff: %v", err)
+		}
+		p, err := openaicompat.New(openaicompat.Config{
+			Name:    "freebuff",
+			BaseURL: "https://www.codebuff.com/api/v1",
+			DataDir: dataDir,
+			Quirks: openaicompat.Quirks{
+				FreebuffActor:       &freebuffActorAdapter{actor: fbActor},
+				FreebuffDefaultTool: true,
+			},
+		})
 		if err != nil {
 			log.Fatalf("freebuff: %v", err)
 		}

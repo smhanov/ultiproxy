@@ -22,6 +22,8 @@ type Config struct {
 	SessionCookie string // for AuthViaWorkspaceCookie (opencode)
 	RefreshURL    string // for AuthViaSupabaseRefresh (augure)
 	TokenFile     string // for AuthViaSupabaseRefresh (augure)
+	DeviceAuthURL string // for AuthViaOAuthManager (xai)
+	TokenURL      string // for AuthViaOAuthManager (xai)
 }
 
 // Quirks contains vendor-specific behavioral tweaks for OpenAI-compatible wire endpoints.
@@ -57,4 +59,16 @@ type freebuffQuotaSource interface {
 // instance id (used for the x-freebuff-instance-id header).
 type freebuffInstanceIDer interface {
 	InstanceID() string
+}
+
+// freebuffTokenSetter is implemented by freebuff actors that can accept an
+// imported CLI token during login.
+type freebuffTokenSetter interface {
+	SetToken(tok string)
+}
+
+// freebuffInstanceIDSetter is implemented by freebuff actors that can accept an
+// imported instance ID during login.
+type freebuffInstanceIDSetter interface {
+	SetInstanceID(id string)
 }
