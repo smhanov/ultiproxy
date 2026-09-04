@@ -2,6 +2,8 @@ package copilot
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -301,5 +303,284 @@ func TestRegistry(t *testing.T) {
 	}
 	if !got.Capabilities.Chat || !got.Capabilities.Tools || !got.Capabilities.Reasoning || !got.Capabilities.Streaming || got.Capabilities.Vision {
 		t.Fatalf("unexpected capabilities: %+v", got.Capabilities)
+	}
+}
+
+func TestCopilotChatToolsReachUpstream(t *testing.T) {
+	var capturedBody []byte
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedBody, _ = io.ReadAll(r.Body)
+		if strings.Contains(string(capturedBody), `"stream":true`) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"id": "chatcmpl-test",
+			"choices": [{"message": {"role": "assistant", "content": "Tool acknowledged"}, "finish_reason": "stop"}]
+		}`))
+	}))
+	defer srv.Close()
+
+	p := New(Config{
+		Token:      "gho_testtoken123",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+	})
+
+	msgs := []*ir.Message{
+		{Role: "user", Blocks: []ir.Block{ir.TextBlock{Text: "What is the weather?"}}},
+	}
+
+	toolDef := map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "get_weather",
+			"description": "Get weather for location",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"location": map[string]any{"type": "string"},
+				},
+				"required": []any{"location"},
+			},
+		},
+	}
+
+	// 1. Generate call with tools and tool_choice
+	_, err := p.Generate(context.Background(), msgs,
+		provider.WithModel("gpt-4o"),
+		provider.WithExtraBody(map[string]any{
+			"tools":       []any{toolDef},
+			"tool_choice": "auto",
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Generate with tools failed: %v", err)
+	}
+
+	var reqMap map[string]any
+	if err := json.Unmarshal(capturedBody, &reqMap); err != nil {
+		t.Fatalf("failed to unmarshal captured body: %v", err)
+	}
+
+	toolsRaw, ok := reqMap["tools"]
+	if !ok || toolsRaw == nil {
+		t.Fatalf("expected 'tools' in chat request body, got none")
+	}
+	toolsSlice, ok := toolsRaw.([]any)
+	if !ok || len(toolsSlice) != 1 {
+		t.Fatalf("expected 1 tool in 'tools', got %v", toolsRaw)
+	}
+	tool0, ok := toolsSlice[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tool[0] to be map, got %T", toolsSlice[0])
+	}
+	fnMap, ok := tool0["function"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tool[0]['function'] map, got %v", tool0["function"])
+	}
+	if fnMap["name"] != "get_weather" {
+		t.Errorf("expected function name 'get_weather', got %v", fnMap["name"])
+	}
+	if reqMap["tool_choice"] != "auto" {
+		t.Errorf("expected tool_choice 'auto', got %v", reqMap["tool_choice"])
+	}
+
+	// 2. Stream call with tools and tool_choice
+	capturedBody = nil
+	eventsCh, err := p.Stream(context.Background(), msgs,
+		provider.WithModel("gpt-4o"),
+		provider.WithExtraBody(map[string]any{
+			"tools":       []any{toolDef},
+			"tool_choice": "auto",
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Stream with tools failed: %v", err)
+	}
+	for range eventsCh {
+	}
+
+	var streamReqMap map[string]any
+	if err := json.Unmarshal(capturedBody, &streamReqMap); err != nil {
+		t.Fatalf("failed to unmarshal captured stream body: %v", err)
+	}
+	if _, ok := streamReqMap["tools"]; !ok {
+		t.Errorf("expected 'tools' in chat stream request body, got none")
+	}
+	if streamReqMap["tool_choice"] != "auto" {
+		t.Errorf("expected tool_choice 'auto' in stream body, got %v", streamReqMap["tool_choice"])
+	}
+
+	// 3. Call without tools: assert no-tools requests omit both keys (wire unchanged)
+	capturedBody = nil
+	_, err = p.Generate(context.Background(), msgs, provider.WithModel("gpt-4o"))
+	if err != nil {
+		t.Fatalf("Generate without tools failed: %v", err)
+	}
+
+	var noToolsMap map[string]any
+	if err := json.Unmarshal(capturedBody, &noToolsMap); err != nil {
+		t.Fatalf("failed to unmarshal captured body: %v", err)
+	}
+	if _, exists := noToolsMap["tools"]; exists {
+		t.Errorf("expected no 'tools' key in no-tools request body, but found %v", noToolsMap["tools"])
+	}
+	if _, exists := noToolsMap["tool_choice"]; exists {
+		t.Errorf("expected no 'tool_choice' key in no-tools request body, but found %v", noToolsMap["tool_choice"])
+	}
+}
+
+func TestCopilotResponsesToolsReachUpstream(t *testing.T) {
+	var capturedBody []byte
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/responses") {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		capturedBody, _ = io.ReadAll(r.Body)
+		if strings.Contains(string(capturedBody), `"stream":true`) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream_01\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"id": "resp_test_tools",
+			"model": "gpt-5.4",
+			"status": "completed",
+			"output": [
+				{
+					"type": "message",
+					"role": "assistant",
+					"content": [{"type": "output_text", "text": "Understood"}]
+				}
+			],
+			"usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+		}`))
+	}))
+	defer srv.Close()
+
+	p := New(Config{
+		Token:      "gho_testtoken123",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+	})
+
+	msgs := []*ir.Message{
+		{Role: "user", Blocks: []ir.Block{ir.TextBlock{Text: "Check weather"}}},
+	}
+
+	toolDef := map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "get_weather",
+			"description": "Get weather for location",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"location": map[string]any{"type": "string"},
+				},
+				"required": []any{"location"},
+			},
+		},
+	}
+
+	// 1. Generate call with tools
+	_, err := p.Generate(context.Background(), msgs,
+		provider.WithModel("gpt-5.4"),
+		provider.WithExtraBody(map[string]any{
+			"tools":       []any{toolDef},
+			"tool_choice": "auto",
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Generate with tools failed: %v", err)
+	}
+
+	var reqMap map[string]any
+	if err := json.Unmarshal(capturedBody, &reqMap); err != nil {
+		t.Fatalf("failed to unmarshal captured body: %v", err)
+	}
+
+	toolsRaw, ok := reqMap["tools"]
+	if !ok || toolsRaw == nil {
+		t.Fatalf("expected 'tools' in responses request body, got none")
+	}
+	toolsSlice, ok := toolsRaw.([]any)
+	if !ok || len(toolsSlice) != 1 {
+		t.Fatalf("expected 1 tool in 'tools', got %v", toolsRaw)
+	}
+	tool0, ok := toolsSlice[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tool[0] to be map, got %T", toolsSlice[0])
+	}
+
+	// Assert tools array has {"type":"function","name":...} shape (Responses shape: flat, not nested under "function")
+	if tool0["type"] != "function" {
+		t.Errorf("expected tool[0]['type'] == 'function', got %v", tool0["type"])
+	}
+	if tool0["name"] != "get_weather" {
+		t.Errorf("expected tool[0]['name'] == 'get_weather', got %v", tool0["name"])
+	}
+	if tool0["description"] != "Get weather for location" {
+		t.Errorf("expected tool[0]['description'] == 'Get weather for location', got %v", tool0["description"])
+	}
+	if _, ok := tool0["parameters"]; !ok {
+		t.Errorf("expected tool[0]['parameters'] to be present")
+	}
+	if _, hasNestedFn := tool0["function"]; hasNestedFn {
+		t.Errorf("expected responses tool NOT to have nested 'function' object")
+	}
+
+	// 2. Stream call with tools
+	capturedBody = nil
+	eventsCh, err := p.Stream(context.Background(), msgs,
+		provider.WithModel("gpt-5.4"),
+		provider.WithExtraBody(map[string]any{
+			"tools":       []any{toolDef},
+			"tool_choice": "auto",
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Stream with tools failed: %v", err)
+	}
+	for range eventsCh {
+	}
+
+	var streamReqMap map[string]any
+	if err := json.Unmarshal(capturedBody, &streamReqMap); err != nil {
+		t.Fatalf("failed to unmarshal captured stream body: %v", err)
+	}
+	streamToolsRaw, ok := streamReqMap["tools"]
+	if !ok || streamToolsRaw == nil {
+		t.Fatalf("expected 'tools' in responses stream request body, got none")
+	}
+	streamToolsSlice, ok := streamToolsRaw.([]any)
+	if !ok || len(streamToolsSlice) != 1 {
+		t.Fatalf("expected 1 tool in stream 'tools', got %v", streamToolsRaw)
+	}
+	streamTool0, ok := streamToolsSlice[0].(map[string]any)
+	if !ok || streamTool0["type"] != "function" || streamTool0["name"] != "get_weather" {
+		t.Errorf("unexpected stream tool: %v", streamToolsSlice[0])
+	}
+
+	// 3. Call without tools: assert no-tools requests omit tools key
+	capturedBody = nil
+	_, err = p.Generate(context.Background(), msgs, provider.WithModel("gpt-5.4"))
+	if err != nil {
+		t.Fatalf("Generate without tools failed: %v", err)
+	}
+
+	var noToolsMap map[string]any
+	if err := json.Unmarshal(capturedBody, &noToolsMap); err != nil {
+		t.Fatalf("failed to unmarshal captured body: %v", err)
+	}
+	if _, exists := noToolsMap["tools"]; exists {
+		t.Errorf("expected no 'tools' key in no-tools responses request body, but found %v", noToolsMap["tools"])
 	}
 }

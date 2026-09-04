@@ -231,6 +231,8 @@ type openAIFunctionCall struct {
 type openAIChatRequest struct {
 	Model       string              `json:"model"`
 	Messages    []openAIChatMessage `json:"messages"`
+	Tools       []any               `json:"tools,omitempty"`
+	ToolChoice  any                 `json:"tool_choice,omitempty"`
 	Stream      bool                `json:"stream"`
 	MaxTokens   int                 `json:"max_tokens,omitempty"`
 	Temperature *float64            `json:"temperature,omitempty"`
@@ -315,10 +317,40 @@ func convertIRToChatMessages(msgs []*ir.Message) []openAIChatMessage {
 	return out
 }
 
+func extractChatTools(cfg *provider.RequestConfig) ([]any, any) {
+	if cfg == nil || cfg.ExtraBody == nil {
+		return nil, nil
+	}
+	var tools []any
+	if rawTools, ok := cfg.ExtraBody["tools"]; ok && rawTools != nil {
+		switch t := rawTools.(type) {
+		case []any:
+			if len(t) > 0 {
+				tools = t
+			}
+		case []map[string]any:
+			if len(t) > 0 {
+				tools = make([]any, len(t))
+				for i, v := range t {
+					tools[i] = v
+				}
+			}
+		}
+	}
+	var toolChoice any
+	if tc, ok := cfg.ExtraBody["tool_choice"]; ok && tc != nil && tc != "" {
+		toolChoice = tc
+	}
+	return tools, toolChoice
+}
+
 func (p *Provider) generateChat(ctx context.Context, msgs []*ir.Message, cfg *provider.RequestConfig) (*ir.Response, error) {
+	tools, toolChoice := extractChatTools(cfg)
 	reqBody := openAIChatRequest{
 		Model:       cfg.Model,
 		Messages:    convertIRToChatMessages(msgs),
+		Tools:       tools,
+		ToolChoice:  toolChoice,
 		Stream:      false,
 		MaxTokens:   cfg.MaxTokens,
 		Temperature: cfg.Temperature,
@@ -402,9 +434,12 @@ func (p *Provider) generateChat(ctx context.Context, msgs []*ir.Message, cfg *pr
 }
 
 func (p *Provider) streamChat(ctx context.Context, msgs []*ir.Message, cfg *provider.RequestConfig) (<-chan ir.Event, error) {
+	tools, toolChoice := extractChatTools(cfg)
 	reqBody := openAIChatRequest{
 		Model:       cfg.Model,
 		Messages:    convertIRToChatMessages(msgs),
+		Tools:       tools,
+		ToolChoice:  toolChoice,
 		Stream:      true,
 		MaxTokens:   cfg.MaxTokens,
 		Temperature: cfg.Temperature,
@@ -552,9 +587,11 @@ type responsesInputItem struct {
 }
 
 type responsesRequest struct {
-	Model  string               `json:"model"`
-	Input  []responsesInputItem `json:"input"`
-	Stream bool                 `json:"stream"`
+	Model      string               `json:"model"`
+	Input      []responsesInputItem `json:"input"`
+	Tools      []map[string]any     `json:"tools,omitempty"`
+	ToolChoice any                  `json:"tool_choice,omitempty"`
+	Stream     bool                 `json:"stream"`
 }
 
 func convertIRToResponsesInput(msgs []*ir.Message) []responsesInputItem {
@@ -620,11 +657,97 @@ func convertIRToResponsesInput(msgs []*ir.Message) []responsesInputItem {
 	return out
 }
 
+func convertIRToResponsesTools(rawTools any) []map[string]any {
+	if rawTools == nil {
+		return nil
+	}
+	var items []map[string]any
+	switch t := rawTools.(type) {
+	case []any:
+		for _, item := range t {
+			if m, ok := item.(map[string]any); ok {
+				items = append(items, m)
+			}
+		}
+	case []map[string]any:
+		items = t
+	default:
+		return nil
+	}
+	if len(items) == 0 {
+		return nil
+	}
+
+	var result []map[string]any
+	for _, item := range items {
+		tool := map[string]any{
+			"type": "function",
+		}
+		if fnRaw, ok := item["function"]; ok {
+			if fnMap, ok := fnRaw.(map[string]any); ok {
+				if name, ok := fnMap["name"]; ok && name != nil {
+					tool["name"] = name
+				}
+				if desc, ok := fnMap["description"]; ok && desc != nil {
+					tool["description"] = desc
+				}
+				if params, ok := fnMap["parameters"]; ok && params != nil {
+					tool["parameters"] = params
+				}
+				for k, v := range fnMap {
+					if k != "name" && k != "description" && k != "parameters" {
+						tool[k] = v
+					}
+				}
+				result = append(result, tool)
+				continue
+			}
+		}
+		if name, ok := item["name"]; ok && name != nil {
+			tool["name"] = name
+			if desc, ok := item["description"]; ok && desc != nil {
+				tool["description"] = desc
+			}
+			if params, ok := item["parameters"]; ok && params != nil {
+				tool["parameters"] = params
+			}
+			for k, v := range item {
+				if k != "name" && k != "description" && k != "parameters" && k != "type" {
+					tool[k] = v
+				}
+			}
+			result = append(result, tool)
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func extractResponsesTools(cfg *provider.RequestConfig) ([]map[string]any, any) {
+	if cfg == nil || cfg.ExtraBody == nil {
+		return nil, nil
+	}
+	var tools []map[string]any
+	if rawTools, ok := cfg.ExtraBody["tools"]; ok && rawTools != nil {
+		tools = convertIRToResponsesTools(rawTools)
+	}
+	var toolChoice any
+	if tc, ok := cfg.ExtraBody["tool_choice"]; ok && tc != nil && tc != "" {
+		toolChoice = tc
+	}
+	return tools, toolChoice
+}
+
 func (p *Provider) generateResponses(ctx context.Context, msgs []*ir.Message, cfg *provider.RequestConfig) (*ir.Response, error) {
+	tools, toolChoice := extractResponsesTools(cfg)
 	reqBody := responsesRequest{
-		Model:  cfg.Model,
-		Input:  convertIRToResponsesInput(msgs),
-		Stream: false,
+		Model:      cfg.Model,
+		Input:      convertIRToResponsesInput(msgs),
+		Tools:      tools,
+		ToolChoice: toolChoice,
+		Stream:     false,
 	}
 
 	payload, err := json.Marshal(reqBody)
@@ -745,10 +868,13 @@ func TranslateResponsesJSONToResponse(data []byte) (*ir.Response, error) {
 }
 
 func (p *Provider) streamResponses(ctx context.Context, msgs []*ir.Message, cfg *provider.RequestConfig) (<-chan ir.Event, error) {
+	tools, toolChoice := extractResponsesTools(cfg)
 	reqBody := responsesRequest{
-		Model:  cfg.Model,
-		Input:  convertIRToResponsesInput(msgs),
-		Stream: true,
+		Model:      cfg.Model,
+		Input:      convertIRToResponsesInput(msgs),
+		Tools:      tools,
+		ToolChoice: toolChoice,
+		Stream:     true,
 	}
 
 	payload, err := json.Marshal(reqBody)
