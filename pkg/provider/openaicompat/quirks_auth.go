@@ -21,6 +21,8 @@ const (
 	defaultAugureRefreshURL = "https://jsulegwnacbyntfqzfiq.supabase.co/auth/v1/token?grant_type=refresh_token"
 	defaultXAIIssuer        = "https://auth.x.ai"
 	defaultXAIClientID      = "b1a00492-073a-47ea-816f-4c329264a828"
+	defaultXAIDeviceURL     = "https://auth.x.ai/oauth2/device/code"
+	defaultXAITokenURL      = "https://auth.x.ai/oauth2/token"
 )
 
 // SupabaseTokenData represents stored Supabase OAuth tokens.

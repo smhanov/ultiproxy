@@ -334,7 +334,7 @@ func ParseGrokCreditsResponse(data []byte, now time.Time) (*provider.QuotaSnapsh
 }
 
 // ----------------------------------------------------------------------------
-// Freebuff quota (ported verbatim from pkg/provider/freebuff — that package is
+// Freebuff quota (ported verbatim from freebuff — that package is
 // deleted in Phase F2b; the account actor stays in pkg/spikes/freebuff).
 // ----------------------------------------------------------------------------
 
@@ -358,7 +358,7 @@ type freebuffUsagePayload struct {
 }
 
 // ParseFreebuffUsageSnapshot parses freebuff usage response bytes into a
-// normalized QuotaSnapshot (ported verbatim from pkg/provider/freebuff).
+// normalized QuotaSnapshot (ported verbatim from freebuff).
 func ParseFreebuffUsageSnapshot(data []byte, now time.Time) (*provider.QuotaSnapshot, error) {
 	var u freebuffUsagePayload
 	if err := json.Unmarshal(data, &u); err != nil {
@@ -448,7 +448,7 @@ func ParseFreebuffUsageSnapshot(data []byte, now time.Time) (*provider.QuotaSnap
 }
 
 // freebuffQuota queries usage via the injected actor and returns a normalized
-// QuotaSnapshot (ported from pkg/provider/freebuff.Provider.Quota).
+// QuotaSnapshot (ported from freebuff.Provider.Quota).
 func freebuffQuota(ctx context.Context, actor any) (*provider.QuotaSnapshot, error) {
 	src, ok := actor.(freebuffQuotaSource)
 	if !ok {

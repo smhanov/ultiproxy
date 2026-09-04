@@ -17,7 +17,7 @@ import (
 
 	"github.com/smhanov/ultiproxy/pkg/ir"
 	"github.com/smhanov/ultiproxy/pkg/provider"
-	provopencode "github.com/smhanov/ultiproxy/pkg/provider/opencode"
+	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 	"github.com/smhanov/ultiproxy/pkg/server"
 )
 
@@ -29,7 +29,7 @@ type Harness struct {
 	FakeUpstream     *FakeUpstream
 	Registry         *provider.Registry
 	Provider         provider.Provider
-	OpenCodeProvider *provopencode.Provider
+	OpenCodeProvider *openaicompat.Provider
 	tempDir          string
 	client           *http.Client
 }
@@ -66,7 +66,7 @@ func (h *Harness) Close() {
 type FakeProvider struct {
 	name     string
 	upstream *FakeUpstream
-	inner    *provopencode.Provider
+	inner    *openaicompat.Provider
 }
 
 // Name returns the provider identifier.
@@ -86,7 +86,7 @@ func (f *FakeProvider) Stream(ctx context.Context, msgs []*ir.Message, opts ...p
 
 // Capabilities returns standard capabilities.
 func (f *FakeProvider) Capabilities() provider.Capabilities {
-	return provopencode.Capabilities()
+	return f.inner.Capabilities()
 }
 
 // Provider returns the provider.Provider bundle.
@@ -97,18 +97,23 @@ func (f *FakeProvider) Provider() provider.Provider {
 	}
 }
 
+// Bundle returns the provider.Provider bundle.
+func (f *FakeProvider) Bundle() provider.Provider {
+	return f.Provider()
+}
+
 // NewFakeProvider constructs a FakeProvider with the given name pointing to the fake upstream.
-func NewFakeProvider(name string, fake *FakeUpstream, opts ...func(*provopencode.Config)) (*FakeProvider, error) {
-	cfg := provopencode.Config{
-		BaseURL:      fake.URL(),
-		InferenceURL: fake.URL(),
-		APIKey:       "fake-" + name + "-key",
-		HTTPClient:   fake.Client(),
+func NewFakeProvider(name string, fake *FakeUpstream, opts ...func(*openaicompat.Config)) (*FakeProvider, error) {
+	cfg := openaicompat.Config{
+		Name:       name,
+		BaseURL:    fake.URL(),
+		APIKey:     "test-" + name + "-key",
+		HTTPClient: fake.Client(),
 	}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	inner, err := provopencode.New(cfg)
+	inner, err := openaicompat.New(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +136,7 @@ type harnessConfig struct {
 	modelAliases      map[string]server.ModelAlias
 	providers         []provider.Provider
 	providerName      string
-	customOpenCodeCfg func(*provopencode.Config)
+	customOpenCodeCfg func(*openaicompat.Config)
 	dataDir           string
 }
 
@@ -197,8 +202,8 @@ func WithProviderName(name string) HarnessOption {
 	}
 }
 
-// WithOpenCodeConfig allows custom modification of the OpenCode provider configuration.
-func WithOpenCodeConfig(fn func(*provopencode.Config)) HarnessOption {
+// WithOpenCodeConfig allows custom modification of the OpenAI-compatible provider configuration.
+func WithOpenCodeConfig(fn func(*openaicompat.Config)) HarnessOption {
 	return func(c *harnessConfig) {
 		c.customOpenCodeCfg = fn
 	}
@@ -235,10 +240,10 @@ func NewHarness(opts ...HarnessOption) (*Harness, error) {
 	registry := provider.NewRegistry()
 
 	var activeProvBundle provider.Provider
-	var ocProv *provopencode.Provider
+	var ocProv *openaicompat.Provider
 
-	if hcfg.providerName != "" && hcfg.providerName != provopencode.ProviderName {
-		var optFn func(*provopencode.Config)
+	if hcfg.providerName != "" && hcfg.providerName != "opencode" {
+		var optFn func(*openaicompat.Config)
 		if hcfg.customOpenCodeCfg != nil {
 			optFn = hcfg.customOpenCodeCfg
 		}
@@ -249,18 +254,21 @@ func NewHarness(opts ...HarnessOption) (*Harness, error) {
 		activeProvBundle = fp.Provider()
 		registry.Register(activeProvBundle)
 	} else {
-		ocCfg := provopencode.Config{
+		ocCfg := openaicompat.Config{
+			Name:          "opencode",
 			BaseURL:       fake.URL(),
-			InferenceURL:  fake.URL(),
-			APIKey:        "test-opencode-key",
+			APIKey:        "test-key",
 			WorkspaceID:   "test-workspace",
 			SessionCookie: "test-cookie",
 			HTTPClient:    fake.Client(),
+			Quirks: openaicompat.Quirks{
+				AuthViaWorkspaceCookie: true,
+			},
 		}
 		if hcfg.customOpenCodeCfg != nil {
 			hcfg.customOpenCodeCfg(&ocCfg)
 		}
-		p, err := provopencode.New(ocCfg)
+		p, err := openaicompat.New(ocCfg)
 		if err != nil {
 			return nil, fmt.Errorf("create opencode provider: %w", err)
 		}

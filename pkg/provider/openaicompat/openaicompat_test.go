@@ -3,11 +3,13 @@ package openaicompat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -411,6 +413,7 @@ type fakeActor struct {
 	maxActive    int
 	acquireCount int
 	instanceID   string
+	token        string
 }
 
 func (a *fakeActor) Acquire(ctx context.Context) error {
@@ -430,6 +433,18 @@ func (a *fakeActor) Release() {
 	a.active--
 	a.mu.Unlock()
 	a.lock.Unlock()
+}
+
+func (a *fakeActor) SetToken(tok string) {
+	a.mu.Lock()
+	a.token = tok
+	a.mu.Unlock()
+}
+
+func (a *fakeActor) Token() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.token
 }
 
 func (a *fakeActor) InstanceID() string {
@@ -817,5 +832,124 @@ func TestOpenAICompat_FreebuffQuota(t *testing.T) {
 	}
 	if snap.Detail != "instance: fb-inst-007, model: test-model" {
 		t.Errorf("expected detail with instance+model, got %q", snap.Detail)
+	}
+}
+
+func TestOpenAICompat_Login_ErrNotImplemented(t *testing.T) {
+	p, err := New(Config{
+		BaseURL:    "https://api.openai.com/v1",
+		APIKey:     "test-key",
+		HTTPClient: http.DefaultClient,
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	if err := p.Login(context.Background()); !errors.Is(err, provider.ErrNotImplemented) {
+		t.Errorf("expected ErrNotImplemented, got %v", err)
+	}
+}
+
+func TestOpenAICompat_Login_Freebuff(t *testing.T) {
+	tempDir := t.TempDir()
+	manicodeFile := filepath.Join(tempDir, "credentials.json")
+	credentialsData := `{"default": {"id": "user-1", "email": "test@example.com", "authToken": "secret-freebuff-tok"}}`
+	if err := os.WriteFile(manicodeFile, []byte(credentialsData), 0600); err != nil {
+		t.Fatalf("write credentials.json: %v", err)
+	}
+
+	t.Setenv("ULTIPROXY_MANICODE_CREDENTIALS", manicodeFile)
+
+	actor := &fakeActor{instanceID: "fb-inst-007"}
+	p, err := New(Config{
+		BaseURL:    "https://codebuff.invalid",
+		DataDir:    tempDir,
+		HTTPClient: http.DefaultClient,
+		Quirks: Quirks{
+			FreebuffActor:       actor,
+			FreebuffDefaultTool: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	if err := p.Login(context.Background()); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Verify token was pushed to actor
+	if actor.Token() != "secret-freebuff-tok" {
+		t.Errorf("expected actor token secret-freebuff-tok, got %q", actor.Token())
+	}
+
+	// Verify token was persisted to freebuff_token
+	persistedTok, err := os.ReadFile(filepath.Join(tempDir, "freebuff_token"))
+	if err != nil {
+		t.Fatalf("failed to read persisted token: %v", err)
+	}
+	if strings.TrimSpace(string(persistedTok)) != "secret-freebuff-tok" {
+		t.Errorf("persisted token = %q, want secret-freebuff-tok", strings.TrimSpace(string(persistedTok)))
+	}
+
+	// Verify Token() returns the imported token
+	tok, err := p.Token(context.Background())
+	if err != nil {
+		t.Fatalf("Token() failed: %v", err)
+	}
+	if tok != "secret-freebuff-tok" {
+		t.Errorf("Token() = %q, want secret-freebuff-tok", tok)
+	}
+}
+
+func TestOpenAICompat_Login_OAuthManager(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/device", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"device_code": "dev-test-123",
+			"user_code": "TEST-1234",
+			"verification_uri": "https://accounts.x.ai/oauth2/device",
+			"expires_in": 300,
+			"interval": 1
+		}`))
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"access_token": "mock-xai-access-tok",
+			"refresh_token": "mock-xai-refresh-tok",
+			"expires_in": 3600
+		}`))
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	tempDir := t.TempDir()
+	p, err := New(Config{
+		Name:          "xai",
+		BaseURL:       "https://api.x.ai",
+		DataDir:       tempDir,
+		HTTPClient:    srv.Client(),
+		DeviceAuthURL: srv.URL + "/device",
+		TokenURL:      srv.URL + "/token",
+		Quirks: Quirks{
+			AuthViaOAuthManager: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	if err := p.Login(context.Background()); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	tok, err := p.Token(context.Background())
+	if err != nil {
+		t.Fatalf("Token() failed: %v", err)
+	}
+	if tok != "mock-xai-access-tok" {
+		t.Errorf("Token() = %q, want mock-xai-access-tok", tok)
 	}
 }

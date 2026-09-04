@@ -432,6 +432,11 @@ func registerProviders(registry *provider.Registry) {
 	// Freebuff — CLI credentials (~/.config/manicode/credentials.json), then env.
 	// Never reads ~/workspace/freebuff-proxy/.env.
 	fbTok := firstEnv("ULTIPROXY_FREEBUFF_TOKEN", "FREEBUFF_TOKEN")
+	if fbTok == "" && stateDir != "" {
+		if data, err := os.ReadFile(filepath.Join(stateDir, "freebuff_token")); err == nil {
+			fbTok = strings.TrimSpace(string(data))
+		}
+	}
 	if fbTok == "" {
 		if tok, _, _, err := openaicompat.ReadCLIToken(); err == nil {
 			fbTok = tok

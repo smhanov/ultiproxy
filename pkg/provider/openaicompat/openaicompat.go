@@ -99,7 +99,7 @@ func New(cfg Config) (*Provider, error) {
 		hubKey = "openaicompat"
 	}
 
-	hubOpts := []llmhub.Option{llmhub.WithHTTPClient(client)}
+	hubOpts := []llmhub.Option{llmhub.WithHTTPClient(client), llmhub.WithRetryOnStatus(http.StatusTooManyRequests, false)}
 	if cfg.BaseURL != "" {
 		hubOpts = append(hubOpts, llmhub.WithBaseURL(cfg.BaseURL))
 	}
@@ -660,12 +660,20 @@ func (p *Provider) Login(ctx context.Context) error {
 }
 
 // loginXAI performs the xAI device authorization flow (ported from
-// pkg/provider/xai Provider.Login).
+// xai Provider.Login).
 func (p *Provider) loginXAI(ctx context.Context) error {
+	deviceURL := p.cfg.DeviceAuthURL
+	if deviceURL == "" {
+		deviceURL = defaultXAIDeviceURL
+	}
+	tokenURL := p.cfg.TokenURL
+	if tokenURL == "" {
+		tokenURL = defaultXAITokenURL
+	}
 	cfg := oauth.DeviceFlowConfig{
 		ClientID:      defaultXAIClientID,
-		DeviceAuthURL: "https://auth.x.ai/oauth2/device/code",
-		TokenURL:      "https://auth.x.ai/oauth2/token",
+		DeviceAuthURL: deviceURL,
+		TokenURL:      tokenURL,
 		HTTPClient:    p.httpClient,
 	}
 
@@ -684,7 +692,7 @@ func (p *Provider) loginXAI(ctx context.Context) error {
 	if dataDir == "" {
 		dataDir = filepath.Join(os.TempDir(), "ultiproxy-xai-auth")
 	}
-	refresher := oauth.MakeRefresher(p.httpClient, "https://auth.x.ai/oauth2/token", defaultXAIClientID, "")
+	refresher := oauth.MakeRefresher(p.httpClient, tokenURL, defaultXAIClientID, "")
 	mgr, err := auth.NewManager(dataDir, refresher)
 	if err != nil {
 		return fmt.Errorf("openaicompat: xai login credential store: %w", err)
@@ -707,7 +715,8 @@ func (p *Provider) loginXAI(ctx context.Context) error {
 }
 
 // loginFreebuff imports the Codebuff CLI token and pushes it into the actor
-// (ported from pkg/provider/freebuff Provider.Login).
+// and persists the token + instance id into dataDir (ported from
+// freebuff Provider.Login).
 func (p *Provider) loginFreebuff(ctx context.Context) error {
 	tok, _, _, err := ReadCLIToken()
 	if err != nil {
@@ -718,12 +727,39 @@ func (p *Provider) loginFreebuff(ctx context.Context) error {
 	}
 	p.apiKey = tok
 	p.cfg.APIKey = tok
+
+	dataDir := p.cfg.DataDir
+	if dataDir != "" {
+		if err := os.MkdirAll(dataDir, 0755); err != nil {
+			return fmt.Errorf("freebuff: create data dir: %w", err)
+		}
+		tokenFile := filepath.Join(dataDir, "freebuff_token")
+		if err := os.WriteFile(tokenFile, []byte(tok+"\n"), 0600); err != nil {
+			return fmt.Errorf("freebuff: persist token: %w", err)
+		}
+		instanceIDFile := filepath.Join(dataDir, "freebuff_instance_id")
+		var instanceID string
+		if ider, ok := p.cfg.Quirks.FreebuffActor.(freebuffInstanceIDer); ok {
+			instanceID = ider.InstanceID()
+		}
+		if instanceID == "" {
+			if data, err := os.ReadFile(instanceIDFile); err == nil {
+				instanceID = strings.TrimSpace(string(data))
+			}
+		}
+		if strings.HasPrefix(instanceID, "fb-inst-") {
+			instanceID = ""
+		}
+		if instanceID != "" {
+			_ = os.WriteFile(instanceIDFile, []byte(instanceID+"\n"), 0600)
+		}
+	}
 	return nil
 }
 
 // ReadCLIToken loads the Codebuff / Freebuff CLI auth token from
 // ~/.config/manicode/credentials.json (ported verbatim from
-// pkg/provider/freebuff). Never prints the token.
+// freebuff). Never prints the token.
 func ReadCLIToken() (token, email, userID string, err error) {
 	data, err := os.ReadFile(manicodeCredentialsPath())
 	if err != nil {
@@ -752,6 +788,9 @@ func ReadCLIToken() (token, email, userID string, err error) {
 }
 
 func manicodeCredentialsPath() string {
+	if p := os.Getenv("ULTIPROXY_MANICODE_CREDENTIALS"); p != "" {
+		return p
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".config", "manicode", "credentials.json")
 }
