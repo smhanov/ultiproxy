@@ -18,6 +18,7 @@ import (
 	"github.com/smhanov/ultiproxy/pkg/provider/anthropichub"
 	"github.com/smhanov/ultiproxy/pkg/provider/antigravity"
 	"github.com/smhanov/ultiproxy/pkg/provider/codex"
+	"github.com/smhanov/ultiproxy/pkg/provider/copilot"
 	"github.com/smhanov/ultiproxy/pkg/server"
 	"github.com/smhanov/ultiproxy/pkg/state"
 	"github.com/smhanov/ultiproxy/pkg/storage"
@@ -183,6 +184,13 @@ func runtimeLaneBuilder(name, kind, dataDir, apiKey string) (provider.Provider, 
 			return provider.Provider{}, fmt.Errorf("codex: create credential store: %w", err)
 		}
 		p := codex.New(codex.Config{AuthManager: mgr, ClientID: codex.DefaultClientID})
+		return p.ProviderBundle(), nil
+	case "copilot":
+		tok := apiKey
+		if tok == "" {
+			tok = firstEnv("ULTIPROXY_COPILOT_TOKEN", "COPILOT_GITHUB_TOKEN", "GH_TOKEN")
+		}
+		p := copilot.New(copilot.Config{Token: tok})
 		return p.ProviderBundle(), nil
 	default:
 		return provider.Provider{}, fmt.Errorf("unsupported runtime lane kind %q", kind)

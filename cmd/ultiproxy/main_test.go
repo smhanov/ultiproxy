@@ -95,6 +95,18 @@ func TestRuntimeLaneBuilderAnthropicAndCodex(t *testing.T) {
 		t.Fatalf("codex credential dir missing: %v", err)
 	}
 
+	copilotLane, err := runtimeLaneBuilder("copilot", "copilot", dir, "gho_test_token")
+	if err != nil {
+		t.Fatalf("copilot lane: %v", err)
+	}
+	if copilotLane.Inference == nil || copilotLane.Inference.Name() != "copilot" {
+		t.Fatalf("copilot lane is not an inference provider: %+v", copilotLane)
+	}
+	registry.Register(copilotLane)
+	if _, ok := registry.Get("copilot"); !ok {
+		t.Fatal("copilot lane not registered")
+	}
+
 	// Unknown kinds are rejected.
 	if _, err := runtimeLaneBuilder("nope", "nope", dir, ""); err == nil {
 		t.Fatal("expected an error for an unsupported kind")
