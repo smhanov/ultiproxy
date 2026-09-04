@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -167,6 +168,13 @@ func (s *Server) dispatchRequest(
 		routeCtx := ContextWithExcludedProviders(r.Context(), failedProviders)
 		provName, err := s.router.Route(routeCtx, model)
 		if err != nil {
+			// Unknown model: fail immediately with 404 — failover across
+			// lanes cannot help a model that maps to no lane at all.
+			var uerr *UnknownModelError
+			if errors.As(err, &uerr) {
+				renderFailedBeforeCommit(w, err, "")
+				return
+			}
 			// No provider available
 			renderFailedBeforeCommit(w, lastErr, fmt.Sprintf("no available provider for model %q: %v", model, err))
 			return
@@ -434,7 +442,12 @@ func renderFailedBeforeCommit(w http.ResponseWriter, lastErr error, fallbackMsg 
 	statusCode := http.StatusBadGateway
 	errMsg := fallbackMsg
 	errType := "bad_gateway"
-	if lastErr != nil {
+	var uerr *UnknownModelError
+	if errors.As(lastErr, &uerr) {
+		statusCode = http.StatusNotFound
+		errType = "unknown_model"
+		errMsg = uerr.Error()
+	} else if lastErr != nil {
 		errMsg = lastErr.Error()
 		msgLower := strings.ToLower(errMsg)
 		if strings.Contains(msgLower, "status 429") || strings.Contains(msgLower, "http 429") || strings.Contains(msgLower, "429 too many") || strings.Contains(msgLower, "resource_exhausted") || strings.Contains(msgLower, "quota_exceeded") || strings.Contains(msgLower, "daily token limit") || strings.Contains(msgLower, "rate limit") {

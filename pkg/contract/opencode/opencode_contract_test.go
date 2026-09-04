@@ -130,7 +130,7 @@ func TestOpenCode_ToolResultReplayCorrelation(t *testing.T) {
 		"messages": []map[string]any{
 			{"role": "user", "content": "Read a file"},
 			{
-				"role": "assistant",
+				"role":    "assistant",
 				"content": "",
 				"tool_calls": []any{
 					map[string]any{
@@ -315,9 +315,9 @@ func TestOpenCode_ToolSchemaPassthrough(t *testing.T) {
 // masked by blind failover to another provider.
 func TestOpenCode_UpstreamErrorPropagationWithoutFailover(t *testing.T) {
 	tests := []struct {
-		status   int
-		message  string
-		errType  string
+		status  int
+		message string
+		errType string
 	}{
 		{http.StatusTooManyRequests, "rate limit hit", "rate_limit_exceeded"},
 		{http.StatusUnauthorized, "invalid credentials", "authentication_error"},
@@ -428,5 +428,51 @@ func TestOpenCode_StreamingUsageTracking(t *testing.T) {
 	}
 	if !foundDone {
 		t.Errorf("expected [DONE] marker in stream")
+	}
+}
+
+// TestOpenCode_UnknownModelIs404 verifies that requesting an unknown model
+// returns HTTP 404 with JSON error type "unknown_model" and zero provider
+// invocations across all fake upstreams (no 10-lane failover walk).
+func TestOpenCode_UnknownModelIs404(t *testing.T) {
+	fake := NewFakeUpstream()
+	extraLanes := []string{"zai", "openrouter", "deepseek", "vllm", "antigravity", "copilot", "xai", "codex", "freebuff"}
+	var opts []HarnessOption
+	opts = append(opts, WithFakeUpstream(fake))
+	for _, name := range extraLanes {
+		fp, err := NewFakeProvider(name, fake)
+		if err != nil {
+			t.Fatalf("failed to create fake provider %q: %v", name, err)
+		}
+		opts = append(opts, WithProvider(fp.Provider()))
+	}
+	h := NewTestHarness(t, opts...)
+
+	req := map[string]any{
+		"model": "totally-bogus",
+		"messages": []map[string]any{
+			{"role": "user", "content": "Hello"},
+		},
+	}
+
+	resp, body, err := h.PostChat(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PostChat failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d: %v", resp.StatusCode, body)
+	}
+
+	errObj, ok := body["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected error object in body, got %#v", body)
+	}
+	if errObj["type"] != "unknown_model" {
+		t.Errorf("expected error type %q, got %v", "unknown_model", errObj["type"])
+	}
+
+	// Assert ZERO provider invocations across all fake upstreams (no 10-lane walk)
+	if h.FakeUpstream.RequestCount() != 0 {
+		t.Errorf("expected 0 upstream requests across all fakes, got %d", h.FakeUpstream.RequestCount())
 	}
 }

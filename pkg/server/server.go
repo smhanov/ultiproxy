@@ -77,10 +77,6 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		opt(s)
 	}
 
-	if s.router == nil {
-		s.router = NewRegistryRouter(registry, s.sm)
-	}
-
 	// Model alias catalog (config + runtime-persisted aliases). Must exist
 	// before the MCP server is built (the bridge references it).
 	catalog, catalogErr := NewModelCatalog(cfg.Server.Models, filepath.Join(cfg.DataDir, "aliases.json"))
@@ -90,6 +86,12 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		catalog, _ = NewModelCatalog(cfg.Server.Models, "")
 	}
 	s.catalog = catalog
+
+	// Default router needs the catalog so unknown models can be rejected
+	// instead of silently routed to the first registered provider.
+	if s.router == nil {
+		s.router = NewRegistryRouter(registry, s.sm, catalog)
+	}
 
 	// Register aliases into the state manager so the router and /v1/models
 	// resolve them without touching the catalog on every request.

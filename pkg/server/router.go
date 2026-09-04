@@ -34,13 +34,17 @@ func ExcludedProvidersFromContext(ctx context.Context) map[string]bool {
 type RegistryRouter struct {
 	registry *provider.Registry
 	sm       *state.StateManager
+	catalog  *ModelCatalog
 }
 
-// NewRegistryRouter creates a default registry-backed router.
-func NewRegistryRouter(registry *provider.Registry, sm *state.StateManager) *RegistryRouter {
+// NewRegistryRouter creates a default registry-backed router. The catalog is
+// optional; when set, unknown models are rejected instead of falling back to
+// an arbitrary provider (the "10-lane failover walk" bug).
+func NewRegistryRouter(registry *provider.Registry, sm *state.StateManager, catalog *ModelCatalog) *RegistryRouter {
 	return &RegistryRouter{
 		registry: registry,
 		sm:       sm,
+		catalog:  catalog,
 	}
 }
 
@@ -74,7 +78,19 @@ func (r *RegistryRouter) Route(ctx context.Context, model string) (string, error
 
 	names := r.registry.Names()
 
-	// Direct or prefix match with provider name
+	// 3. Catalog mapping (alias -> provider) when the state snapshot missed it.
+	if r.catalog != nil {
+		if entry, ok := r.catalog.Get(model); ok && entry.Provider != "" {
+			if !excluded[entry.Provider] {
+				if _, registered := r.registry.Get(entry.Provider); registered {
+					return entry.Provider, nil
+				}
+			}
+			return "", fmt.Errorf("provider %q for model %q is unavailable or failed", entry.Provider, model)
+		}
+	}
+
+	// 4. Direct or prefix match with provider name (e.g. "zai/glm-5.3-flash").
 	for _, name := range names {
 		if strings.Contains(strings.ToLower(model), strings.ToLower(name)) {
 			if !excluded[name] {
@@ -84,12 +100,17 @@ func (r *RegistryRouter) Route(ctx context.Context, model string) (string, error
 		}
 	}
 
-	// Fallback to first non-excluded provider (for generic unmapped models)
-	for _, name := range names {
-		if !excluded[name] {
-			return name, nil
-		}
-	}
+	// 5. Unknown model: reject with unknown_model instead of silently
+	// routing to the first registered provider (which produced the
+	// "all candidate providers failed" 10-lane walk).
+	return "", &UnknownModelError{Model: model}
+}
 
-	return "", errors.New("no available provider for model")
+// UnknownModelError indicates the requested model has no mapping to any lane.
+type UnknownModelError struct {
+	Model string
+}
+
+func (e *UnknownModelError) Error() string {
+	return fmt.Sprintf("unknown model %q: no catalog alias or provider prefix match", e.Model)
 }

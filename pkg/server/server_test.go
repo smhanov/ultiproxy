@@ -63,10 +63,10 @@ func (f *fakeInferenceProvider) Generate(ctx context.Context, msgs []*ir.Message
 	}, nil
 }
 
-// 1. Failover BEFORE commit works:
-// Provider A returns sync error -> router / server fails over to Provider B before headers are committed.
-// If all fail -> HTTP 502.
-func TestServer_FailoverBeforeCommit(t *testing.T) {
+// 1. Honest routing before commit:
+// A model routed to ONE lane whose upstream returns a synchronous error BEFORE commit
+// must NOT silently walk to another lane.
+func TestServer_MappedLaneSyncErrorHonestFailure(t *testing.T) {
 	provA := &fakeInferenceProvider{
 		name: "prov-a",
 		streamFn: func(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (<-chan ir.Event, error) {
@@ -92,41 +92,70 @@ func TestServer_FailoverBeforeCommit(t *testing.T) {
 
 	srv := NewServer(nil, registry)
 
-	// Stream request
-	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	// Stream request routed to prov-a via prefix match
+	body := `{"model":"prov-a/gpt-4o","messages":[{"role":"user","content":"Hi"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 
 	srv.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK after failover, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway, got %d: %s", rec.Code, rec.Body.String())
 	}
 
 	if provA.calls != 1 {
 		t.Errorf("expected provA to be called once, got %d", provA.calls)
 	}
-	if provB.calls != 1 {
-		t.Errorf("expected provB to be called once after failover, got %d", provB.calls)
+	if provB.calls != 0 {
+		t.Errorf("expected provB calls == 0 (no cross-vendor failover walk), got %d", provB.calls)
 	}
 
-	respBody := rec.Body.String()
-	if !strings.Contains(respBody, "Hello from Provider B") {
-		t.Errorf("expected stream to contain Provider B output, got:\n%s", respBody)
+	var errResp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to decode JSON error body: %v, body: %s", err, rec.Body.String())
+	}
+	errObj, ok := errResp["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected 'error' object in response, got: %v", errResp)
+	}
+	msg, _ := errObj["message"].(string)
+	if !strings.Contains(msg, "provider A 503 upstream error") {
+		t.Errorf("expected error message to carry upstream message, got %q", msg)
 	}
 
-	// Test: Both providers return sync error -> returns 502 Bad Gateway
-	provB.streamFn = func(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (<-chan ir.Event, error) {
-		return nil, errors.New("provider B also down")
+	// Unknown-model case: model "totally-bogus" -> 404 with error type "unknown_model" and zero provider calls.
+	provA.calls = 0
+	provB.calls = 0
+
+	bogusBody := `{"model":"totally-bogus","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	bogusReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(bogusBody))
+	bogusRec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(bogusRec, bogusReq)
+
+	if bogusRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for totally-bogus, got %d: %s", bogusRec.Code, bogusRec.Body.String())
+	}
+	if provA.calls != 0 || provB.calls != 0 {
+		t.Errorf("expected zero provider calls for unknown model, got provA=%d, provB=%d", provA.calls, provB.calls)
 	}
 
-	req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	rec2 := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec2, req2)
-
-	if rec2.Code != http.StatusBadGateway {
-		t.Errorf("expected 502 Bad Gateway when all candidates fail before commit, got %d", rec2.Code)
+	var bogusErrResp map[string]any
+	if err := json.Unmarshal(bogusRec.Body.Bytes(), &bogusErrResp); err != nil {
+		t.Fatalf("failed to decode JSON error body for bogus model: %v", err)
 	}
+	bogusErrObj, ok := bogusErrResp["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected 'error' object in bogus model response, got: %v", bogusErrResp)
+	}
+	if bogusErrObj["type"] != "unknown_model" {
+		t.Errorf("expected error type 'unknown_model', got %v", bogusErrObj["type"])
+	}
+}
+
+// TestServer_FailoverBeforeCommit preserves backward compatibility for test runners targeting the old name.
+func TestServer_FailoverBeforeCommit(t *testing.T) {
+	TestServer_MappedLaneSyncErrorHonestFailure(t)
 }
 
 // 2. Failover NEVER after first byte:
@@ -155,7 +184,7 @@ func TestServer_FailoverNeverAfterFirstByte(t *testing.T) {
 
 	srv := NewServer(nil, registry)
 
-	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	body := `{"model":"prov-a/gpt-4o","messages":[{"role":"user","content":"Hi"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 
@@ -164,6 +193,10 @@ func TestServer_FailoverNeverAfterFirstByte(t *testing.T) {
 	// Since headers were committed on first chunk, response code is 200
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK headers committed, got %d", rec.Code)
+	}
+
+	if provA.calls != 1 {
+		t.Errorf("expected provA to be called once, got %d", provA.calls)
 	}
 
 	// CRITICAL ASSERTION: Provider B MUST NEVER BE CALLED
@@ -207,7 +240,7 @@ func TestServer_Auth401Paths(t *testing.T) {
 	}
 
 	// B. /v1/chat/completions without Authorization header -> 401
-	reqNoAuth := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o"}`))
+	reqNoAuth := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov-b/gpt-4o"}`))
 	recNoAuth := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(recNoAuth, reqNoAuth)
 	if recNoAuth.Code != http.StatusUnauthorized {
@@ -218,7 +251,7 @@ func TestServer_Auth401Paths(t *testing.T) {
 	}
 
 	// C. /v1/chat/completions with wrong key -> 401
-	reqBadAuth := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o"}`))
+	reqBadAuth := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov-a/gpt-4o"}`))
 	reqBadAuth.Header.Set("Authorization", "Bearer wrong-key")
 	recBadAuth := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(recBadAuth, reqBadAuth)
@@ -227,7 +260,7 @@ func TestServer_Auth401Paths(t *testing.T) {
 	}
 
 	// D. Valid admin key -> 200
-	reqAdmin := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","messages":[]}`))
+	reqAdmin := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov-a/gpt-4o","messages":[]}`))
 	reqAdmin.Header.Set("Authorization", "Bearer admin-secret-key-123")
 	recAdmin := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(recAdmin, reqAdmin)
@@ -236,7 +269,7 @@ func TestServer_Auth401Paths(t *testing.T) {
 	}
 
 	// E. Valid client key -> 200
-	reqClient := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","messages":[]}`))
+	reqClient := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov-a/gpt-4o","messages":[]}`))
 	reqClient.Header.Set("Authorization", "Bearer alpha-secret-456")
 	recClient := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(recClient, reqClient)
@@ -273,7 +306,7 @@ func TestServer_PerClientAccountingTag(t *testing.T) {
 	registry.Register(provider.Provider{Inference: prov})
 	srv := NewServer(cfg, registry)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","messages":[]}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov-a/gpt-4o","messages":[]}`))
 	req.Header.Set("Authorization", "Bearer secret-token-xyz")
 	rec := httptest.NewRecorder()
 
@@ -315,7 +348,7 @@ func TestServer_UsageEvent_TrackUsageCall(t *testing.T) {
 
 	srv := NewServer(nil, registry, WithStorageWriter(writer))
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","messages":[],"stream":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov-a/gpt-4o","messages":[],"stream":true}`))
 	rec := httptest.NewRecorder()
 
 	srv.Handler().ServeHTTP(rec, req)
