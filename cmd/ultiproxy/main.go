@@ -48,8 +48,15 @@ func main() {
 	case "serve":
 		runServe(*configPath, *dataDir)
 
+	case "login":
+		providerName := ""
+		if fs.NArg() > 0 {
+			providerName = fs.Arg(0)
+		}
+		runLogin(providerName, *dataDir)
+
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q (available: serve, version)\n", cmd)
+		fmt.Fprintf(os.Stderr, "unknown command %q (available: serve, login, version)\n", cmd)
 		os.Exit(1)
 	}
 }

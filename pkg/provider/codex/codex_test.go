@@ -250,6 +250,30 @@ func TestStreamSynchronousErrorOnNon2xx(t *testing.T) {
 	}
 }
 
+func TestGetTokenPrefersAuthManagerOverStatic(t *testing.T) {
+	dir := t.TempDir()
+	mgr, err := auth.NewManager(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Store(context.Background(), DefaultClientID, auth.Credential{
+		Provider:    "codex",
+		AccessToken: "manager-token",
+		ExpiresAt:   time.Now().Add(time.Hour),
+		ClientID:    DefaultClientID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := New(Config{AuthManager: mgr, StaticToken: "stale-static", ClientID: DefaultClientID})
+	tok, err := p.getToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "manager-token" {
+		t.Fatalf("got %q, want manager-token", tok)
+	}
+}
+
 func TestRegistry(t *testing.T) {
 	r := provider.NewRegistry()
 	p := New(Config{StaticToken: "test"})

@@ -99,6 +99,7 @@ func DecodeChatCompletionRequest(body []byte) (*ChatCompletionDecoded, error) {
 	}
 
 	var irMessages []*ir.Message
+	toolCallNames := make(map[string]string)
 	for _, msg := range req.Messages {
 		role := msg.Role
 		if role == "developer" {
@@ -157,6 +158,9 @@ func DecodeChatCompletionRequest(body []byte) (*ChatCompletionDecoded, error) {
 			if tc.Index != nil {
 				idx = *tc.Index
 			}
+			if tc.ID != "" && tc.Function.Name != "" {
+				toolCallNames[tc.ID] = tc.Function.Name
+			}
 			blocks = append(blocks, ir.ToolCallBlock{
 				Index:     idx,
 				ID:        tc.ID,
@@ -177,9 +181,13 @@ func DecodeChatCompletionRequest(body []byte) (*ChatCompletionDecoded, error) {
 					contentStr = string(b)
 				}
 			}
+			name := msg.Name
+			if name == "" && msg.ToolCallID != "" {
+				name = toolCallNames[msg.ToolCallID]
+			}
 			blocks = append(blocks, ir.ToolResultBlock{
 				ToolCallID: msg.ToolCallID,
-				Name:       msg.Name,
+				Name:       name,
 				Content:    contentStr,
 			})
 		}
@@ -350,7 +358,7 @@ func EncodeChatCompletionResponse(resp *ir.Response, model string) ([]byte, erro
 		switch finishReason {
 		case "end_turn":
 			finishReason = "stop"
-		case "tool_use":
+		case "tool_use", "malformed_function_call":
 			finishReason = "tool_calls"
 		case "max_tokens":
 			finishReason = "length"
@@ -435,6 +443,7 @@ type OpenAIStreamEncoder struct {
 	created      int64
 	includeUsage bool
 	started      bool
+	sawToolCalls bool
 	lastUsage    *OpenAIUsage
 }
 
@@ -483,6 +492,7 @@ func (e *OpenAIStreamEncoder) EncodeEvent(evt ir.Event) error {
 		return e.writeChunk(OpenAIChunkDelta{ReasoningContent: ev.Text}, nil)
 
 	case ir.EventToolCallStart:
+		e.sawToolCalls = true
 		if !e.started {
 			e.started = true
 			if err := e.writeChunk(OpenAIChunkDelta{Role: "assistant"}, nil); err != nil {
@@ -532,14 +542,16 @@ func (e *OpenAIStreamEncoder) EncodeEvent(evt ir.Event) error {
 
 	case ir.EventMessageStop:
 		finish := ev.FinishReason
-		if finish == "" {
+		if e.sawToolCalls {
+			finish = "tool_calls"
+		} else if finish == "" {
 			finish = "stop"
 		} else {
 			switch finish {
-			case "end_turn":
-				finish = "stop"
-			case "tool_use":
+			case "tool_use", "malformed_function_call":
 				finish = "tool_calls"
+			case "stop", "end_turn":
+				finish = "stop"
 			case "max_tokens":
 				finish = "length"
 			}

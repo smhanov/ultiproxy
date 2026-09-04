@@ -13,4 +13,5 @@ type Credential struct {
 	ExpiresAt    time.Time `json:"expires_at"`
 	Generation   uint64    `json:"generation"`
 	ClientID     string    `json:"client_id"`
+	ProjectID    string    `json:"project_id,omitempty"`
 }

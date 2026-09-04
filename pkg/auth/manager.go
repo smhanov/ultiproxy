@@ -66,6 +66,14 @@ func NewManager(storageDir string, refresher Refresher, opts ...Option) (*Manage
 	return m, nil
 }
 
+// SetRefresher installs or replaces the token refresher.
+func (m *Manager) SetRefresher(r Refresher) {
+	if m == nil {
+		return
+	}
+	m.refresher = r
+}
+
 func (m *Manager) now() time.Time {
 	if m.nowFn != nil {
 		return m.nowFn()

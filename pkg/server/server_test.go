@@ -400,3 +400,39 @@ func TestServer_AdditionalEndpoints(t *testing.T) {
 		t.Errorf("failed to decode quota dashboard response: %v", err)
 	}
 }
+
+func TestServer_Upstream429ErrorPreserved(t *testing.T) {
+	provA := &fakeInferenceProvider{
+		name: "augure",
+		streamFn: func(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (<-chan ir.Event, error) {
+			return nil, errors.New("upstream error (status 429): Daily token limit exceeded")
+		},
+	}
+
+	registry := provider.NewRegistry()
+	registry.Register(provider.Provider{Inference: provA})
+
+	sm := state.NewStateManager()
+	sm.Update(func(snap *state.RuntimeSnapshot) {
+		snap.Models["tofino-3"] = state.ModelRuntime{
+			ID:       "tofino-3",
+			Provider: "augure",
+			Enabled:  true,
+		}
+	})
+
+	srv := NewServer(nil, registry, WithStateManager(sm))
+
+	body := `{"model":"tofino-3","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 Too Many Requests, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Daily token limit exceeded") {
+		t.Errorf("expected error body to contain upstream error message, got: %s", rec.Body.String())
+	}
+}

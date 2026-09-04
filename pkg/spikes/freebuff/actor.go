@@ -25,7 +25,8 @@ var (
 
 // Session represents the Freebuff upstream session state.
 type Session struct {
-	InstanceID string `json:"instance_id"`
+	Status     string `json:"status,omitempty"`
+	InstanceID string `json:"instanceId"`
 	Model      string `json:"model"`
 }
 
@@ -168,6 +169,13 @@ func (a *FreebuffAccountActor) SetInstanceID(id string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.instanceID = id
+}
+
+// SetToken updates the bearer token.
+func (a *FreebuffAccountActor) SetToken(tok string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.token = tok
 }
 
 // TryAcquire attempts to acquire the advisory lock non-blockingly.
@@ -334,36 +342,55 @@ func (a *FreebuffAccountActor) Bind(ctxOrModel any, optionalModel ...string) err
 	client := a.httpClient
 	a.mu.Unlock()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/freebuff/session", bytes.NewReader([]byte("{}")))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-freebuff-model", model)
-	if tok != "" {
-		req.Header.Set("Authorization", "Bearer "+tok)
-	}
-	if instID != "" {
-		req.Header.Set("x-freebuff-instance-id", instID)
+	doBind := func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/freebuff/session", bytes.NewReader([]byte("{}")))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-freebuff-model", model)
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		if instID != "" {
+			req.Header.Set("x-freebuff-instance-id", instID)
+		}
+		return client.Do(req)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := doBind()
 	if err != nil {
 		return err
+	}
+	if resp.StatusCode == http.StatusConflict {
+		resp.Body.Close()
+		_ = a.DeleteSession(ctx)
+		a.mu.Lock()
+		instID = a.instanceID
+		a.mu.Unlock()
+		resp, err = doBind()
+		if err != nil {
+			return err
+		}
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("failed to bind model, status: %d", resp.StatusCode)
+		return fmt.Errorf("failed to bind model, status: %d: %s", resp.StatusCode, string(body))
 	}
 
 	var sess Session
-	if err := json.NewDecoder(resp.Body).Decode(&sess); err == nil {
+	if err := json.Unmarshal(body, &sess); err == nil {
 		a.mu.Lock()
 		if sess.InstanceID != "" {
 			a.instanceID = sess.InstanceID
 		}
-		a.boundModel = model
+		if sess.Model != "" {
+			a.boundModel = sess.Model
+		} else {
+			a.boundModel = model
+		}
 		a.mu.Unlock()
 	} else {
 		a.mu.Lock()

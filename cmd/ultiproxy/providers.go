@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/provider/antigravity"
 	"github.com/smhanov/ultiproxy/pkg/provider/augure"
@@ -121,11 +122,21 @@ func firstEnv(keys ...string) string {
 	return ""
 }
 
+func newOAuthManager(credDir string) (*auth.Manager, error) {
+	return auth.NewManager(credDir, nil)
+}
+
+func managerHasToken(mgr *auth.Manager, key string) bool {
+	if mgr == nil {
+		return false
+	}
+	cred, err := mgr.LoadFromDisk(key)
+	return err == nil && cred.AccessToken != ""
+}
+
 // registerProviders wires upstream adapters into the registry. Registration is
-// opt-in per provider and driven by environment variables OR local credential
-// files, so the binary boots cleanly in CI and on machines without any
-// subscription credentials. Local tokens kept fresh by the legacy bridge
-// daemons (cliproxy, xgroxy, codex, gh) are read at startup.
+// opt-in per provider and driven by environment variables OR ultiproxy-owned
+// credential stores. Antigravity never reads ~/.cli-proxy-api.
 func registerProviders(registry *provider.Registry) {
 	home, _ := os.UserHomeDir()
 	stateDir := firstEnv("ULTIPROXY_DATA_DIR", "ULTIPROXY_STATE_DIR")
@@ -222,46 +233,49 @@ func registerProviders(registry *provider.Registry) {
 		}
 	}
 
-	// xAI Grok — env or ~/.grok/auth.json (kept fresh by xgroxy daemon).
-	xaiTok := firstEnv("ULTIPROXY_XAI_TOKEN")
-	if xaiTok == "" {
-		xaiTok, _ = readNestedToken(filepath.Join(home, ".grok", "auth.json"))
-	}
-	if xaiTok != "" {
-		p := xai.New(xai.Config{StaticToken: xaiTok})
-		add("xai", p.ProviderBundle())
-	}
-
-	// Codex — env or ~/.codex/auth.json tokens.access_token (kept fresh by the codex CLI).
-	codexTok := firstEnv("ULTIPROXY_CODEX_TOKEN")
-	if codexTok == "" {
-		codexTok, _ = readJSONField(filepath.Join(home, ".codex", "auth.json"), "tokens", "access_token")
-	}
-	if codexTok == "" {
-		codexTok, _ = readJSONField(filepath.Join(home, ".codex", "auth.json"), "access_token")
-	}
-	if codexTok != "" {
-		p := codex.New(codex.Config{StaticToken: codexTok})
-		add("codex", p.ProviderBundle())
-	}
-
-	// Antigravity — env or ~/.cli-proxy-api/antigravity-*.json (cliproxy keeps fresh).
-	agTok := firstEnv("ULTIPROXY_ANTIGRAVITY_TOKEN")
-	agProject := firstEnv("ULTIPROXY_ANTIGRAVITY_PROJECT")
-	if agTok == "" || agProject == "" {
-		matches, _ := filepath.Glob(filepath.Join(home, ".cli-proxy-api", "antigravity-*.json"))
-		for _, m := range matches {
-			if tok, _ := readJSONField(m, "access_token"); tok != "" {
-				agTok = tok
-				if proj, _ := readJSONField(m, "project_id"); proj != "" {
-					agProject = proj
-				}
-				break
-			}
+	// xAI Grok — ultiproxy-owned credentials first; env, then ~/.grok (xAI CLI).
+	{
+		credDir := filepath.Join(stateDir, "credentials", "xai")
+		mgr, mgrErr := newOAuthManager(credDir)
+		if mgrErr == nil && managerHasToken(mgr, xai.DefaultClientID) {
+			p := xai.New(xai.Config{AuthManager: mgr, ClientID: xai.DefaultClientID})
+			add("xai", p.ProviderBundle())
+		} else if tok := firstEnv("ULTIPROXY_XAI_TOKEN"); tok != "" {
+			p := xai.New(xai.Config{StaticToken: tok})
+			add("xai", p.ProviderBundle())
+		} else if tok, ok := readNestedToken(filepath.Join(home, ".grok", "auth.json")); ok {
+			p := xai.New(xai.Config{StaticToken: tok})
+			add("xai", p.ProviderBundle())
+		} else if mgrErr == nil {
+			p := xai.New(xai.Config{AuthManager: mgr, ClientID: xai.DefaultClientID})
+			add("xai", p.ProviderBundle())
 		}
 	}
-	if agTok != "" {
-		p := antigravity.New(antigravity.Config{StaticToken: agTok, ProjectID: agProject})
+
+	// Codex — ultiproxy-owned credentials first; env, then ~/.codex (Codex CLI).
+	{
+		credDir := filepath.Join(stateDir, "credentials", "codex")
+		mgr, mgrErr := newOAuthManager(credDir)
+		if mgrErr == nil && managerHasToken(mgr, codex.DefaultClientID) {
+			p := codex.New(codex.Config{AuthManager: mgr, ClientID: codex.DefaultClientID})
+			add("codex", p.ProviderBundle())
+		} else if tok := firstEnv("ULTIPROXY_CODEX_TOKEN"); tok != "" {
+			p := codex.New(codex.Config{StaticToken: tok})
+			add("codex", p.ProviderBundle())
+		} else if tok, ok := readJSONField(filepath.Join(home, ".codex", "auth.json"), "tokens", "access_token"); ok {
+			p := codex.New(codex.Config{StaticToken: tok})
+			add("codex", p.ProviderBundle())
+		} else if tok, ok := readJSONField(filepath.Join(home, ".codex", "auth.json"), "access_token"); ok {
+			p := codex.New(codex.Config{StaticToken: tok})
+			add("codex", p.ProviderBundle())
+		} else if mgrErr == nil {
+			p := codex.New(codex.Config{AuthManager: mgr, ClientID: codex.DefaultClientID})
+			add("codex", p.ProviderBundle())
+		}
+	}
+
+	// Antigravity — ultiproxy-owned OAuth only. Never read ~/.cli-proxy-api.
+	if p := antigravity.NewFromState(home, stateDir, nil); p != nil {
 		add("antigravity", p.ProviderBundle())
 	}
 
@@ -277,10 +291,13 @@ func registerProviders(registry *provider.Registry) {
 		add("copilot", p.ProviderBundle())
 	}
 
-	// Freebuff — env or ~/workspace/freebuff-proxy/.env FREEBUFF_TOKEN.
+	// Freebuff — CLI credentials (~/.config/manicode/credentials.json), then env.
+	// Never reads ~/workspace/freebuff-proxy/.env.
 	fbTok := firstEnv("ULTIPROXY_FREEBUFF_TOKEN", "FREEBUFF_TOKEN")
 	if fbTok == "" {
-		fbTok = envFile(filepath.Join(home, "workspace", "freebuff-proxy", ".env"), "FREEBUFF_TOKEN")
+		if tok, _, _, err := freebuff.ReadCLIToken(); err == nil {
+			fbTok = tok
+		}
 	}
 	if fbTok != "" {
 		if p, err := freebuff.New(freebuff.Config{Token: fbTok, DataDir: stateDir}); err == nil {

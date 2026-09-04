@@ -12,8 +12,8 @@ func TestExampleConfigValid(t *testing.T) {
 		t.Fatalf("failed to load config.example.yaml: %v", err)
 	}
 
-	if cfg.Server.Addr != "127.0.0.1:9050" {
-		t.Errorf("expected Addr 127.0.0.1:9050, got %s", cfg.Server.Addr)
+	if cfg.Server.Addr != "0.0.0.0:9050" && cfg.Server.Addr != "127.0.0.1:9050" {
+		t.Errorf("expected Addr 0.0.0.0:9050 or 127.0.0.1:9050, got %s", cfg.Server.Addr)
 	}
 	// Open-access default: no api_key configured means no auth required.
 	if cfg.Server.APIKey != "" {

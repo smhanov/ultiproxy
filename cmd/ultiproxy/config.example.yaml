@@ -133,6 +133,12 @@ server:
       context_limit: 128000
       max_output: 8192
       pricing_tag: "subscription_zero_marginal"
+    freebuff-deepseek-v4-flash:
+      provider: "freebuff"
+      upstream: "deepseek/deepseek-v4-flash"
+      context_limit: 128000
+      max_output: 8192
+      pricing_tag: "free_tier"
 
   timeouts:
     antigravity: "2m"

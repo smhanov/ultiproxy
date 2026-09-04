@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -203,19 +204,26 @@ func TestFreebuffNoFakeToolsAndNoSystemMessageRewrite(t *testing.T) {
 		t.Fatalf("Generate failed: %v", err)
 	}
 
-	// 1. NEVER inject fake tools
-	if tools, exists := capturedPayload["tools"]; exists && tools != nil {
-		t.Errorf("expected no tools in payload when none requested, got %v", tools)
+	// Free mode requires CLI fingerprint: dummy read_files tool + Buffy system message.
+	tools, exists := capturedPayload["tools"]
+	if !exists || tools == nil {
+		t.Errorf("expected CLI dummy tools in payload, got none")
 	}
-
-	// 2. Transparency over rewriting: check user content passed through as-is
 	msgsRaw, ok := capturedPayload["messages"].([]any)
-	if !ok || len(msgsRaw) != 1 {
-		t.Fatalf("expected 1 message in payload, got %v", msgsRaw)
+	if !ok || len(msgsRaw) < 2 {
+		t.Fatalf("expected system+user messages, got %v", msgsRaw)
 	}
-	firstMsg := msgsRaw[0].(map[string]any)
-	if firstMsg["role"] != "user" || firstMsg["content"] != userMsgText {
-		t.Errorf("user message was rewritten: %+v", firstMsg)
+	sys := msgsRaw[0].(map[string]any)
+	if sys["role"] != "system" {
+		t.Errorf("first message should be system, got %+v", sys)
+	}
+	user := msgsRaw[len(msgsRaw)-1].(map[string]any)
+	if user["role"] != "user" || user["content"] != userMsgText {
+		t.Errorf("user message was rewritten: %+v", user)
+	}
+	meta, _ := capturedPayload["codebuff_metadata"].(map[string]any)
+	if cid, _ := meta["client_id"].(string); !strings.HasPrefix(cid, "cli-") {
+		t.Errorf("client_id should be cli- prefixed, got %v", meta["client_id"])
 	}
 }
 

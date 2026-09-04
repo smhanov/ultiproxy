@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/smhanov/ultiproxy/pkg/provider"
@@ -61,6 +62,7 @@ func (r *RegistryRouter) Route(ctx context.Context, model string) (string, error
 						return mr.Provider, nil
 					}
 				}
+				return "", fmt.Errorf("provider %q for model %q is unavailable or failed", mr.Provider, model)
 			}
 		}
 	}
@@ -74,15 +76,15 @@ func (r *RegistryRouter) Route(ctx context.Context, model string) (string, error
 
 	// Direct or prefix match with provider name
 	for _, name := range names {
-		if excluded[name] {
-			continue
-		}
 		if strings.Contains(strings.ToLower(model), strings.ToLower(name)) {
-			return name, nil
+			if !excluded[name] {
+				return name, nil
+			}
+			return "", fmt.Errorf("provider %q for model %q is unavailable or failed", name, model)
 		}
 	}
 
-	// Fallback to first non-excluded provider
+	// Fallback to first non-excluded provider (for generic unmapped models)
 	for _, name := range names {
 		if !excluded[name] {
 			return name, nil

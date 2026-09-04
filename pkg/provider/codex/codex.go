@@ -94,6 +94,13 @@ func New(cfg Config) *Provider {
 		client = http.DefaultClient
 	}
 
+	if cfg.Refresher == nil && cfg.AuthManager != nil {
+		cfg.Refresher = oauth.MakeRefresher(client, tokenURL, clientID, cfg.ClientSecret)
+	}
+	if cfg.AuthManager != nil && cfg.Refresher != nil {
+		cfg.AuthManager.SetRefresher(cfg.Refresher)
+	}
+
 	return &Provider{
 		baseURL:       baseURL,
 		clientID:      clientID,
@@ -150,8 +157,14 @@ func (p *Provider) Register(r *provider.Registry) {
 // -----------------------------------------------------------------------------
 
 func (p *Provider) getToken(ctx context.Context) (string, error) {
-	if p.staticToken != "" {
-		return p.staticToken, nil
+	if p.authManager != nil {
+		cred, err := p.authManager.Get(ctx, p.clientID)
+		if err == nil && cred.AccessToken != "" {
+			p.mu.Lock()
+			p.liveToken = cred.AccessToken
+			p.mu.Unlock()
+			return cred.AccessToken, nil
+		}
 	}
 	p.mu.RLock()
 	if p.liveToken != "" {
@@ -160,12 +173,8 @@ func (p *Provider) getToken(ctx context.Context) (string, error) {
 		return t, nil
 	}
 	p.mu.RUnlock()
-
-	if p.authManager != nil {
-		cred, err := p.authManager.Get(ctx, p.clientID)
-		if err == nil && cred.AccessToken != "" {
-			return cred.AccessToken, nil
-		}
+	if p.staticToken != "" {
+		return p.staticToken, nil
 	}
 	return "", errors.New("codex: no access token available")
 }

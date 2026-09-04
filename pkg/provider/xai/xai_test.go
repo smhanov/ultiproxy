@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/ir"
 	"github.com/smhanov/ultiproxy/pkg/provider"
 )
@@ -288,6 +289,30 @@ func TestTolerantErrorHandlingOnBadBilling(t *testing.T) {
 	}
 	if !strings.Contains(snap.Detail, "unknown") && !strings.Contains(snap.Detail, "503") {
 		t.Errorf("expected detail mentioning unknown status or 503, got %q", snap.Detail)
+	}
+}
+
+func TestGetTokenPrefersAuthManagerOverStatic(t *testing.T) {
+	dir := t.TempDir()
+	mgr, err := auth.NewManager(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Store(context.Background(), DefaultClientID, auth.Credential{
+		Provider:    "xai",
+		AccessToken: "manager-token",
+		ExpiresAt:   time.Now().Add(time.Hour),
+		ClientID:    DefaultClientID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := New(Config{AuthManager: mgr, StaticToken: "stale-static", ClientID: DefaultClientID})
+	tok, err := p.getToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "manager-token" {
+		t.Fatalf("got %q, want manager-token", tok)
 	}
 }
 

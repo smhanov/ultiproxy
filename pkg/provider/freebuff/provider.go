@@ -3,8 +3,6 @@ package freebuff
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -64,11 +62,12 @@ type Config struct {
 
 // Provider implements provider.InferenceProvider and provider.QuotaProvider.
 type Provider struct {
-	cfg        Config
-	actor      *spikesfreebuff.FreebuffAccountActor
-	models     map[string]string
-	aliases    map[string]string
-	instanceID string
+	cfg            Config
+	actor          *spikesfreebuff.FreebuffAccountActor
+	models         map[string]string
+	aliases        map[string]string
+	instanceID     string
+	instanceIDFile string
 }
 
 // New creates a new Freebuff provider.
@@ -121,11 +120,10 @@ func New(cfg Config) (*Provider, error) {
 	if data, err := os.ReadFile(instanceIDFile); err == nil {
 		instanceID = strings.TrimSpace(string(data))
 	}
-	if instanceID == "" {
-		b := make([]byte, 8)
-		_, _ = rand.Read(b)
-		instanceID = "fb-inst-" + hex.EncodeToString(b)
-		_ = os.WriteFile(instanceIDFile, []byte(instanceID), 0600)
+	// Homemade fb-inst-* ids are rejected by Codebuff (HTTP 409). Let
+	// POST /freebuff/session mint a real UUID, then persist it.
+	if strings.HasPrefix(instanceID, "fb-inst-") {
+		instanceID = ""
 	}
 
 	actor := cfg.Actor
@@ -146,11 +144,12 @@ func New(cfg Config) (*Provider, error) {
 	}
 
 	return &Provider{
-		cfg:        cfg,
-		actor:      actor,
-		models:     models,
-		aliases:    aliases,
-		instanceID: instanceID,
+		cfg:            cfg,
+		actor:          actor,
+		models:         models,
+		aliases:        aliases,
+		instanceID:     instanceID,
+		instanceIDFile: instanceIDFile,
 	}, nil
 }
 
@@ -202,6 +201,7 @@ func (p *Provider) Provider() provider.Provider {
 	return provider.Provider{
 		Inference:    p,
 		Quota:        p,
+		Auth:         p,
 		Capabilities: Capabilities(),
 	}
 }
@@ -223,6 +223,7 @@ func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...pro
 		if err := p.actor.Bind(ctx, model); err != nil {
 			return nil, fmt.Errorf("failed to bind model: %w", err)
 		}
+		p.persistInstanceID()
 	}
 
 	run, err := p.actor.StartRun(ctx, agentID)
@@ -261,6 +262,7 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 			_ = p.actor.Release()
 			return nil, fmt.Errorf("failed to bind model: %w", err)
 		}
+		p.persistInstanceID()
 	}
 
 	run, err := p.actor.StartRun(ctx, agentID)
@@ -305,30 +307,63 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 }
 
 func (p *Provider) buildPayload(msgs []*ir.Message, model, runID string, stream bool, cfg *provider.RequestConfig) (io.Reader, error) {
-	// Transparency: do not rewrite user messages or inject fake tools
-	// Transparency: do not rewrite user messages or inject fake tools unless required by mode
 	chatMsgs := openai.ConvertMessages(msgs, openai.ConvertOptions{})
+	hasSystem := false
+	for _, m := range chatMsgs {
+		if m.Role == "system" {
+			hasSystem = true
+			break
+		}
+	}
+	if !hasSystem {
+		chatMsgs = append([]openai.ChatMessage{{Role: "system", Content: "You are Buffy, the coding agent behind Codebuff."}}, chatMsgs...)
+	}
+
+	inst := p.actor.InstanceID()
+	if inst == "" {
+		inst = p.instanceID
+	}
+
+	defaultTool := map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "read_files",
+			"description": "Read files from project",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"paths": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				},
+			},
+		},
+	}
+
+	var finalTools []any
+	if cfg.ExtraBody != nil {
+		if tools, ok := cfg.ExtraBody["tools"].([]any); ok && len(tools) > 0 {
+			finalTools = append(finalTools, defaultTool)
+			finalTools = append(finalTools, tools...)
+		}
+	}
+	if len(finalTools) == 0 {
+		finalTools = []any{defaultTool}
+	}
 
 	payload := map[string]any{
 		"model":    model,
 		"messages": chatMsgs,
 		"stream":   stream,
+		"tools":    finalTools,
 		"codebuff_metadata": map[string]any{
 			"run_id":               runID,
-			"freebuff_instance_id": p.instanceID,
+			"freebuff_instance_id": inst,
 			"cost_mode":            "free",
-			"client_id":            p.instanceID,
-			"llm_step_number":      1,
+			"client_id":            "cli-" + inst,
+			"llm_step_number":      "1",
 		},
 		"provider": map[string]any{
 			"allow_fallbacks": true,
 		},
-	}
-
-	if cfg.ExtraBody != nil {
-		if tools, ok := cfg.ExtraBody["tools"]; ok && tools != nil {
-			payload["tools"] = tools
-		}
 	}
 
 	if cfg.MaxTokens > 0 {
@@ -338,6 +373,9 @@ func (p *Provider) buildPayload(msgs []*ir.Message, model, runID string, stream 
 		payload["temperature"] = *cfg.Temperature
 	}
 	for k, v := range cfg.ExtraBody {
+		if k == "tools" {
+			continue
+		}
 		payload[k] = v
 	}
 
@@ -348,13 +386,35 @@ func (p *Provider) buildPayload(msgs []*ir.Message, model, runID string, stream 
 	return bytes.NewReader(data), nil
 }
 
+func (p *Provider) persistInstanceID() {
+	id := p.actor.InstanceID()
+	if id == "" {
+		return
+	}
+	p.instanceID = id
+	if p.instanceIDFile == "" {
+		return
+	}
+	_ = os.WriteFile(p.instanceIDFile, []byte(id+"\n"), 0o600)
+}
+
 func (p *Provider) setHeaders(req *http.Request, cfg *provider.RequestConfig) {
 	req.Header.Set("User-Agent", UserAgentValue)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-freebuff-instance-id", p.instanceID)
+	inst := p.actor.InstanceID()
+	if inst == "" {
+		inst = p.instanceID
+	}
+	if inst != "" {
+		req.Header.Set("x-freebuff-instance-id", inst)
+	}
 	req.Header.Set("x-freebuff-acting-user-id", "adcc6f59-fffd-4735-8c09-703eb3158941")
-	if p.cfg.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+p.cfg.Token)
+	tok := p.cfg.Token
+	if tok == "" {
+		tok = p.actor.Token()
+	}
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	for k, v := range cfg.Headers {
 		req.Header.Set(k, v)
@@ -498,4 +558,83 @@ func (p *Provider) Close() error {
 		return p.actor.Close()
 	}
 	return nil
+}
+
+// ----------------------------------------------------------------------------
+// AuthProvider — imports the Freebuff CLI token; there is no OAuth dance.
+// ----------------------------------------------------------------------------
+
+const freebuffAuthKey = "freebuff"
+
+func manicodeCredentialsPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "manicode", "credentials.json")
+}
+
+// ReadCLIToken loads the Codebuff / Freebuff CLI auth token from
+// ~/.config/manicode/credentials.json. Never prints the token.
+func ReadCLIToken() (token, email, userID string, err error) {
+	data, err := os.ReadFile(manicodeCredentialsPath())
+	if err != nil {
+		return "", "", "", fmt.Errorf("freebuff: CLI credentials not found (%s): %w — run `freebuff` and sign in first", manicodeCredentialsPath(), err)
+	}
+	var parsed map[string]struct {
+		ID        string `json:"id"`
+		Email     string `json:"email"`
+		AuthToken string `json:"authToken"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return "", "", "", fmt.Errorf("freebuff: parse CLI credentials: %w", err)
+	}
+	entry, ok := parsed["default"]
+	if !ok {
+		for _, v := range parsed {
+			entry = v
+			ok = true
+			break
+		}
+	}
+	if !ok || entry.AuthToken == "" {
+		return "", "", "", fmt.Errorf("freebuff: no authToken in CLI credentials")
+	}
+	return entry.AuthToken, entry.Email, entry.ID, nil
+}
+
+func (p *Provider) Login(ctx context.Context) error {
+	tok, email, userID, err := ReadCLIToken()
+	if err != nil {
+		return err
+	}
+	p.cfg.Token = tok
+	if p.actor != nil {
+		p.actor.SetToken(tok)
+	}
+	_ = email
+	_ = userID
+	return nil
+}
+
+func (p *Provider) Token(ctx context.Context) (string, error) {
+	if p.cfg.Token != "" {
+		return p.cfg.Token, nil
+	}
+	if p.actor != nil {
+		if t := p.actor.Token(); t != "" {
+			return t, nil
+		}
+	}
+	tok, _, _, err := ReadCLIToken()
+	if err != nil {
+		return "", err
+	}
+	p.cfg.Token = tok
+	if p.actor != nil {
+		p.actor.SetToken(tok)
+	}
+	return tok, nil
+}
+
+func (p *Provider) Refresh(ctx context.Context) error {
+	_, err := p.Token(ctx)
+	return err
 }

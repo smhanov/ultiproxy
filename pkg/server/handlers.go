@@ -153,6 +153,7 @@ func (s *Server) dispatchRequest(
 	clientKeyHash := ClientKeyHashFromContext(r.Context())
 
 	failedProviders := make(map[string]bool)
+	var lastErr error
 	maxAttempts := 3
 	if s.registry != nil && s.registry.Len() > maxAttempts {
 		maxAttempts = s.registry.Len()
@@ -167,14 +168,7 @@ func (s *Server) dispatchRequest(
 		provName, err := s.router.Route(routeCtx, model)
 		if err != nil {
 			// No provider available
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadGateway)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"error": map[string]any{
-					"message": fmt.Sprintf("no available provider for model %q: %v", model, err),
-					"type":    "bad_gateway",
-				},
-			})
+			renderFailedBeforeCommit(w, lastErr, fmt.Sprintf("no available provider for model %q: %v", model, err))
 			return
 		}
 
@@ -229,6 +223,7 @@ func (s *Server) dispatchRequest(
 		if stream {
 			streamChan, syncErr := prov.Inference.Stream(reqCtx, messages, opts...)
 			if syncErr != nil {
+				lastErr = syncErr
 				// Synchronous error BEFORE headers committed -> failover!
 				if s.writer != nil {
 					_ = s.writer.TrackAttempt(storage.AttemptRecord{
@@ -262,6 +257,7 @@ func (s *Server) dispatchRequest(
 				}
 
 				if upErr, isUpErr := firstEvt.(ir.EventUpstreamError); isUpErr {
+					lastErr = fmt.Errorf("upstream error: %s", upErr.Kind)
 					// Upstream error BEFORE headers committed -> failover!
 					if s.writer != nil {
 						_ = s.writer.TrackAttempt(storage.AttemptRecord{
@@ -370,6 +366,7 @@ func (s *Server) dispatchRequest(
 			// Non-streaming request
 			resp, genErr := prov.Inference.Generate(reqCtx, messages, opts...)
 			if genErr != nil {
+				lastErr = genErr
 				if s.writer != nil {
 					_ = s.writer.TrackAttempt(storage.AttemptRecord{
 						Attempt:    attemptCount,
@@ -427,12 +424,36 @@ func (s *Server) dispatchRequest(
 	}
 
 	// All candidate providers failed before commit
+	renderFailedBeforeCommit(w, lastErr, "all candidate providers failed before commit")
+}
+
+func renderFailedBeforeCommit(w http.ResponseWriter, lastErr error, fallbackMsg string) {
+	statusCode := http.StatusBadGateway
+	errMsg := fallbackMsg
+	errType := "bad_gateway"
+	if lastErr != nil {
+		errMsg = lastErr.Error()
+		msgLower := strings.ToLower(errMsg)
+		if strings.Contains(msgLower, "status 429") || strings.Contains(msgLower, "http 429") || strings.Contains(msgLower, "429 too many") || strings.Contains(msgLower, "resource_exhausted") || strings.Contains(msgLower, "quota_exceeded") || strings.Contains(msgLower, "daily token limit") || strings.Contains(msgLower, "rate limit") {
+			statusCode = http.StatusTooManyRequests
+			errType = "rate_limit_exceeded"
+		} else if strings.Contains(msgLower, "status 401") || strings.Contains(msgLower, "http 401") || strings.Contains(msgLower, "unauthorized") {
+			statusCode = http.StatusUnauthorized
+			errType = "authentication_error"
+		} else if strings.Contains(msgLower, "status 403") || strings.Contains(msgLower, "http 403") || strings.Contains(msgLower, "forbidden") {
+			statusCode = http.StatusForbidden
+			errType = "permission_denied"
+		} else if strings.Contains(msgLower, "status 404") || strings.Contains(msgLower, "http 404") || strings.Contains(msgLower, "not found") {
+			statusCode = http.StatusNotFound
+			errType = "not_found"
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadGateway)
+	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]any{
-			"message": "all candidate providers failed before commit",
-			"type":    "bad_gateway",
+			"message": errMsg,
+			"type":    errType,
 		},
 	})
 }
