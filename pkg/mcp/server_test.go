@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/smhanov/ultiproxy/pkg/ir"
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 	"github.com/smhanov/ultiproxy/pkg/state"
@@ -357,12 +358,12 @@ func (s *fileProviderStore) Add(cfg openaicompat.Config) error {
 }
 
 // AddCustom stores a custom-kind lane in the in-memory test store.
-func (s *fileProviderStore) AddCustom(name, kind string) error {
+func (s *fileProviderStore) AddCustom(name, kind, apiKey string) error {
 	if name == "" {
 		return errTest("name is required")
 	}
 	s.mu.Lock()
-	s.m[name] = openaicompat.Config{Name: name, BaseURL: "custom://" + kind}
+	s.m[name] = openaicompat.Config{Name: name, BaseURL: "custom://" + kind, APIKey: apiKey}
 	s.mu.Unlock()
 	return s.persist()
 }
@@ -518,5 +519,120 @@ func TestMCP_AddRemoveListProviders(t *testing.T) {
 	unknown := callMCPTool(t, srv, 6, "remove_provider", `{"name":"ghost"}`)
 	if !unknown.IsError {
 		t.Fatalf("expected error removing unknown lane: %s", unknown.Content[0].Text)
+	}
+}
+
+// stubCustomLane is a minimal inference provider the custom-lane tests hand
+// back from the injected builder.
+type stubCustomLane struct {
+	name string
+}
+
+func (s stubCustomLane) Name() string { return s.name }
+
+func (s stubCustomLane) Generate(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (*ir.Response, error) {
+	return &ir.Response{}, nil
+}
+
+func (s stubCustomLane) Stream(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (<-chan ir.Event, error) {
+	return nil, nil
+}
+
+// TestMCP_AddCustomProviderAnthropic covers kind=anthropic: the API key from
+// the add_provider call must reach the injected builder and be persisted, and
+// a missing key must be rejected before anything is registered.
+func TestMCP_AddCustomProviderAnthropic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.json")
+	store := newFileProviderStore(path)
+	registry := provider.NewRegistry()
+
+	var gotKind, gotAPIKey string
+	srv := NewServer(registry, nil,
+		WithProviderStore(store),
+		WithCustomLaneBuilder(func(name, kind, apiKey string) (provider.Provider, error) {
+			gotKind, gotAPIKey = kind, apiKey
+			return provider.Provider{Inference: stubCustomLane{name: name}}, nil
+		}),
+	)
+
+	// kind=anthropic without an api_key is rejected up front.
+	bad := callMCPTool(t, srv, 1, "add_provider",
+		`{"name":"anthropic","kind":"anthropic","base_url":"https://api.anthropic.com"}`)
+	if !bad.IsError {
+		t.Fatalf("expected error for anthropic without api_key: %s", bad.Content[0].Text)
+	}
+	if _, ok := registry.Get("anthropic"); ok {
+		t.Fatal("anthropic lane registered without an api_key")
+	}
+
+	// With the key the lane builds, registers and persists.
+	res := callMCPTool(t, srv, 2, "add_provider",
+		`{"name":"anthropic","kind":"anthropic","base_url":"https://api.anthropic.com","api_key":"sk-ant-test"}`)
+	if res.IsError {
+		t.Fatalf("add_provider failed: %s", res.Content[0].Text)
+	}
+	if !strings.Contains(res.Content[0].Text, `"registered": true`) {
+		t.Fatalf("add_provider response unexpected: %s", res.Content[0].Text)
+	}
+	if gotKind != "anthropic" {
+		t.Fatalf("builder kind = %q, want anthropic", gotKind)
+	}
+	if gotAPIKey != "sk-ant-test" {
+		t.Fatalf("builder api key = %q, want sk-ant-test", gotAPIKey)
+	}
+	if _, ok := registry.Get("anthropic"); !ok {
+		t.Fatal("registry does not contain the anthropic lane")
+	}
+	if store.List()["anthropic"].APIKey != "sk-ant-test" {
+		t.Fatalf("store did not persist the anthropic api key: %+v", store.List()["anthropic"])
+	}
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read providers.json: %v", err)
+	}
+	if !strings.Contains(string(onDisk), "sk-ant-test") {
+		t.Fatalf("providers.json missing the anthropic api key: %s", onDisk)
+	}
+
+	// The key is never echoed back by list_providers.
+	list := callMCPTool(t, srv, 3, "list_providers", `{}`)
+	if list.IsError || strings.Contains(list.Content[0].Text, "sk-ant-test") {
+		t.Fatalf("list_providers leaked the anthropic api key: %s", list.Content[0].Text)
+	}
+}
+
+// TestMCP_AddCustomProviderCodex covers kind=codex: no api_key is required (the
+// lane authenticates from the ultiproxy-owned credential store), and the lane
+// still registers so quota can be read.
+func TestMCP_AddCustomProviderCodex(t *testing.T) {
+	dir := t.TempDir()
+	store := newFileProviderStore(filepath.Join(dir, "providers.json"))
+	registry := provider.NewRegistry()
+
+	var gotKind, gotAPIKey string
+	srv := NewServer(registry, nil,
+		WithProviderStore(store),
+		WithCustomLaneBuilder(func(name, kind, apiKey string) (provider.Provider, error) {
+			gotKind, gotAPIKey = kind, apiKey
+			return provider.Provider{Inference: stubCustomLane{name: name}}, nil
+		}),
+	)
+
+	res := callMCPTool(t, srv, 1, "add_provider", `{"name":"codex","kind":"codex"}`)
+	if res.IsError {
+		t.Fatalf("add_provider failed: %s", res.Content[0].Text)
+	}
+	if !strings.Contains(res.Content[0].Text, `"kind": "codex"`) {
+		t.Fatalf("add_provider response unexpected: %s", res.Content[0].Text)
+	}
+	if gotKind != "codex" {
+		t.Fatalf("builder kind = %q, want codex", gotKind)
+	}
+	if gotAPIKey != "" {
+		t.Fatalf("builder api key = %q, want empty", gotAPIKey)
+	}
+	if _, ok := registry.Get("codex"); !ok {
+		t.Fatal("registry does not contain the codex lane")
 	}
 }

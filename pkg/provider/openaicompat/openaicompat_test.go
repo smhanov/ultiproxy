@@ -1026,3 +1026,62 @@ func TestOpenAICompat_StartLogin_XAIScope(t *testing.T) {
 		t.Errorf("LoginStartInfo.ExpiresIn = %d, want 600", info.ExpiresIn)
 	}
 }
+
+// TestOpenAICompat_VersionedBaseURLKeepsVersionSegment guards the z.ai lane:
+// llmhub's openaichat.EnsureV1Suffix used to append "/v1" to any base URL not
+// already ending in "/v1", which turned https://api.z.ai/api/paas/v4 into
+// .../v4/v1/chat/completions (upstream 404). A base URL that already pins a
+// version segment (/v4) must be used verbatim; a base URL with no version
+// segment still gets "/v1" appended.
+func TestOpenAICompat_VersionedBaseURLKeepsVersionSegment(t *testing.T) {
+	tests := []struct {
+		name     string
+		baseURL  string // path shape handed to Config.BaseURL (host is the fake upstream)
+		wantPath string
+	}{
+		{"zai_v4", "/api/paas/v4", "/api/paas/v4/chat/completions"},
+		{"zai_v4_trailing_slash", "/api/paas/v4/", "/api/paas/v4/chat/completions"},
+		{"other_version", "/v2", "/v2/chat/completions"},
+		{"unversioned_gets_v1", "", "/v1/chat/completions"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotPath string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id": "cmpl-versioned",
+					"choices": []map[string]any{
+						{
+							"index":         0,
+							"message":       map[string]any{"role": "assistant", "content": "ok"},
+							"finish_reason": "stop",
+						},
+					},
+				})
+			}))
+			defer server.Close()
+
+			p, err := New(Config{
+				Name:       "zai",
+				BaseURL:    server.URL + tt.baseURL,
+				APIKey:     "test-zai-key",
+				HTTPClient: server.Client(),
+			})
+			if err != nil {
+				t.Fatalf("New failed: %v", err)
+			}
+
+			if _, err := p.Generate(context.Background(), []*ir.Message{
+				{Role: "user", Blocks: []ir.Block{ir.TextBlock{Text: "hi"}}},
+			}, provider.WithModel("glm-4.6")); err != nil {
+				t.Fatalf("Generate failed: %v", err)
+			}
+			if gotPath != tt.wantPath {
+				t.Fatalf("upstream path = %q, want %q (base URL %q must not gain an extra /v1)",
+					gotPath, tt.wantPath, tt.baseURL)
+			}
+		})
+	}
+}

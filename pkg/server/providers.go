@@ -155,11 +155,12 @@ type RuntimeProviderStore struct {
 	DefaultDataDir string
 	ActorBuilder   func(openaicompat.Config) any // optional freebuff actor reconstruction hook (set by cmd)
 	// LaneBuilder constructs compile-time-wired lane kinds that are not
-	// openai-compatible (e.g. antigravity) from their stored identity. It
-	// receives the lane name, kind and the server's general DataDir and
-	// returns the provider bundle. When nil, custom kinds can be stored but
+	// openai-compatible (e.g. antigravity, anthropic, codex) from their stored
+	// identity. It receives the lane name, kind, the server's general DataDir
+	// and the lane's persisted api_key ("" for kinds that use no static key)
+	// and returns the provider bundle. When nil, custom kinds can be stored but
 	// not restored.
-	LaneBuilder func(name, kind, dataDir string) (provider.Provider, error)
+	LaneBuilder func(name, kind, dataDir, apiKey string) (provider.Provider, error)
 }
 
 // RuntimeProviderKind is the persisted provider kind discriminator.
@@ -304,11 +305,13 @@ func (s *RuntimeProviderStore) Add(cfg openaicompat.Config) error {
 	return s.persist()
 }
 
-// AddCustom stores a non-OpenAI-compatible lane (kind only), replacing any
-// existing entry with the same name, then persists. Name validation stays the
-// same; BaseURL is not required for compile-time-wired kinds. Credential
-// storage is the server's general DataDir, not a per-lane dir.
-func (s *RuntimeProviderStore) AddCustom(name, kind string) error {
+// AddCustom stores a non-OpenAI-compatible lane (kind plus, for kinds that
+// need one, the api_key), replacing any existing entry with the same name,
+// then persists. Name validation stays the same; BaseURL is not required for
+// compile-time-wired kinds. Credential storage is the server's general
+// DataDir, not a per-lane dir. apiKey is empty for kinds that authenticate
+// through a credential store instead of a static key (antigravity, codex).
+func (s *RuntimeProviderStore) AddCustom(name, kind, apiKey string) error {
 	if s == nil {
 		return errors.New("runtime provider store not configured")
 	}
@@ -327,7 +330,7 @@ func (s *RuntimeProviderStore) AddCustom(name, kind string) error {
 		s.custom = make(map[string]storedProvider)
 	}
 	delete(s.providers, name)
-	s.custom[name] = storedProvider{Kind: kind, Name: name}
+	s.custom[name] = storedProvider{Kind: kind, Name: name, APIKey: apiKey}
 	s.mu.Unlock()
 	return s.persist()
 }
@@ -441,7 +444,7 @@ func (s *RuntimeProviderStore) Restore(registry *provider.Registry) []string {
 			log.Printf("[providers] runtime %s: no LaneBuilder for kind %q — not restored", name, sp.Kind)
 			continue
 		}
-		bundle, err := laneBuilder(name, sp.Kind, s.DefaultDataDir)
+		bundle, err := laneBuilder(name, sp.Kind, s.DefaultDataDir, sp.APIKey)
 		if err != nil {
 			log.Printf("[providers] runtime %s: %v", name, err)
 			continue

@@ -19,7 +19,7 @@ type Server struct {
 	aliases           AliasManager
 	timeouts          TimeoutManager
 	providers         ProviderStore
-	customLaneBuilder func(name, kind string) (provider.Provider, error)
+	customLaneBuilder func(name, kind, apiKey string) (provider.Provider, error)
 	name              string
 	version           string
 	mu                sync.RWMutex
@@ -59,10 +59,12 @@ func WithProviderStore(ps ProviderStore) Option {
 }
 
 // WithCustomLaneBuilder configures construction of runtime-registered lanes
-// that are not OpenAI-compatible (e.g. antigravity). It receives the lane name
-// and kind and returns the provider bundle. Called by add_provider when kind
-// is not the default. Credential storage uses the server's general DataDir.
-func WithCustomLaneBuilder(builder func(name, kind string) (provider.Provider, error)) Option {
+// that are not OpenAI-compatible (e.g. antigravity, anthropic, codex). It
+// receives the lane name, kind and the lane's api_key ("" for kinds that use a
+// credential store instead) and returns the provider bundle. Called by
+// add_provider when kind is not the default. Credential storage uses the
+// server's general DataDir.
+func WithCustomLaneBuilder(builder func(name, kind, apiKey string) (provider.Provider, error)) Option {
 	return func(s *Server) {
 		s.customLaneBuilder = builder
 	}

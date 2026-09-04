@@ -28,8 +28,8 @@ type Server struct {
 	timeouts  *TimeoutManager
 	providers *RuntimeProviderStore
 	// mcpLaneBuilder bridges the runtime store's LaneBuilder into the MCP
-	// add_provider custom-kind path (antigravity).
-	mcpLaneBuilder func(name, kind string) (provider.Provider, error)
+	// add_provider custom-kind path (antigravity, anthropic, codex).
+	mcpLaneBuilder func(name, kind, apiKey string) (provider.Provider, error)
 	httpServer     *http.Server
 	mux            *http.ServeMux
 }
@@ -112,13 +112,14 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 	if s.providers.DefaultDataDir == "" {
 		s.providers.DefaultDataDir = cfg.DataDir
 	}
-	// Wire the custom-lane builder (antigravity etc.) into MCP add_provider /
-	// restore. The store's LaneBuilder and the MCP custom builder both come
-	// from the same constructor; the router/catalog resolve lanes after this.
+	// Wire the custom-lane builder (antigravity, anthropic, codex, ...) into
+	// MCP add_provider / restore. The store's LaneBuilder and the MCP custom
+	// builder both come from the same constructor; the router/catalog resolve
+	// lanes after this.
 	if s.providers.LaneBuilder != nil {
 		laneBuilder := s.providers.LaneBuilder
-		s.mcpLaneBuilder = func(name, kind string) (provider.Provider, error) {
-			return laneBuilder(name, kind, s.providers.DefaultDataDir)
+		s.mcpLaneBuilder = func(name, kind, apiKey string) (provider.Provider, error) {
+			return laneBuilder(name, kind, s.providers.DefaultDataDir, apiKey)
 		}
 	}
 	s.providers.Restore(registry)

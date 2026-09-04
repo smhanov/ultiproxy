@@ -198,3 +198,82 @@ func TestRuntimeProviderRestoreAcrossRestart(t *testing.T) {
 		t.Fatalf("restored lane is not an inference provider: %+v", p)
 	}
 }
+
+// laneBuilderCall records one invocation of RuntimeProviderStore.LaneBuilder.
+type laneBuilderCall struct {
+	name, kind, dataDir, apiKey string
+}
+
+// TestRuntimeProviderStore_CustomLaneAPIKeyAcrossRestart covers the custom-lane
+// plumbing for key-authenticated kinds (anthropic): AddCustom persists the
+// api_key and Restore hands name, kind, DataDir and the key to LaneBuilder so
+// the lane rebuilds identically after a restart.
+func TestRuntimeProviderStore_CustomLaneAPIKeyAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.json")
+
+	var calls []laneBuilderCall
+	laneBuilder := func(name, kind, dataDir, apiKey string) (provider.Provider, error) {
+		calls = append(calls, laneBuilderCall{name: name, kind: kind, dataDir: dataDir, apiKey: apiKey})
+		return provider.Provider{Inference: &fakeInferenceProvider{name: name}}, nil
+	}
+	byKind := func() map[string]laneBuilderCall {
+		out := map[string]laneBuilderCall{}
+		for _, c := range calls {
+			out[c.kind] = c
+		}
+		return out
+	}
+
+	s1 := NewRuntimeProviderStore(path)
+	s1.DefaultDataDir = dir
+	s1.LaneBuilder = laneBuilder
+	if err := s1.AddCustom("anthropic", "anthropic", "sk-ant-test"); err != nil {
+		t.Fatalf("AddCustom anthropic: %v", err)
+	}
+	if err := s1.AddCustom("codex", "codex", ""); err != nil {
+		t.Fatalf("AddCustom codex: %v", err)
+	}
+
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read providers.json: %v", err)
+	}
+	if !strings.Contains(string(onDisk), "sk-ant-test") || !strings.Contains(string(onDisk), `"kind": "anthropic"`) {
+		t.Fatalf("providers.json missing the anthropic key/kind: %s", onDisk)
+	}
+
+	registry := provider.NewRegistry()
+	if got := s1.Restore(registry); len(got) != 2 {
+		t.Fatalf("Restore registered %v, want [anthropic codex]", got)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("LaneBuilder called %d times, want 2: %+v", len(calls), calls)
+	}
+	if c := byKind()["anthropic"]; c.apiKey != "sk-ant-test" || c.dataDir != dir || c.name != "anthropic" {
+		t.Fatalf("anthropic LaneBuilder call unexpected: %+v", c)
+	}
+	if c := byKind()["codex"]; c.apiKey != "" || c.name != "codex" {
+		t.Fatalf("codex LaneBuilder call unexpected: %+v", c)
+	}
+
+	// Restart: a fresh store over the same file rebuilds the lanes with the
+	// persisted key.
+	s2 := NewRuntimeProviderStore(path)
+	s2.DefaultDataDir = dir
+	s2.LaneBuilder = laneBuilder
+	calls = nil
+	registry2 := provider.NewRegistry()
+	if got := s2.Restore(registry2); len(got) != 2 {
+		t.Fatalf("second Restore registered %v, want [anthropic codex]", got)
+	}
+	if c := byKind()["anthropic"]; c.apiKey != "sk-ant-test" {
+		t.Fatalf("anthropic key not restored: %+v", c)
+	}
+	if _, ok := registry2.Get("anthropic"); !ok {
+		t.Fatal("anthropic lane not registered after restart")
+	}
+	if _, ok := registry2.Get("codex"); !ok {
+		t.Fatal("codex lane not registered after restart")
+	}
+}

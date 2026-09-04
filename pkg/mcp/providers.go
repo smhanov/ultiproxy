@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 )
@@ -15,11 +16,13 @@ import (
 type ProviderStore interface {
 	// Add validates + stores a lane config and persists it (providers.json).
 	Add(cfg openaicompat.Config) error
-	// AddCustom stores a non-OpenAI-compatible lane (kind only) and persists
-	// it. Used for antigravity-like compile-time-wired lanes that the store can
-	// hold but only the server's LaneBuilder can reconstruct. Storage lives in
-	// the server's general DataDir — lanes never carry their own data dir.
-	AddCustom(name, kind string) error
+	// AddCustom stores a non-OpenAI-compatible lane (kind, plus the api_key
+	// for kinds that need a static key) and persists it. Used for
+	// antigravity-like compile-time-wired lanes that the store can hold but
+	// only the server's LaneBuilder can reconstruct. Storage lives in the
+	// server's general DataDir — lanes never carry their own data dir. apiKey
+	// is empty for kinds that authenticate through a credential store instead.
+	AddCustom(name, kind, apiKey string) error
 	// Remove deletes a persisted lane.
 	Remove(name string) error
 	// List returns the stored lane configs keyed by lane name.
@@ -45,7 +48,7 @@ type providerQuirksArgs struct {
 
 type addProviderArgs struct {
 	Name    string             `json:"name"`
-	Kind    string             `json:"kind"` // "" or "openaicompat" | "antigravity"
+	Kind    string             `json:"kind"` // "" or "openaicompat" | "antigravity" | "anthropic" | "codex"
 	BaseURL string             `json:"base_url"`
 	APIKey  string             `json:"api_key"`
 	Quirks  providerQuirksArgs `json:"quirks"`
@@ -99,8 +102,8 @@ func (s *Server) toolAddProvider(ctx context.Context, argsRaw json.RawMessage) (
 	if args.Name == "" {
 		return toolError("name is required"), nil
 	}
-	// Custom-wire lanes (antigravity) do not carry base_url; route them to the
-	// injected builder before the openai-compat path.
+	// Custom-wire lanes (antigravity, anthropic, codex) do not go through the
+	// openai-compat path; route them to the injected builder instead.
 	if args.Kind != "" && args.Kind != "openaicompat" {
 		return s.toolAddCustomProvider(ctx, args)
 	}
@@ -132,22 +135,42 @@ func (s *Server) toolAddProvider(ctx context.Context, argsRaw json.RawMessage) (
 	}), nil
 }
 
+// customProviderKindsRequireAPIKey lists custom lane kinds whose upstream
+// authenticates with a static API key handed in through the add_provider call;
+// every other custom kind uses the ultiproxy-owned credential store instead.
+var customProviderKindsRequireAPIKey = map[string]bool{
+	"anthropic": true,
+}
+
+// validateCustomProviderArgs enforces the per-kind requirements of custom
+// lanes before the lane is built or persisted.
+func validateCustomProviderArgs(args addProviderArgs) error {
+	if customProviderKindsRequireAPIKey[args.Kind] && strings.TrimSpace(args.APIKey) == "" {
+		return fmt.Errorf("kind %q requires api_key", args.Kind)
+	}
+	return nil
+}
+
 // toolAddCustomProvider registers a runtime lane that is not
-// OpenAI-compatible (kind=antigravity) via the injected builder. The lane
-// persists in providers.json alongside openai-compatible lanes; the original
-// DataDir is stored so the builder can reconstruct auth state on restart.
+// OpenAI-compatible (kind=antigravity, anthropic, codex) via the injected
+// builder. The lane persists in providers.json alongside openai-compatible
+// lanes; the api_key of key-authenticated kinds (anthropic) is persisted too,
+// so the builder can reconstruct the lane after a restart.
 func (s *Server) toolAddCustomProvider(ctx context.Context, args addProviderArgs) (*CallToolResult, *JSONRPCError) {
 	if args.Name == "" {
 		return toolError("name is required"), nil
 	}
+	if err := validateCustomProviderArgs(args); err != nil {
+		return toolError("%v", err), nil
+	}
 	if s.customLaneBuilder == nil {
 		return toolError("custom lanes (kind=%q) are not wired on this server", args.Kind), nil
 	}
-	bundle, err := s.customLaneBuilder(args.Name, args.Kind)
+	bundle, err := s.customLaneBuilder(args.Name, args.Kind, args.APIKey)
 	if err != nil {
 		return toolError("provider %q failed to build: %v", args.Name, err), nil
 	}
-	if err := s.providers.AddCustom(args.Name, args.Kind); err != nil {
+	if err := s.providers.AddCustom(args.Name, args.Kind, args.APIKey); err != nil {
 		return toolError("%v", err), nil
 	}
 	if s.registry != nil {
