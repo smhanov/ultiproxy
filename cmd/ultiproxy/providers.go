@@ -12,6 +12,7 @@ import (
 
 	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/provider"
+	"github.com/smhanov/ultiproxy/pkg/provider/anthropichub"
 	"github.com/smhanov/ultiproxy/pkg/provider/antigravity"
 	"github.com/smhanov/ultiproxy/pkg/provider/augure"
 	"github.com/smhanov/ultiproxy/pkg/provider/codex"
@@ -165,6 +166,15 @@ func registerProviders(registry *provider.Registry) {
 			add("deepseek", p.Provider())
 		} else {
 			log.Printf("[providers] deepseek: %v", err)
+		}
+	}
+
+	// Anthropic (first-party API) — via llmhub, opt-in by env key.
+	if key := firstEnv("ULTIPROXY_ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY"); key != "" {
+		if p, err := anthropichub.New(anthropichub.Config{APIKey: key}); err == nil {
+			add("anthropic", p.Provider())
+		} else {
+			log.Printf("[providers] anthropic: %v", err)
 		}
 	}
 
