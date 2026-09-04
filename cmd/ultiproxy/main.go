@@ -85,9 +85,18 @@ func runServe(configPath, dataDir string) {
 
 	registerProviders(registry)
 
+	// Runtime-registered lanes (MCP add_provider) persist to
+	// <data_dir>/providers.json and must be loaded BEFORE the router / model
+	// catalog resolve provider names, so a restart from the same DataDir
+	// restores them without any config file.
+	providerStore := server.NewRuntimeProviderStore(filepath.Join(cfg.DataDir, "providers.json"))
+	providerStore.ActorBuilder = runtimeFreebuffActorBuilder(cfg.DataDir)
+	providerStore.Restore(registry)
+
 	srv := server.NewServer(cfg, registry,
 		server.WithStateManager(stateManager),
 		server.WithStorageWriter(writer),
+		server.WithRuntimeProviderStore(providerStore),
 	)
 
 	stop := make(chan os.Signal, 1)

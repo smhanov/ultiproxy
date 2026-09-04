@@ -851,17 +851,11 @@ func TestOpenAICompat_Login_ErrNotImplemented(t *testing.T) {
 
 func TestOpenAICompat_Login_Freebuff(t *testing.T) {
 	tempDir := t.TempDir()
-	manicodeFile := filepath.Join(tempDir, "credentials.json")
-	credentialsData := `{"default": {"id": "user-1", "email": "test@example.com", "authToken": "secret-freebuff-tok"}}`
-	if err := os.WriteFile(manicodeFile, []byte(credentialsData), 0600); err != nil {
-		t.Fatalf("write credentials.json: %v", err)
-	}
-
-	t.Setenv("ULTIPROXY_MANICODE_CREDENTIALS", manicodeFile)
 
 	actor := &fakeActor{instanceID: "fb-inst-007"}
 	p, err := New(Config{
 		BaseURL:    "https://codebuff.invalid",
+		APIKey:     "secret-freebuff-tok",
 		DataDir:    tempDir,
 		HTTPClient: http.DefaultClient,
 		Quirks: Quirks{

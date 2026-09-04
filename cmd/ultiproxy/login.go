@@ -72,7 +72,7 @@ func runLogin(providerName, dataDir string) {
 		if p == nil {
 			log.Fatalf("antigravity: could not create credential store under %s", dataDir)
 		}
-		fmt.Fprintln(os.Stderr, "Ultiproxy Antigravity login (does not use cliproxy).")
+		fmt.Fprintln(os.Stderr, "Ultiproxy Antigravity login (ultiproxy-owned Google OAuth).")
 		if err := p.Login(ctx); err != nil {
 			log.Fatalf("antigravity login failed: %v", err)
 		}
@@ -136,11 +136,11 @@ func runLogin(providerName, dataDir string) {
 		if err != nil {
 			log.Fatalf("freebuff: %v", err)
 		}
-		fmt.Fprintln(os.Stderr, "Ultiproxy Freebuff login (imports ~/.config/manicode/credentials.json).")
+		fmt.Fprintln(os.Stderr, "Ultiproxy Freebuff login (token from ULTIPROXY_FREEBUFF_TOKEN / FREEBUFF_TOKEN env).")
 		if err := p.Login(ctx); err != nil {
 			log.Fatalf("freebuff login failed: %v", err)
 		}
-		fmt.Fprintln(os.Stderr, "Imported Freebuff CLI token. Restart ultiproxy serve to use it.")
+		fmt.Fprintln(os.Stderr, "Freebuff token persisted to ultiproxy state. Restart ultiproxy serve to use it.")
 	default:
 		fmt.Fprintf(os.Stderr, "unknown login provider %q (available: antigravity, xai, codex, freebuff)\n", providerName)
 		os.Exit(1)

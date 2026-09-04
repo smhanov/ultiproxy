@@ -646,8 +646,8 @@ func (p *Provider) Quota(ctx context.Context) (*provider.QuotaSnapshot, error) {
 // Quirk-routed (ported from the pre-F2 xai and freebuff lanes):
 //   - AuthViaOAuthManager: xai device-OAuth flow (RequestDeviceCode -> PollToken ->
 //     persist via auth.Manager under DataDir so Token() can serve it later).
-//   - FreebuffActor != nil: import the Codebuff CLI token from
-//     ~/.config/manicode/credentials.json and push it into the actor.
+//   - FreebuffActor != nil: persist the configured/web token (env or api_key)
+//     into ultraproxy state and push it into the actor.
 //   - otherwise: provider.ErrNotImplemented (plain openai endpoint needs no login).
 func (p *Provider) Login(ctx context.Context) error {
 	if p.cfg.Quirks.AuthViaOAuthManager {
@@ -714,13 +714,20 @@ func (p *Provider) loginXAI(ctx context.Context) error {
 	return nil
 }
 
-// loginFreebuff imports the Codebuff CLI token and pushes it into the actor
-// and persists the token + instance id into dataDir (ported from
-// freebuff Provider.Login).
+// loginFreebuff persists the freebuff token from the provider's own
+// configuration (APIKey set via env, MCP add_provider, or an explicit token)
+// into ultiproxy state, then pushes it into the actor. It never reads an
+// external CLI credential store.
 func (p *Provider) loginFreebuff(ctx context.Context) error {
-	tok, _, _, err := ReadCLIToken()
-	if err != nil {
-		return err
+	tok := p.cfg.APIKey
+	if tok == "" {
+		tok = os.Getenv("ULTIPROXY_FREEBUFF_TOKEN")
+	}
+	if tok == "" {
+		tok = os.Getenv("FREEBUFF_TOKEN")
+	}
+	if tok == "" {
+		return errors.New("freebuff: no token configured — set ULTIPROXY_FREEBUFF_TOKEN or pass api_key to add_provider")
 	}
 	if setter, ok := p.cfg.Quirks.FreebuffActor.(freebuffTokenSetter); ok {
 		setter.SetToken(tok)
@@ -737,62 +744,8 @@ func (p *Provider) loginFreebuff(ctx context.Context) error {
 		if err := os.WriteFile(tokenFile, []byte(tok+"\n"), 0600); err != nil {
 			return fmt.Errorf("freebuff: persist token: %w", err)
 		}
-		instanceIDFile := filepath.Join(dataDir, "freebuff_instance_id")
-		var instanceID string
-		if ider, ok := p.cfg.Quirks.FreebuffActor.(freebuffInstanceIDer); ok {
-			instanceID = ider.InstanceID()
-		}
-		if instanceID == "" {
-			if data, err := os.ReadFile(instanceIDFile); err == nil {
-				instanceID = strings.TrimSpace(string(data))
-			}
-		}
-		if strings.HasPrefix(instanceID, "fb-inst-") {
-			instanceID = ""
-		}
-		if instanceID != "" {
-			_ = os.WriteFile(instanceIDFile, []byte(instanceID+"\n"), 0600)
-		}
 	}
 	return nil
-}
-
-// ReadCLIToken loads the Codebuff / Freebuff CLI auth token from
-// ~/.config/manicode/credentials.json (ported verbatim from
-// freebuff). Never prints the token.
-func ReadCLIToken() (token, email, userID string, err error) {
-	data, err := os.ReadFile(manicodeCredentialsPath())
-	if err != nil {
-		return "", "", "", fmt.Errorf("freebuff: CLI credentials not found (%s): %w — run `freebuff` and sign in first", manicodeCredentialsPath(), err)
-	}
-	var parsed map[string]struct {
-		ID        string `json:"id"`
-		Email     string `json:"email"`
-		AuthToken string `json:"authToken"`
-	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", "", "", fmt.Errorf("freebuff: parse CLI credentials: %w", err)
-	}
-	entry, ok := parsed["default"]
-	if !ok {
-		for _, v := range parsed {
-			entry = v
-			ok = true
-			break
-		}
-	}
-	if !ok || entry.AuthToken == "" {
-		return "", "", "", fmt.Errorf("freebuff: no authToken in CLI credentials")
-	}
-	return entry.AuthToken, entry.Email, entry.ID, nil
-}
-
-func manicodeCredentialsPath() string {
-	if p := os.Getenv("ULTIPROXY_MANICODE_CREDENTIALS"); p != "" {
-		return p
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "manicode", "credentials.json")
 }
 
 // Token implements provider.AuthProvider.

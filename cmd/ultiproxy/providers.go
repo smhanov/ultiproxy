@@ -6,10 +6,8 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/provider"
@@ -95,64 +93,6 @@ func readJSONField(path string, fields ...string) (string, bool) {
 	return s, true
 }
 
-// readNestedToken walks a JSON file: try the exact field path first; if that
-// fails, return the "access_token" field of the first dict value that has one.
-// This handles files where credentials are nested under an opaque scope key
-// (e.g. ~/.grok/auth.json keyed by OAuth scope).
-func readNestedToken(path string, fields ...string) (string, bool) {
-	if tok, ok := readJSONField(path, fields...); ok {
-		return tok, true
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", false
-	}
-	var m map[string]any
-	if err := json.Unmarshal(data, &m); err != nil {
-		return "", false
-	}
-	for _, v := range m {
-		if entry, ok := v.(map[string]any); ok {
-			if tok, ok := entry["access_token"].(string); ok && tok != "" {
-				return tok, true
-			}
-			if tok, ok := entry["key"].(string); ok && tok != "" {
-				return tok, true
-			}
-		}
-	}
-	if tok, ok := m["access_token"].(string); ok && tok != "" {
-		return tok, true
-	}
-	return "", false
-}
-
-// execGhAuthToken shells out to `gh auth token` (best effort, 8s timeout).
-func execGhAuthToken() (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "gh", "auth", "token").Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-// envFile reads a KEY=value pair from one or more dotenv files.
-func envFile(envFile, key string) string {
-	data, err := os.ReadFile(envFile)
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, key+"=") {
-			return strings.Trim(strings.TrimPrefix(line, key+"="), `"'`)
-		}
-	}
-	return ""
-}
-
 // firstEnv returns the first non-empty environment variable.
 func firstEnv(keys ...string) string {
 	for _, k := range keys {
@@ -177,7 +117,7 @@ func managerHasToken(mgr *auth.Manager, key string) bool {
 
 // registerProviders wires upstream adapters into the registry. Registration is
 // opt-in per provider and driven by environment variables OR ultiproxy-owned
-// credential stores. Antigravity never reads ~/.cli-proxy-api.
+// credential stores. Antigravity never reads external CLI credential stores.
 func registerProviders(registry *provider.Registry) {
 	home, _ := os.UserHomeDir()
 	stateDir := firstEnv("ULTIPROXY_DATA_DIR", "ULTIPROXY_STATE_DIR")
@@ -269,30 +209,12 @@ func registerProviders(registry *provider.Registry) {
 		}
 	}
 
-	// OpenCode Go — workspace id + session cookie (from dashboard .env) + API key (from opencode.json).
+	// OpenCode Go — env only (ultiproxy self-contained): API key, workspace id,
+	// session cookie all come from env; no external CLI config reads.
 	ocKey := firstEnv("OPENCODE_API_KEY", "ULTIPROXY_OPENCODE_API_KEY")
-	if ocKey == "" {
-		if k, ok := readNestedToken(filepath.Join(home, ".config", "opencode", "opencode.json"), "provider", "opencode-go", "options", "apiKey"); ok {
-			ocKey = k
-		}
-	}
-	if ocKey == "" {
-		// check old backup files if opencode.json was overwritten
-		matches, _ := filepath.Glob(filepath.Join(home, ".config", "opencode", "opencode.json.bak-*"))
-		for _, m := range matches {
-			if k, ok := readNestedToken(m, "provider", "opencode-go", "options", "apiKey"); ok && k != "" {
-				ocKey = k
-				break
-			}
-		}
-	}
 
 	ocWorkspace := firstEnv("OPENCODE_WORKSPACE_ID", "ULTIPROXY_OPENCODE_WORKSPACE")
 	ocCookie := firstEnv("OPENCODE_SESSION_COOKIE", "ULTIPROXY_OPENCODE_COOKIE")
-	if ocWorkspace == "" {
-		ocWorkspace = envFile(filepath.Join(home, "ai-quota-dashboard", ".env"), "OPENCODE_WORKSPACE_ID")
-		ocCookie = envFile(filepath.Join(home, "ai-quota-dashboard", ".env"), "OPENCODE_SESSION_COOKIE")
-	}
 	if ocKey != "" || (ocWorkspace != "" && ocCookie != "") {
 		if p, err := openaicompat.New(openaicompat.Config{
 			Name:          "opencode",
@@ -310,14 +232,24 @@ func registerProviders(registry *provider.Registry) {
 		}
 	}
 
-	// Augure AI — Supabase OAuth tokens in ~/.augure.
-	authFile := filepath.Join(home, ".augure", "augure-auth.json")
-	if _, err := os.Stat(authFile); err == nil {
+	// Augure AI — ultiproxy-owned token file (stateDir/augure_token) or env only.
+	// No ~/.augure reads; login writes the token into ultiproxy state.
+	augTok := firstEnv("ULTIPROXY_AUGURE_TOKEN", "AUGURE_TOKEN")
+	augTokenFile := filepath.Join(stateDir, "augure_token")
+	if augTok == "" {
+		if data, err := os.ReadFile(augTokenFile); err == nil {
+			augTok = strings.TrimSpace(string(data))
+		}
+	}
+	if augTok != "" {
+		_ = os.MkdirAll(stateDir, 0755)
+		_ = os.WriteFile(augTokenFile, []byte(augTok+"\n"), 0600)
 		if p, err := openaicompat.New(openaicompat.Config{
 			Name:      "augure",
 			BaseURL:   "https://api.augureai.ca/v1",
-			TokenFile: authFile,
-			DataDir:   filepath.Dir(authFile),
+			APIKey:    augTok,
+			TokenFile: augTokenFile,
+			DataDir:   stateDir,
 			Quirks: openaicompat.Quirks{
 				AuthViaSupabaseRefresh: true,
 				DefaultModel:           "tofino-3",
@@ -360,19 +292,6 @@ func registerProviders(registry *provider.Registry) {
 			} else {
 				log.Printf("[providers] xai: %v", err)
 			}
-		} else if tok, ok := readNestedToken(filepath.Join(home, ".grok", "auth.json")); ok {
-			if p, err := openaicompat.New(openaicompat.Config{
-				Name:    "xai",
-				BaseURL: xaiDefaultBaseURL,
-				APIKey:  tok,
-				Quirks: openaicompat.Quirks{
-					CreditsQuotaObserver: xaiDefaultBillingURL,
-				},
-			}); err == nil {
-				add("xai", p.Provider())
-			} else {
-				log.Printf("[providers] xai: %v", err)
-			}
 		} else if mgrErr == nil {
 			if p, err := openaicompat.New(openaicompat.Config{
 				Name:    "xai",
@@ -390,7 +309,7 @@ func registerProviders(registry *provider.Registry) {
 		}
 	}
 
-	// Codex — ultiproxy-owned credentials first; env, then ~/.codex (Codex CLI).
+	// Codex — ultiproxy-owned credentials or env token only (no ~/.codex reads).
 	{
 		credDir := filepath.Join(stateDir, "credentials", "codex")
 		mgr, mgrErr := newOAuthManager(credDir)
@@ -400,69 +319,33 @@ func registerProviders(registry *provider.Registry) {
 		} else if tok := firstEnv("ULTIPROXY_CODEX_TOKEN"); tok != "" {
 			p := codex.New(codex.Config{StaticToken: tok})
 			add("codex", p.ProviderBundle())
-		} else if tok, ok := readJSONField(filepath.Join(home, ".codex", "auth.json"), "tokens", "access_token"); ok {
-			p := codex.New(codex.Config{StaticToken: tok})
-			add("codex", p.ProviderBundle())
-		} else if tok, ok := readJSONField(filepath.Join(home, ".codex", "auth.json"), "access_token"); ok {
-			p := codex.New(codex.Config{StaticToken: tok})
-			add("codex", p.ProviderBundle())
 		} else if mgrErr == nil {
 			p := codex.New(codex.Config{AuthManager: mgr, ClientID: codex.DefaultClientID})
 			add("codex", p.ProviderBundle())
 		}
 	}
 
-	// Antigravity — ultiproxy-owned OAuth only. Never read ~/.cli-proxy-api.
+	// Antigravity — ultiproxy-owned OAuth only.
 	if p := antigravity.NewFromState(home, stateDir, nil); p != nil {
 		add("antigravity", p.ProviderBundle())
 	}
 
-	// Copilot — env, gh auth token, or gh CLI output.
+	// Copilot — env token only (ultiproxy self-contained; no gh CLI shell-out).
 	copTok := firstEnv("ULTIPROXY_COPILOT_TOKEN", "COPILOT_GITHUB_TOKEN", "GH_TOKEN")
-	if copTok == "" {
-		if out, err := execGhAuthToken(); err == nil && out != "" {
-			copTok = out
-		}
-	}
 	if copTok != "" {
 		p := copilot.New(copilot.Config{Token: copTok})
 		add("copilot", p.ProviderBundle())
 	}
 
-	// Freebuff — CLI credentials (~/.config/manicode/credentials.json), then env.
-	// Never reads ~/workspace/freebuff-proxy/.env.
-	fbTok := firstEnv("ULTIPROXY_FREEBUFF_TOKEN", "FREEBUFF_TOKEN")
-	if fbTok == "" && stateDir != "" {
-		if data, err := os.ReadFile(filepath.Join(stateDir, "freebuff_token")); err == nil {
-			fbTok = strings.TrimSpace(string(data))
-		}
-	}
-	if fbTok == "" {
-		if tok, _, _, err := openaicompat.ReadCLIToken(); err == nil {
-			fbTok = tok
-		}
-	}
+	// Freebuff: env or ultiproxy-owned state token only (self-contained).
+	fbTok := freebuffToken(stateDir)
 	if fbTok != "" {
 		if err := os.MkdirAll(stateDir, 0755); err != nil {
 			log.Printf("[providers] freebuff: %v", err)
 		} else {
-			instanceIDFile := filepath.Join(stateDir, "freebuff_instance_id")
-			instanceID := ""
-			if data, err := os.ReadFile(instanceIDFile); err == nil {
-				instanceID = strings.TrimSpace(string(data))
-			}
-			if strings.HasPrefix(instanceID, "fb-inst-") {
-				instanceID = ""
-			}
-			fbActor, err := spikesfreebuff.NewFreebuffAccountActor(
-				"",
-				http.DefaultClient,
-				fbTok,
-				spikesfreebuff.WithBaseURL("https://www.codebuff.com/api/v1"),
-				spikesfreebuff.WithInstanceID(instanceID),
-			)
-			if err != nil {
-				log.Printf("[providers] freebuff: %v", err)
+			fbActor := newFreebuffActor(stateDir)
+			if fbActor == nil {
+				log.Printf("[providers] freebuff: actor unavailable")
 			} else {
 				if p, err := openaicompat.New(openaicompat.Config{
 					Name:    "freebuff",
@@ -470,7 +353,7 @@ func registerProviders(registry *provider.Registry) {
 					APIKey:  fbTok,
 					DataDir: stateDir,
 					Quirks: openaicompat.Quirks{
-						FreebuffActor:       &freebuffActorAdapter{actor: fbActor},
+						FreebuffActor:       fbActor,
 						FreebuffDefaultTool: true,
 					},
 				}); err == nil {
@@ -480,5 +363,65 @@ func registerProviders(registry *provider.Registry) {
 				}
 			}
 		}
+	}
+}
+
+// freebuffToken discovers the Codebuff/Freebuff token from ultiproxy-owned
+// sources only: env, then the state-dir token file. Never reads an external
+// CLI store.
+func freebuffToken(stateDir string) string {
+	if tok := firstEnv("ULTIPROXY_FREEBUFF_TOKEN", "FREEBUFF_TOKEN"); tok != "" {
+		return tok
+	}
+	if stateDir != "" {
+		if data, err := os.ReadFile(filepath.Join(stateDir, "freebuff_token")); err == nil {
+			if tok := strings.TrimSpace(string(data)); tok != "" {
+				return tok
+			}
+		}
+	}
+	return ""
+}
+
+// newFreebuffActor builds the serialized-request actor for a freebuff lane,
+// reusing the persisted instance id (if any). It returns nil when no token is
+// available. Used by the compile-time lane above and by the runtime provider
+// store hook (providers.json quirks.freebuff_actor=true).
+func newFreebuffActor(stateDir string) any {
+	fbTok := freebuffToken(stateDir)
+	if fbTok == "" {
+		return nil
+	}
+	instanceID := ""
+	if data, err := os.ReadFile(filepath.Join(stateDir, "freebuff_instance_id")); err == nil {
+		instanceID = strings.TrimSpace(string(data))
+	}
+	if strings.HasPrefix(instanceID, "fb-inst-") {
+		instanceID = ""
+	}
+	fbActor, err := spikesfreebuff.NewFreebuffAccountActor(
+		"",
+		http.DefaultClient,
+		fbTok,
+		spikesfreebuff.WithBaseURL("https://www.codebuff.com/api/v1"),
+		spikesfreebuff.WithInstanceID(instanceID),
+	)
+	if err != nil {
+		log.Printf("[providers] freebuff actor: %v", err)
+		return nil
+	}
+	return &freebuffActorAdapter{actor: fbActor}
+}
+
+// runtimeFreebuffActorBuilder adapts newFreebuffActor to the runtime provider
+// store hook: the lane's own DataDir wins, otherwise fall back to the daemon
+// state dir.
+func runtimeFreebuffActorBuilder(fallbackStateDir string) func(openaicompat.Config) any {
+	return func(cfg openaicompat.Config) any {
+		dir := cfg.DataDir
+		if dir == "" {
+			dir = fallbackStateDir
+		}
+		return newFreebuffActor(dir)
 	}
 }
