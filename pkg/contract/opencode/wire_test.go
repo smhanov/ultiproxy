@@ -401,3 +401,72 @@ func TestWire_QuirksUnsetByDefault(t *testing.T) {
 		t.Errorf("expected max_tokens to pass through as 512, got %d", rec.MaxTokens)
 	}
 }
+
+// TestWire_ImageInputPassthrough verifies that multipart content containing
+// image_url parts (data URLs and http URLs) translates cleanly through the IR
+// and hublane bridge to the upstream request.
+func TestWire_ImageInputPassthrough(t *testing.T) {
+	h, _ := newWireHarness(t, "vision")
+
+	dataURL := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+	httpURL := "https://example.com/photo.jpg"
+
+	rec := postChatAndRecord(t, h, map[string]any{
+		"model": "vision/qwen-vl",
+		"messages": []map[string]any{
+			{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "text", "text": "Describe these images"},
+					map[string]any{"type": "image_url", "image_url": map[string]any{"url": dataURL, "detail": "high"}},
+					map[string]any{"type": "image_url", "image_url": httpURL},
+				},
+			},
+		},
+	})
+
+	if len(rec.Messages) != 1 {
+		t.Fatalf("expected 1 upstream message, got %d", len(rec.Messages))
+	}
+
+	msg := rec.Messages[0]
+	if msg.Role != "user" {
+		t.Errorf("expected role 'user', got %q", msg.Role)
+	}
+
+	// In upstream JSON, content should be an array of parts
+	parts, ok := msg.Content.([]any)
+	if !ok {
+		t.Fatalf("expected []any content for multimodal message, got %T: %v", msg.Content, msg.Content)
+	}
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 content parts, got %d: %v", len(parts), parts)
+	}
+
+	// Part 0: text
+	p0, ok := parts[0].(map[string]any)
+	if !ok || p0["type"] != "text" || p0["text"] != "Describe these images" {
+		t.Errorf("unexpected part 0: %v", parts[0])
+	}
+
+	// Part 1: image_url (data URL, detail high)
+	p1, ok := parts[1].(map[string]any)
+	if !ok || p1["type"] != "image_url" {
+		t.Fatalf("unexpected part 1 type: %v", parts[1])
+	}
+	iu1, ok := p1["image_url"].(map[string]any)
+	if !ok || iu1["url"] != dataURL || iu1["detail"] != "high" {
+		t.Errorf("unexpected part 1 image_url: %v", p1["image_url"])
+	}
+
+	// Part 2: image_url (http URL)
+	p2, ok := parts[2].(map[string]any)
+	if !ok || p2["type"] != "image_url" {
+		t.Fatalf("unexpected part 2 type: %v", parts[2])
+	}
+	iu2, ok := p2["image_url"].(map[string]any)
+	if !ok || iu2["url"] != httpURL {
+		t.Errorf("unexpected part 2 image_url: %v", p2["image_url"])
+	}
+}
+
