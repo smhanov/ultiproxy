@@ -22,7 +22,7 @@ Yet every time you spin up an autonomous coding agent—[OpenCode](https://openc
 **The solution:** **Ultiproxy** pools all your subscriptions into **ONE local endpoint at `:9050`** that natively speaks both OpenAI (`POST /v1/chat/completions`) and Anthropic (`POST /v1/messages`).
 
 - **Zero-Marginal-Cost Pooling**: Run agents 24/7 on your flat subscriptions. Stop paying per-token API bills for workloads you've already paid for.
-- **Quota-Aware Intelligent Routing**: When Copilot exhausts its 5-hour rate window, Ultiproxy instantly cascades traffic to Google Antigravity, Codex, or DeepSeek without dropping agent context.
+- **Quota Monitoring**: live per-provider quota windows and credit state via the MCP get_quota_status tool, /api/quota dashboard, and quota.txt — operators decide routing; the proxy never reroutes on quota by itself.
 - **Native Embedded MCP Server**: AI agents can inspect `/mcp` directly to query live quotas, list model readiness, and toggle routing providers dynamically.
 - **Per-API-Key Accounting**: Issue scoped keys (`sk-up-agent-a`, `sk-up-ci-worker`) with granular tracking of prompt tokens, completion tokens, cached tokens, and estimated cost savings.
 - **Reasoning & Tool Passthrough**: Flawless streaming support for thinking tokens (`reasoning_content` in o1/DeepSeek-R1), tool calls, and multi-image vision inputs.

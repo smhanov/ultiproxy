@@ -124,7 +124,7 @@
 
     <!-- Description Details -->
     <text x="2" y="260" class="sans" font-size="14.5" fill="#94a3b8" letter-spacing="0.3">
-      Zero-marginal-cost pooling • Quota-aware routing • Embedded MCP server • Single OpenAI/Anthropic spec
+      Zero-marginal-cost pooling • Quota monitoring • Embedded MCP server • Single OpenAI/Anthropic spec
     </text>
 
     <!-- Feature Pills Row -->
@@ -133,9 +133,9 @@
       <rect x="0" y="0" width="154" height="28" rx="6" fill="#111827" stroke="#334155" stroke-width="1" />
       <text x="12" y="18" class="mono" font-size="11" fill="#e2e8f0"><tspan fill="#22d3ee">◆</tspan> /v1/chat + /v1/msg</text>
 
-      <!-- Pill 2: Quota-Aware -->
+      <!-- Pill 2: Quota Monitoring -->
       <rect x="166" y="0" width="138" height="28" rx="6" fill="#111827" stroke="#334155" stroke-width="1" />
-      <text x="178" y="18" class="mono" font-size="11" fill="#e2e8f0"><tspan fill="#a3e635">⚡</tspan> Quota Router</text>
+      <text x="178" y="18" class="mono" font-size="11" fill="#e2e8f0"><tspan fill="#a3e635">⚡</tspan> Quota Monitor</text>
 
       <!-- Pill 3: Embedded MCP -->
       <rect x="316" y="0" width="130" height="28" rx="6" fill="#111827" stroke="#334155" stroke-width="1" />

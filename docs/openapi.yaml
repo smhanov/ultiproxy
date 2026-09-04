@@ -6,7 +6,7 @@ info:
     Ultiproxy is an agent-first universal LLM subscription proxy.
     It exposes a single OpenAI-compatible and Anthropic-compatible gateway at port 9050,
     fronting multiple pooled subscriptions (GitHub Copilot, OpenAI Codex, Anthropic Claude,
-    Google Antigravity, xAI Grok, DeepSeek, Z.ai, local vLLM, etc.) with quota-aware routing,
+    Google Antigravity, xAI Grok, DeepSeek, Z.ai, local vLLM, etc.) with live quota monitoring,
     per-API-key accounting, and an embedded Model Context Protocol (MCP) server.
 servers:
   - url: http://localhost:9050

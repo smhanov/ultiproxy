@@ -1,15 +1,15 @@
 # Ultiproxy
 
 > Agent-First Universal LLM Subscription Proxy (:9050)
-> Pooling GitHub Copilot, OpenAI Codex, Claude, Antigravity, Grok, DeepSeek, Z.ai, and local vLLM into a single quota-aware endpoint.
+> Pooling GitHub Copilot, OpenAI Codex, Claude, Antigravity, Grok, DeepSeek, Z.ai, and local vLLM into a single unified endpoint.
 
-Ultiproxy is an ultra-fast, local-first proxy daemon that multiplexes multiple upstream AI subscriptions into unified OpenAI and Anthropic compatible APIs. It provides automated quota-aware routing, per-API-key accounting, zero-marginal-cost pooling, and a native Model Context Protocol (MCP) server for autonomous agents.
+Ultiproxy is an ultra-fast, local-first proxy daemon that multiplexes multiple upstream AI subscriptions into unified OpenAI and Anthropic compatible APIs. It provides live per-provider quota monitoring, per-API-key accounting, zero-marginal-cost pooling, and a native Model Context Protocol (MCP) server for autonomous agents.
 
 ## Key Capabilities
 
 - **Unified Surface**: Exposes `POST /v1/chat/completions` (OpenAI format) and `POST /v1/messages` (Anthropic format) on port `9050`.
 - **Zero-Marginal-Cost Subscription Pooling**: Combines flat-fee developer subscriptions into a unified high-capacity gateway, bypassing per-token API billing.
-- **Quota-Aware Intelligent Routing**: Automatically inspects remaining request windows and resets across upstreams, redirecting traffic away from exhausted providers.
+- **Quota Monitoring**: Live per-provider quota windows and credit state via the MCP `get_quota_status` tool, `/api/quota`, and `quota.txt` — operators decide routing; the proxy never reroutes on quota by itself.
 - **Embedded MCP Server**: Streamable HTTP and SSE Model Context Protocol endpoints allow agents to introspect active models, check remaining quota, and toggle backends dynamically.
 - **Per-API-Key Accounting**: Granular tracking and attribution of prompt tokens, completion tokens, cached tokens, and request counts per client.
 - **Legacy Quota Dashboard Drop-in**: Serves the exact JSON shape expected by `quota.fjkl.cc` and `dashboard-quota-probe.py` at `/api/quota`.
