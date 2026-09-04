@@ -18,6 +18,7 @@ type Server struct {
 	usageSource UsageSource
 	aliases     AliasManager
 	timeouts    TimeoutManager
+	providers   ProviderStore
 	name        string
 	version     string
 	mu          sync.RWMutex
@@ -44,6 +45,15 @@ func WithAliasManager(am AliasManager) Option {
 func WithTimeoutManager(tm TimeoutManager) Option {
 	return func(s *Server) {
 		s.timeouts = tm
+	}
+}
+
+// WithProviderStore configures the runtime provider store (add_provider /
+// remove_provider / list_providers). Without it those tools report that the
+// store is not configured.
+func WithProviderStore(ps ProviderStore) Option {
+	return func(s *Server) {
+		s.providers = ps
 	}
 }
 

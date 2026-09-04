@@ -184,7 +184,7 @@ func (p *Provider) setProjectID(id string) {
 }
 
 // NewFromState constructs an Antigravity provider that stores OAuth credentials
-// under stateDir. It never reads ~/.cli-proxy-api. A nil result means no
+// under stateDir. A nil result means no
 // credential store could be created.
 func NewFromState(home, stateDir string, httpClient *http.Client) *Provider {
 	if stateDir == "" {

@@ -122,6 +122,46 @@ var standardTools = []Tool{
 			Required: []string{"provider"},
 		},
 	},
+	{
+		Name:        "add_provider",
+		Description: "Register an OpenAI-compatible provider lane at runtime (no config file). Persists across restarts in providers.json.",
+		InputSchema: &InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"name":            {Type: "string", Description: "Lane name, lowercase [a-z0-9_-], e.g. vllm, zai, openrouter"},
+				"base_url":        {Type: "string", Description: "Upstream base URL, e.g. https://api.deepseek.com/v1"},
+				"api_key":         {Type: "string", Description: "Optional static API key"},
+				"data_dir":        {Type: "string", Description: "Optional data dir for token/credential storage"},
+				"workspace_id":    {Type: "string", Description: "Workspace id for auth_via_workspace_cookie (opencode)"},
+				"session_cookie":  {Type: "string", Description: "Session cookie for auth_via_workspace_cookie (opencode)"},
+				"refresh_url":     {Type: "string", Description: "Supabase refresh URL for auth_via_supabase_refresh (augure)"},
+				"token_file":      {Type: "string", Description: "Token file for auth_via_supabase_refresh (augure)"},
+				"device_auth_url": {Type: "string", Description: "Device authorization URL for auth_via_oauth_manager"},
+				"token_url":       {Type: "string", Description: "Token URL for auth_via_oauth_manager"},
+				"quirks": {
+					Type:        "object",
+					Description: "Vendor quirks: {coding_plan_path, max_tokens_by_model, echo_reasoning, model_list_passthrough, auth_via_workspace_cookie, auth_via_oauth_manager, credits_quota_observer, auth_via_supabase_refresh, freebuff_default_tool, default_model}",
+				},
+			},
+			Required: []string{"name", "base_url"},
+		},
+	},
+	{
+		Name:        "remove_provider",
+		Description: "Unregister a provider lane: drops it from the live registry and from providers.json.",
+		InputSchema: &InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"name": {Type: "string", Description: "Lane name to remove, e.g. vllm"},
+			},
+			Required: []string{"name"},
+		},
+	},
+	{
+		Name:        "list_providers",
+		Description: "List runtime-registered provider lanes (base URL + quirks; secrets are redacted) and the live registry lanes.",
+		InputSchema: &InputSchema{Type: "object", Properties: map[string]PropertyDef{}},
+	},
 }
 
 func (s *Server) handleListTools() any {
@@ -162,6 +202,12 @@ func (s *Server) handleCallTool(ctx context.Context, rawParams json.RawMessage) 
 		return s.toolSetProviderTimeout(ctx, params.Arguments)
 	case "remove_provider_timeout":
 		return s.toolRemoveProviderTimeout(ctx, params.Arguments)
+	case "add_provider":
+		return s.toolAddProvider(ctx, params.Arguments)
+	case "remove_provider":
+		return s.toolRemoveProvider(ctx, params.Arguments)
+	case "list_providers":
+		return s.toolListProviders(ctx)
 	default:
 		return nil, &JSONRPCError{
 			Code:    CodeMethodNotFound,

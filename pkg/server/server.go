@@ -26,6 +26,7 @@ type Server struct {
 	auth       *AuthMiddleware
 	catalog    *ModelCatalog
 	timeouts   *TimeoutManager
+	providers  *RuntimeProviderStore
 	httpServer *http.Server
 	mux        *http.ServeMux
 }
@@ -51,6 +52,17 @@ func WithStateManager(sm *state.StateManager) Option {
 func WithStorageWriter(w *storage.Writer) Option {
 	return func(s *Server) {
 		s.writer = w
+	}
+}
+
+// WithRuntimeProviderStore sets the runtime provider store used by the MCP
+// add_provider / remove_provider / list_providers tools. When not provided,
+// NewServer builds one from data_dir/providers.json.
+func WithRuntimeProviderStore(store *RuntimeProviderStore) Option {
+	return func(s *Server) {
+		if store != nil {
+			s.providers = store
+		}
 	}
 }
 
@@ -87,6 +99,15 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 	}
 	s.catalog = catalog
 
+	// Runtime provider store (MCP add_provider / remove_provider /
+	// list_providers). Persisted lanes must be registered BEFORE the router or
+	// the model catalog resolve them, so a restart from the same DataDir serves
+	// the same lanes with no config file anywhere.
+	if s.providers == nil {
+		s.providers = NewRuntimeProviderStore(filepath.Join(cfg.DataDir, "providers.json"))
+	}
+	s.providers.Restore(registry)
+
 	// Default router needs the catalog so unknown models can be rejected
 	// instead of silently routed to the first registered provider.
 	if s.router == nil {
@@ -109,10 +130,14 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		if s.sm != nil {
 			stateSrc = &stateManagerSourceAdapter{sm: s.sm}
 		}
-		s.mcpServer = mcp.NewServer(registry, stateSrc,
+		mcpOpts := []mcp.Option{
 			mcp.WithAliasManager(&catalogBridge{catalog: s.catalog, server: s}),
 			mcp.WithTimeoutManager(&timeoutBridge{timeouts: s.timeouts}),
-		)
+		}
+		if s.providers != nil {
+			mcpOpts = append(mcpOpts, mcp.WithProviderStore(s.providers))
+		}
+		s.mcpServer = mcp.NewServer(registry, stateSrc, mcpOpts...)
 	}
 
 	// Auth middleware

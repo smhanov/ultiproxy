@@ -152,3 +152,26 @@ func (r *Registry) Len() int {
 	defer r.mu.RUnlock()
 	return len(r.providers)
 }
+
+// Unregister removes a provider from the registry by lane name, keeping the
+// registration order slice consistent. It reports whether the name was
+// registered. Runtime removal (MCP remove_provider) uses this so a lane stops
+// being routed immediately, in the same process lifetime.
+func (r *Registry) Unregister(name string) bool {
+	if name == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.providers[name]; !ok {
+		return false
+	}
+	delete(r.providers, name)
+	for i, n := range r.order {
+		if n == name {
+			r.order = append(r.order[:i], r.order[i+1:]...)
+			break
+		}
+	}
+	return true
+}

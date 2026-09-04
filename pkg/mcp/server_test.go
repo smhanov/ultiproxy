@@ -5,12 +5,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/smhanov/ultiproxy/pkg/provider"
+	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 	"github.com/smhanov/ultiproxy/pkg/state"
 )
 
@@ -156,8 +160,8 @@ func TestMCPToolsList(t *testing.T) {
 		t.Fatalf("expected tools list, got %T", resMap["tools"])
 	}
 
-	if len(tools) != 11 {
-		t.Fatalf("expected 11 tools, got %d", len(tools))
+	if len(tools) != 14 {
+		t.Fatalf("expected 14 tools, got %d", len(tools))
 	}
 
 	toolNames := make(map[string]bool)
@@ -178,6 +182,9 @@ func TestMCPToolsList(t *testing.T) {
 		"get_provider_timeouts",
 		"set_provider_timeout",
 		"remove_provider_timeout",
+		"add_provider",
+		"remove_provider",
+		"list_providers",
 	}
 
 	for _, name := range expectedTools {
@@ -317,5 +324,186 @@ func TestMCPStreamableHTTP_GET(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, "event: endpoint\ndata: /mcp") {
 		t.Errorf("expected initial endpoint event, got:\n%s", body)
+	}
+}
+
+// fileProviderStore is a test ProviderStore that persists to a JSON file the
+// same way the real RuntimeProviderStore (pkg/server/providers.go) does.
+// pkg/server cannot be imported from here (server imports mcp), so the store
+// is reimplemented in miniature for these tests.
+type fileProviderStore struct {
+	mu   sync.Mutex
+	path string
+	m    map[string]openaicompat.Config
+}
+
+func newFileProviderStore(path string) *fileProviderStore {
+	return &fileProviderStore{path: path, m: map[string]openaicompat.Config{}}
+}
+
+func (s *fileProviderStore) Add(cfg openaicompat.Config) error {
+	if cfg.Name == "" {
+		return errTest("name is required")
+	}
+	if cfg.BaseURL == "" {
+		return errTest("base_url is required")
+	}
+	s.mu.Lock()
+	s.m[cfg.Name] = cfg
+	s.mu.Unlock()
+	return s.persist()
+}
+
+func (s *fileProviderStore) Remove(name string) error {
+	s.mu.Lock()
+	_, ok := s.m[name]
+	delete(s.m, name)
+	s.mu.Unlock()
+	if !ok {
+		return errTest("not stored: " + name)
+	}
+	return s.persist()
+}
+
+func (s *fileProviderStore) List() map[string]openaicompat.Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]openaicompat.Config, len(s.m))
+	for k, v := range s.m {
+		out[k] = v
+	}
+	return out
+}
+
+func (s *fileProviderStore) persist() error {
+	s.mu.Lock()
+	snapshot := make(map[string]openaicompat.Config, len(s.m))
+	for k, v := range s.m {
+		snapshot[k] = v
+	}
+	s.mu.Unlock()
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
+}
+
+type errTest string
+
+func (e errTest) Error() string { return string(e) }
+
+// callMCPTool posts a tools/call request and decodes the CallToolResult.
+func callMCPTool(t *testing.T, srv *Server, id int, name, arguments string) CallToolResult {
+	t.Helper()
+	body := `{"jsonrpc":"2.0","id":` + strconv.Itoa(id) + `,"method":"tools/call","params":{"name":"` + name + `","arguments":` + arguments + `}}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: HTTP %d: %s", name, rec.Code, rec.Body.String())
+	}
+	var resp JSONRPCResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("%s: decode: %v", name, err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("%s: json-rpc error: %+v", name, resp.Error)
+	}
+	raw, _ := json.Marshal(resp.Result)
+	var out CallToolResult
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("%s: decode call result: %v", name, err)
+	}
+	return out
+}
+
+func TestMCP_AddRemoveListProviders(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.json")
+	store := newFileProviderStore(path)
+	registry := provider.NewRegistry()
+	srv := NewServer(registry, nil, WithProviderStore(store))
+
+	// add_provider: harmless fake upstream; New() does not dial on construction.
+	res := callMCPTool(t, srv, 1, "add_provider",
+		`{"name":"vllm","base_url":"http://127.0.0.1:1/v1","api_key":"sk-supersecret","quirks":{"model_list_passthrough":false}}`)
+	if res.IsError {
+		t.Fatalf("add_provider failed: %s", res.Content[0].Text)
+	}
+	if !strings.Contains(res.Content[0].Text, `"registered": true`) ||
+		!strings.Contains(res.Content[0].Text, `"lane": "vllm"`) {
+		t.Fatalf("add_provider response unexpected: %s", res.Content[0].Text)
+	}
+	if _, ok := registry.Get("vllm"); !ok {
+		t.Fatal("registry does not contain the vllm lane after add_provider")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("providers.json not persisted: %v", err)
+	}
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read providers.json: %v", err)
+	}
+	if !strings.Contains(string(onDisk), `"vllm"`) || !strings.Contains(string(onDisk), "127.0.0.1:1") {
+		t.Fatalf("providers.json missing the lane: %s", onDisk)
+	}
+
+	// list_providers: lane present, api_key redacted.
+	list := callMCPTool(t, srv, 2, "list_providers", `{}`)
+	if list.IsError {
+		t.Fatalf("list_providers failed: %s", list.Content[0].Text)
+	}
+	if !strings.Contains(list.Content[0].Text, `"vllm"`) {
+		t.Fatalf("list_providers missing vllm: %s", list.Content[0].Text)
+	}
+	if strings.Contains(list.Content[0].Text, "sk-supersecret") {
+		t.Fatalf("list_providers leaked the api key: %s", list.Content[0].Text)
+	}
+	if !strings.Contains(list.Content[0].Text, `"has_api_key": true`) {
+		t.Fatalf("list_providers should report key presence: %s", list.Content[0].Text)
+	}
+
+	// remove_provider: registry + file updated.
+	rem := callMCPTool(t, srv, 3, "remove_provider", `{"name":"vllm"}`)
+	if rem.IsError {
+		t.Fatalf("remove_provider failed: %s", rem.Content[0].Text)
+	}
+	if _, ok := registry.Get("vllm"); ok {
+		t.Fatal("registry still contains vllm after remove_provider")
+	}
+	if registry.Len() != 0 {
+		t.Fatalf("registry not empty after remove: %v", registry.Names())
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read providers.json: %v", err)
+	}
+	if strings.Contains(string(after), `"vllm"`) {
+		t.Fatalf("providers.json still contains vllm: %s", after)
+	}
+
+	// list_providers is now empty.
+	list2 := callMCPTool(t, srv, 4, "list_providers", `{}`)
+	if list2.IsError || strings.Contains(list2.Content[0].Text, `"vllm"`) {
+		t.Fatalf("list_providers after remove unexpected: %s", list2.Content[0].Text)
+	}
+
+	// add_provider validation: missing base_url is a tool error, nothing registered.
+	bad := callMCPTool(t, srv, 5, "add_provider", `{"name":"nope"}`)
+	if !bad.IsError {
+		t.Fatalf("expected error for missing base_url: %s", bad.Content[0].Text)
+	}
+	if _, ok := registry.Get("nope"); ok {
+		t.Fatal("invalid lane was registered")
+	}
+
+	// removing an unknown lane errors.
+	unknown := callMCPTool(t, srv, 6, "remove_provider", `{"name":"ghost"}`)
+	if !unknown.IsError {
+		t.Fatalf("expected error removing unknown lane: %s", unknown.Content[0].Text)
 	}
 }
