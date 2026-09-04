@@ -31,11 +31,17 @@ type StorageConfig struct {
 	DBPath string `yaml:"db_path"`
 }
 
-// DefaultConfig returns reasonable defaults.
+// DefaultConfig returns reasonable defaults. ULTIPROXY_ADDR overrides the
+// listen address so a fresh zero-config install can bind 0.0.0.0 for remote
+// agents without writing a config file.
 func DefaultConfig() *Config {
+	addr := os.Getenv("ULTIPROXY_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:9050"
+	}
 	cfg := &Config{
 		Server: ServerConfig{
-			Addr:        "127.0.0.1:9050",
+			Addr:        addr,
 			ClientKeys:  make(map[string]string),
 			LLMsTxtPath: "llms.txt",
 			Models:      make(map[string]ModelAlias),
@@ -64,6 +70,12 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 
+	// Default listen address, overridable via ULTIPROXY_ADDR so a fresh
+	// zero-config install can still bind 0.0.0.0 for remote agents without
+	// writing a config file.
+	if cfg.Server.Addr == "" {
+		cfg.Server.Addr = os.Getenv("ULTIPROXY_ADDR")
+	}
 	if cfg.Server.Addr == "" {
 		cfg.Server.Addr = "127.0.0.1:9050"
 	}
