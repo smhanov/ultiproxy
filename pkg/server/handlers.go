@@ -295,14 +295,17 @@ func (s *Server) dispatchRequest(
 				}
 
 				// NO FAILOVER AFTER FIRST BYTE: stream rest of events
+				var finishReason string
+				var errorClass string
+
 				encoder := createEncoder(w)
 				_ = encoder.EncodeEvent(firstEvt)
+				if stopEvt, isStop := firstEvt.(ir.EventMessageStop); isStop {
+					finishReason = stopEvt.FinishReason
+				}
 				if canFlush {
 					flusher.Flush()
 				}
-
-				var finishReason string
-				var errorClass string
 
 				for ev := range streamChan {
 					if midStreamErr, isErr := ev.(ir.EventUpstreamError); isErr {

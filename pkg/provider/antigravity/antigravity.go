@@ -247,6 +247,78 @@ func (p *Provider) Register(r *provider.Registry) {
 // Strict Tool Schema Sanitizer
 // -----------------------------------------------------------------------------
 
+// googleSchemaAllowed is the field whitelist accepted by Google's
+// GenerateContentRequest function declaration schema. Any other JSON-Schema
+// keyword (OpenCode injects $schema, propertyNames, additionalProperties,
+// const, examples, etc.) causes Google to 400 with "Unknown name ...":
+// we must strip them.
+var googleSchemaAllowed = map[string]bool{
+	"type":             true,
+	"format":           true,
+	"title":            true,
+	"description":      true,
+	"nullable":         true,
+	"enum":             true,
+	"enumNames":        true,
+	"default":          true,
+	"items":            true,
+	"minItems":         true,
+	"maxItems":         true,
+	"minProperties":    true,
+	"maxProperties":    true,
+	"minLength":        true,
+	"maxLength":        true,
+	"pattern":          true,
+	"example":          true,
+	"examples":         true,
+	"properties":       true,
+	"propertyOrdering": true,
+	"required":         true,
+	"anyOf":            true,
+	"definitions":      true,
+}
+
+// SanitizeGoogleSchema recursively strips JSON-Schema keywords that Google's
+// strict proto validator does not support, so OpenCode/other clients' tool
+// schemas pass upstream validation. It keeps the structural keywords Google
+// needs (type, properties, required, items, enum, description, ...).
+func SanitizeGoogleSchema(node map[string]any) map[string]any {
+	if node == nil {
+		return nil
+	}
+	out := make(map[string]any, len(node))
+	for k, v := range node {
+		if !googleSchemaAllowed[k] {
+			continue
+		}
+		switch k {
+		case "properties", "definitions":
+			if sub, ok := v.(map[string]any); ok {
+				cleaned := make(map[string]any, len(sub))
+				for pk, pv := range sub {
+					if pm, ok := pv.(map[string]any); ok {
+						cleaned[pk] = SanitizeGoogleSchema(pm)
+					} else {
+						cleaned[pk] = pv
+					}
+				}
+				out[k] = cleaned
+			} else {
+				out[k] = v
+			}
+		case "items", "additionalProperties":
+			if sub, ok := v.(map[string]any); ok {
+				out[k] = SanitizeGoogleSchema(sub)
+			} else {
+				out[k] = v
+			}
+		default:
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // ValidateToolSchema implements the strict tool schema sanitizer:
 // Rejects (HTTP 400 error surfaced) any tool whose parameters schema has
 // properties/required on a node without type: object, or required fields not
@@ -375,11 +447,13 @@ type cloudCodePart struct {
 
 type cloudCodeFunctionCall struct {
 	Name string         `json:"name"`
+	ID   string         `json:"id,omitempty"`
 	Args map[string]any `json:"args,omitempty"`
 }
 
 type cloudCodeFuncResponse struct {
 	Name     string         `json:"name"`
+	ID       string         `json:"id,omitempty"`
 	Response map[string]any `json:"response"`
 }
 
@@ -535,6 +609,7 @@ func (p *Provider) buildRequest(msgs []*ir.Message, cfg *provider.RequestConfig)
 					ThoughtSignature: "skip_thought_signature_validator",
 					FunctionCall: &cloudCodeFunctionCall{
 						Name: b.Name,
+						ID:   b.ID,
 						Args: args,
 					},
 				})
@@ -545,6 +620,7 @@ func (p *Provider) buildRequest(msgs []*ir.Message, cfg *provider.RequestConfig)
 					ThoughtSignature: "skip_thought_signature_validator",
 					FunctionCall: &cloudCodeFunctionCall{
 						Name: b.Name,
+						ID:   b.ID,
 						Args: args,
 					},
 				})
@@ -559,6 +635,7 @@ func (p *Provider) buildRequest(msgs []*ir.Message, cfg *provider.RequestConfig)
 				parts = append(parts, cloudCodePart{
 					FunctionResponse: &cloudCodeFuncResponse{
 						Name:     name,
+						ID:       b.ToolCallID,
 						Response: map[string]any{"result": b.Content},
 					},
 				})
@@ -573,6 +650,7 @@ func (p *Provider) buildRequest(msgs []*ir.Message, cfg *provider.RequestConfig)
 				parts = append(parts, cloudCodePart{
 					FunctionResponse: &cloudCodeFuncResponse{
 						Name:     name,
+						ID:       b.ToolCallID,
 						Response: map[string]any{"result": b.Content},
 					},
 				})
@@ -605,6 +683,12 @@ func (p *Provider) buildRequest(msgs []*ir.Message, cfg *provider.RequestConfig)
 							params = fnParams
 						}
 					}
+
+					// Google's proto validator rejects any JSON-Schema keyword
+					// outside its whitelist ($schema, propertyNames, const,
+					// additionalProperties, ...). OpenCode injects $schema in
+					// every tool definition — strip them recursively first.
+					params = SanitizeGoogleSchema(params)
 
 					// Strict schema sanitizer
 					if err := ValidateToolSchema(params); err != nil {
@@ -735,12 +819,10 @@ func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...pro
 	cands := ccResp.getCandidates()
 	if len(cands) > 0 {
 		cand := cands[0]
-		if cand.FinishReason != "" {
-			irResp.FinishReason = strings.ToLower(cand.FinishReason)
-		}
 
 		var blocks []ir.Block
 		sig := cand.ThoughtSignature
+		hasToolCalls := false
 
 		for _, part := range cand.Content.Parts {
 			isThought := false
@@ -766,6 +848,7 @@ func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...pro
 			}
 
 			if part.FunctionCall != nil {
+				hasToolCalls = true
 				argsJSON, _ := json.Marshal(part.FunctionCall.Args)
 				h := sha256.Sum256([]byte(fmt.Sprintf("%s_%s", part.FunctionCall.Name, string(argsJSON))))
 				callID := fmt.Sprintf("call_%x", h[:12])
@@ -775,6 +858,16 @@ func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...pro
 					Arguments: string(argsJSON),
 				})
 			}
+		}
+
+		if cand.FinishReason != "" {
+			finish := strings.ToLower(cand.FinishReason)
+			if hasToolCalls && finish == "stop" {
+				finish = "tool_calls"
+			}
+			irResp.FinishReason = finish
+		} else if hasToolCalls {
+			irResp.FinishReason = "tool_calls"
 		}
 
 		irResp.Message = &ir.Message{
@@ -922,9 +1015,29 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 					}
 				}
 
+				hasToolCalls := false
+				for _, part := range cand.Content.Parts {
+					if part.FunctionCall != nil {
+						hasToolCalls = true
+						break
+					}
+				}
+
 				if cand.FinishReason != "" {
-					outCh <- ir.EventMessageStop{
-						FinishReason: strings.ToLower(cand.FinishReason),
+					finish := strings.ToLower(cand.FinishReason)
+					if hasToolCalls && finish == "stop" {
+						finish = "tool_calls"
+					}
+					if finish == "malformed_function_call" {
+						outCh <- ir.EventUpstreamError{
+							Kind:      "malformed_function_call",
+							Message:   "google/antigravity rejected the tool schema; functionDeclarations were malformed",
+							Permanent: true,
+						}
+					} else {
+						outCh <- ir.EventMessageStop{
+							FinishReason: finish,
+						}
 					}
 				}
 			}

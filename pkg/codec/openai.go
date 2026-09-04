@@ -216,7 +216,16 @@ func DecodeChatCompletionRequest(body []byte) (*ChatCompletionDecoded, error) {
 
 	extra := make(map[string]any)
 	if len(req.Tools) > 0 {
-		extra["tools"] = req.Tools
+		// Serialize tools through JSON so downstream providers receive plain
+		// map[string]any entries ([]any), not the typed []OpenAITool slice.
+		// Providers do `tools.([]any)` and would silently drop the typed slice.
+		raw, err := json.Marshal(req.Tools)
+		if err == nil {
+			var list []any
+			if json.Unmarshal(raw, &list) == nil {
+				extra["tools"] = list
+			}
+		}
 	}
 	if req.ToolChoice != nil {
 		extra["tool_choice"] = req.ToolChoice
@@ -348,22 +357,23 @@ func EncodeChatCompletionResponse(resp *ir.Response, model string) ([]byte, erro
 	}
 
 	finishReason := resp.FinishReason
-	if finishReason == "" {
 		if len(toolCalls) > 0 {
+			// If the model returned tool calls, the finish reason MUST be
+			// "tool_calls" — clients (opencode) use it to decide whether to
+			// execute them. Upstream may say "other"/"stop"/anything.
 			finishReason = "tool_calls"
+		} else if finishReason == "" {
+			finishReason = "stop"
 		} else {
-			finishReason = "stop"
+			switch finishReason {
+			case "end_turn":
+				finishReason = "stop"
+			case "tool_use":
+				finishReason = "tool_calls"
+			case "max_tokens":
+				finishReason = "length"
+			}
 		}
-	} else {
-		switch finishReason {
-		case "end_turn":
-			finishReason = "stop"
-		case "tool_use", "malformed_function_call":
-			finishReason = "tool_calls"
-		case "max_tokens":
-			finishReason = "length"
-		}
-	}
 
 	msg := OpenAIResponseMessage{
 		Role: "assistant",
@@ -548,7 +558,7 @@ func (e *OpenAIStreamEncoder) EncodeEvent(evt ir.Event) error {
 			finish = "stop"
 		} else {
 			switch finish {
-			case "tool_use", "malformed_function_call":
+			case "tool_use":
 				finish = "tool_calls"
 			case "stop", "end_turn":
 				finish = "stop"
