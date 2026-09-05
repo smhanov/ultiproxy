@@ -8,6 +8,11 @@
 - Read `plans/todo.md` and the linked plan. If the user did not name a task, take the first `ready` row in queue order.
 - Change that row to `in-progress` before editing code. Never work a `blocked` task until its dependencies are complete.
 - If the requested work is not already listed, create a detailed `plans/<date>-<slug>.md` plan, assign the next unused permanent task ID, and add one concise Active row.
+- Every implementation plan must contain an **Acceptance Criteria** section before coding starts. Acceptance criteria define the required outcome, not the implementation: each criterion must be binary/falsifiable, externally observable where possible, and state how the agent will verify it (test, contract check, command/result, or live receipt).
+- Acceptance criteria must cover the main success path plus relevant regression, error/negative, compatibility, persistence/restart, or concurrency cases for the change. For bug fixes, include a criterion that reproduces the old failure and proves the regression is fixed.
+- `go test ./...` / build / vet passing may be required verification gates, but **"tests pass" alone is never sufficient acceptance criteria**. Do not use vague criteria such as "works correctly", "is robust", or "handles edge cases" without naming the observable behavior and evidence.
+- Prefer behavior/invariant criteria over implementation-detail criteria. Do not force a specific internal design unless that design constraint is itself part of the requirement.
+- A task is not complete until every acceptance criterion has concrete evidence. If a criterion cannot be verified, leave the task `in-progress` or `blocked` and record the reason in the plan instead of claiming completion.
 
 **Before finishing work:**
 - If verified complete, move the task from Active to Completed with the date and commit hash; use `working-tree` only when no commit was requested.

@@ -13,6 +13,10 @@ ID_RE = re.compile(r"^T\d{3}[A-Z]?$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 ACTIVE_STATUSES = {"ready", "in-progress", "blocked"}
+AC_HEADING_RE = re.compile(
+    r"(?im)^(?:#{1,6}[ \t]*)?(?:\d+(?:\.\d+)*[.)]?[ \t]+)?Acceptance Criteria\b[^\n]*$"
+)
+AC_ITEM_RE = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+")
 
 
 def fail(errors: list[str], message: str) -> None:
@@ -95,8 +99,22 @@ def main() -> int:
         plan = clean_code(plan_cell)
         if not plan.startswith("plans/") or not plan.endswith(".md"):
             fail(errors, f"{task_id}: plan must be a plans/*.md path")
-        elif not (ROOT / plan).is_file():
-            fail(errors, f"{task_id}: plan does not exist: {plan}")
+        else:
+            plan_path = ROOT / plan
+            if not plan_path.is_file():
+                fail(errors, f"{task_id}: plan does not exist: {plan}")
+            else:
+                plan_text = plan_path.read_text(encoding="utf-8")
+                match = AC_HEADING_RE.search(plan_text)
+                if not match:
+                    fail(errors, f"{task_id}: plan must contain an Acceptance Criteria section")
+                else:
+                    tail = plan_text[match.end():]
+                    boundary = re.search(r"(?m)^(?:#{1,6}[ \t]+|---[ \t]*$)", tail)
+                    block = tail[: boundary.start()] if boundary else tail
+                    criteria = [line for line in block.splitlines() if AC_ITEM_RE.match(line)]
+                    if len(criteria) < 3:
+                        fail(errors, f"{task_id}: Acceptance Criteria must contain at least 3 explicit items")
 
         deps = [] if depends == "-" else [item.strip() for item in depends.split(",")]
         if status == "blocked" and not deps:
