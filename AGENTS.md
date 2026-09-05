@@ -2,7 +2,20 @@
 
 ## Task tracking: plans/todo.md
 
-Use the untracked `plans/todo.md` as the running list of future/outstanding tasks (status column: `todo` → `in-progress` → `done`, with a Done table carrying commit hashes). When you finish work or discover a new follow-up, update it — don't leave task state only in conversation.
+`plans/todo.md` is the canonical local queue for future/outstanding work. It is intentionally compact; implementation detail belongs in the linked plan file.
+
+**Before starting work:**
+- Read `plans/todo.md` and the linked plan. If the user did not name a task, take the first `ready` row in queue order.
+- Change that row to `in-progress` before editing code. Never work a `blocked` task until its dependencies are complete.
+- If the requested work is not already listed, create a detailed `plans/<date>-<slug>.md` plan, assign the next unused permanent task ID, and add one concise Active row.
+
+**Before finishing work:**
+- If verified complete, move the task from Active to Completed with the date and commit hash; use `working-tree` only when no commit was requested.
+- If unfinished, leave it `in-progress`; if blocked, mark it `blocked` and name the blocking task ID(s).
+- Never put long notes, logs, receipts, audit prose, or completed tasks in Active.
+- Run `python3 scripts/validate_todo.py`. A task-tracker validation failure must be fixed before declaring the task complete.
+
+Do not leave task state only in conversation. IDs are permanent and must never be reused.
 
 ## llmhub changes MUST go through PRs
 

@@ -2,3 +2,6 @@
 
 # local credential safekeeping (never commit)
 .env
+
+__pycache__/
+*.pyc
