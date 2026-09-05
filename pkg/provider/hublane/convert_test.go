@@ -2,11 +2,13 @@ package hublane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
 
 	"github.com/smhanov/llmhub"
+	"github.com/smhanov/ultiproxy/pkg/codec"
 	"github.com/smhanov/ultiproxy/pkg/ir"
 )
 
@@ -316,5 +318,163 @@ func assertIRToolCallBlock(t *testing.T, blk ir.Block, id, name, args string) {
 	b, ok := blk.(ir.ToolCallBlock)
 	if !ok || b.ID != id || b.Name != name || b.Arguments != args {
 		t.Fatalf("expected tool call block id=%q name=%q args=%q, got %+v", id, name, args, blk)
+	}
+}
+
+// TestIRToHubPrompt_CacheControlPassthrough proves that Anthropic prompt
+// caching breakpoints (ir.CacheControl blocks) survive the IR -> llmhub
+// conversion instead of being silently dropped.
+//
+// Regression: IRToHubPrompt had no case for ir.CacheControl, so every
+// cache_control marker on an inbound Anthropic request vanished before the
+// hub adapter, and the upstream never saw a caching boundary.
+func TestIRToHubPrompt_CacheControlPassthrough(t *testing.T) {
+	msgs := []*ir.Message{
+		{
+			Role: "system",
+			Meta: map[string]string{"lane": "anthropic"},
+			Blocks: []ir.Block{
+				ir.TextBlock{Text: "sys"},
+				ir.CacheControl{Breakpoint: true},
+			},
+		},
+		{
+			Role: "user",
+			Blocks: []ir.Block{
+				ir.TextBlock{Text: "hello"},
+				ir.CacheControl{Breakpoint: true},
+				ir.ImageBlock{URL: "http://example.com/img.png"},
+				&ir.CacheControl{Breakpoint: true},
+			},
+		},
+	}
+
+	hubMsgs := IRToHubPrompt(msgs)
+	if len(hubMsgs) != 2 {
+		t.Fatalf("expected 2 hub messages, got %d", len(hubMsgs))
+	}
+
+	// System message: one text part, breakpoint on part 0, original meta kept.
+	if len(hubMsgs[0].Content) != 1 {
+		t.Fatalf("expected 1 system content part, got %d", len(hubMsgs[0].Content))
+	}
+	if hubMsgs[0].Meta["lane"] != "anthropic" {
+		t.Errorf("existing message meta must survive, got %+v", hubMsgs[0].Meta)
+	}
+	sysBp := CacheControlBreakpoints(hubMsgs[0])
+	if len(sysBp) != 1 || sysBp[0].Index != 0 || sysBp[0].CacheControl != "ephemeral" {
+		t.Fatalf("system breakpoints = %+v, want [{0 ephemeral}]", sysBp)
+	}
+
+	// User message: text + image parts, breakpoints on parts 0 and 1.
+	if len(hubMsgs[1].Content) != 2 {
+		t.Fatalf("expected 2 user content parts (no cache_control part injected), got %d", len(hubMsgs[1].Content))
+	}
+	userBp := CacheControlBreakpoints(hubMsgs[1])
+	if len(userBp) != 2 {
+		t.Fatalf("user breakpoints = %+v, want 2 entries", userBp)
+	}
+	if userBp[0].Index != 0 || userBp[1].Index != 1 {
+		t.Fatalf("user breakpoint indexes = [%d %d], want [0 1]", userBp[0].Index, userBp[1].Index)
+	}
+	for _, bp := range userBp {
+		if bp.CacheControl != "ephemeral" {
+			t.Errorf("breakpoint %d cache_control = %q, want ephemeral", bp.Index, bp.CacheControl)
+		}
+	}
+
+	// The marker must be JSON so an upstream hub provider can splice real
+	// cache_control fields onto the matching content parts.
+	raw := hubMsgs[1].Meta["cache_control"]
+	if !json.Valid([]byte(raw)) {
+		t.Fatalf("cache_control meta is not valid JSON: %q", raw)
+	}
+}
+
+// TestIRToHubPrompt_CacheControlWithoutPrecedingBlock: a marker with nothing to
+// annotate must not panic and must not emit a negative index.
+func TestIRToHubPrompt_CacheControlWithoutPrecedingBlock(t *testing.T) {
+	hubMsgs := IRToHubPrompt([]*ir.Message{
+		{Role: "user", Blocks: []ir.Block{ir.CacheControl{Breakpoint: true}, ir.TextBlock{Text: "hi"}}},
+	})
+	if len(hubMsgs) != 1 {
+		t.Fatalf("expected 1 hub message, got %d", len(hubMsgs))
+	}
+	for _, bp := range CacheControlBreakpoints(hubMsgs[0]) {
+		if bp.Index < 0 {
+			t.Fatalf("negative breakpoint index: %+v", bp)
+		}
+	}
+}
+
+// TestAdapter_CacheControlSurvivesToHub: end-to-end from a decoded Anthropic
+// request through the hublane adapter. The hub provider must still see the
+// caching breakpoint (AC1).
+func TestAdapter_CacheControlSurvivesToHub(t *testing.T) {
+	body := `{
+		"model": "claude-3-7-sonnet",
+		"max_tokens": 32,
+		"system": [{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}],
+		"messages": [
+			{"role": "user", "content": [
+				{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+			]}
+		]
+	}`
+
+	decoded, err := codec.DecodeMessagesRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("DecodeMessagesRequest failed: %v", err)
+	}
+
+	hub := &fakeHubProvider{
+		name:         "fake-hub",
+		generateResp: &llmhub.Response{Content: []llmhub.ContentPart{llmhub.Text("ok")}},
+	}
+	adapter := New(hub)
+
+	if _, err := adapter.Generate(context.Background(), decoded.Messages, decoded.Options...); err != nil {
+		t.Fatalf("adapter.Generate failed: %v", err)
+	}
+
+	if len(hub.lastPrompt) != 2 {
+		t.Fatalf("expected 2 hub messages, got %d", len(hub.lastPrompt))
+	}
+	if got := CacheControlBreakpoints(hub.lastPrompt[0]); len(got) != 1 || got[0].Index != 0 {
+		t.Fatalf("system breakpoint lost on the way to the hub adapter: %+v", got)
+	}
+	if got := CacheControlBreakpoints(hub.lastPrompt[1]); len(got) != 1 || got[0].Index != 0 {
+		t.Fatalf("user breakpoint lost on the way to the hub adapter: %+v", got)
+	}
+}
+
+// TestIRToHubPrompt_CacheControlOnToolResult: a breakpoint after a tool_result
+// block must annotate the standalone tool message the bridge emits, not the
+// message the tool result was lifted out of.
+func TestIRToHubPrompt_CacheControlOnToolResult(t *testing.T) {
+	hubMsgs := IRToHubPrompt([]*ir.Message{
+		{
+			Role: "user",
+			Blocks: []ir.Block{
+				ir.TextBlock{Text: "answer?"},
+				ir.ToolResultBlock{ToolCallID: "tc1", Name: "calc", Content: "42"},
+				ir.CacheControl{Breakpoint: true},
+			},
+		},
+	})
+
+	if len(hubMsgs) != 2 {
+		t.Fatalf("expected 2 hub messages (user + tool), got %d", len(hubMsgs))
+	}
+	tool := hubMsgs[0]
+	if tool.Role != llmhub.RoleTool {
+		t.Fatalf("expected the tool message first, got %+v", hubMsgs)
+	}
+	bp := CacheControlBreakpoints(tool)
+	if len(bp) != 1 || bp[0].Index != 0 || bp[0].CacheControl != "ephemeral" {
+		t.Fatalf("tool message breakpoints = %+v, want [{0 ephemeral}]", bp)
+	}
+	if got := CacheControlBreakpoints(hubMsgs[1]); len(got) != 0 {
+		t.Fatalf("user message must not inherit the tool breakpoint: %+v", got)
 	}
 }

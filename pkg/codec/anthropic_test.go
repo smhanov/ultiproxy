@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -269,5 +270,96 @@ func TestAnthropicStreamEncoder_MatchesGoldenFixture(t *testing.T) {
 		if !strings.Contains(streamOutput, `"text":"function "`) {
 			t.Errorf("whitespace in 'function ' was lost!")
 		}
+	}
+}
+
+// TestDecodeMessagesRequest_CacheControlOnEveryBlockType proves that an
+// Anthropic prompt-caching breakpoint attached to any content block (system,
+// text, image, tool_use, tool_result) survives decoding into the IR as an
+// ir.CacheControl block immediately after the block it annotates.
+//
+// Regression: only text and system blocks used to keep their cache_control;
+// image/tool_use/tool_result breakpoints were silently dropped, which moved
+// (or removed) the upstream cache boundary for tool-heavy Claude requests.
+func TestDecodeMessagesRequest_CacheControlOnEveryBlockType(t *testing.T) {
+	rawJSON := `{
+		"model": "claude-3-7-sonnet-20250219",
+		"max_tokens": 64,
+		"system": [
+			{"type": "text", "text": "You are a code assistant.", "cache_control": {"type": "ephemeral"}}
+		],
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": "check this", "cache_control": {"type": "ephemeral"}},
+					{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}, "cache_control": {"type": "ephemeral"}},
+					{"type": "tool_use", "id": "toolu_1", "name": "calc", "input": {"e": "1+1"}, "cache_control": {"type": "ephemeral"}},
+					{"type": "tool_result", "tool_use_id": "toolu_1", "content": "2", "cache_control": {"type": "ephemeral"}}
+				]
+			}
+		]
+	}`
+
+	decoded, err := DecodeMessagesRequest([]byte(rawJSON))
+	if err != nil {
+		t.Fatalf("DecodeMessagesRequest failed: %v", err)
+	}
+	if len(decoded.Messages) != 2 {
+		t.Fatalf("expected 2 IR messages (system + user), got %d", len(decoded.Messages))
+	}
+
+	sys := decoded.Messages[0]
+	if sys.Role != "system" {
+		t.Fatalf("expected system role, got %q", sys.Role)
+	}
+	if len(sys.Blocks) != 2 {
+		t.Fatalf("expected [text, cache_control] in system message, got %+v", sys.Blocks)
+	}
+	if _, ok := sys.Blocks[1].(ir.CacheControl); !ok {
+		t.Fatalf("expected ir.CacheControl after the system text block, got %T", sys.Blocks[1])
+	}
+
+	user := decoded.Messages[1]
+	cacheMarkers := 0
+	for i, blk := range user.Blocks {
+		cc, isCC := blk.(ir.CacheControl)
+		if !isCC {
+			continue
+		}
+		cacheMarkers++
+		if !cc.Breakpoint {
+			t.Errorf("block %d: cache_control breakpoint must be true, got %+v", i, cc)
+		}
+		// Every marker must sit directly behind the block it annotates.
+		if i == 0 {
+			t.Errorf("block %d: cache_control marker has no preceding block", i)
+			continue
+		}
+		if _, prevIsMarker := user.Blocks[i-1].(ir.CacheControl); prevIsMarker {
+			t.Errorf("block %d: cache_control marker directly follows another marker", i)
+		}
+	}
+	if cacheMarkers != 4 {
+		t.Fatalf("expected 4 cache_control markers in the user message (text, image, tool_use, tool_result), got %d: %+v", cacheMarkers, user.Blocks)
+	}
+
+	// The annotated blocks themselves must still be decoded correctly.
+	var kinds []ir.BlockKind
+	for _, blk := range user.Blocks {
+		kinds = append(kinds, blk.Kind())
+	}
+	want := []ir.BlockKind{
+		ir.BlockKindText,
+		ir.BlockKindCacheControl,
+		ir.BlockKindImage,
+		ir.BlockKindCacheControl,
+		ir.BlockKindToolCall,
+		ir.BlockKindCacheControl,
+		ir.BlockKindToolResult,
+		ir.BlockKindCacheControl,
+	}
+	if !reflect.DeepEqual(kinds, want) {
+		t.Fatalf("block kinds = %v, want %v", kinds, want)
 	}
 }
