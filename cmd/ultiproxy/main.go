@@ -28,9 +28,11 @@ import (
 const version = "0.1.0"
 
 func main() {
-	// Subcommand-first CLI: `ultiproxy serve --config ...`. Go's flag
-	// package stops parsing at the first non-flag argument, so we extract
-	// the subcommand before parsing flags.
+	// The daemon serves by default (`ultiproxy --config ...` or the explicit
+	// `ultiproxy serve --config ...`). There is no administration CLI:
+	// every operator knob (logins, lanes, aliases, quotas) is an MCP tool at
+	// /mcp. Go's flag package stops parsing at the first non-flag argument,
+	// so we extract the subcommand before parsing flags.
 	args := os.Args[1:]
 	cmd := "serve"
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -53,15 +55,8 @@ func main() {
 	case "serve":
 		runServe(*configPath, *dataDir)
 
-	case "login":
-		providerName := ""
-		if fs.NArg() > 0 {
-			providerName = fs.Arg(0)
-		}
-		runLogin(providerName, *dataDir)
-
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q (available: serve, login, version)\n", cmd)
+		fmt.Fprintf(os.Stderr, "unknown command %q (available: serve, version; administration goes through MCP tools at /mcp)\n", cmd)
 		os.Exit(1)
 	}
 }

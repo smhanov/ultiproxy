@@ -582,7 +582,7 @@ func (p *Provider) Quota(ctx context.Context) (*provider.QuotaSnapshot, error) {
 		return &provider.QuotaSnapshot{
 			ObservedAt: time.Now().UTC(),
 			Windows:    []provider.QuotaWindow{},
-			Detail:     "not logged in — run 'ultiproxy login codex'",
+			Detail:     "not logged in — start a login with the MCP initiate_oauth_login tool (provider \"codex\")",
 		}, nil
 	}
 

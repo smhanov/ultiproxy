@@ -173,7 +173,7 @@ curl -s http://localhost:9050/v1/messages \
 - **Protocol**: JSON-RPC 2.0 over HTTP/SSE.
 - **Exposed Agent Tools** (each one carries a full self-describing docstring through `tools/list`):
   - `list_models`: Client-visible model ids with their provider lane, enabled state, context limit, max output, pricing tag and benchmark scores.
-  - `get_quota_status`: Remaining allocations, units, and seconds until reset for one provider lane (antigravity, xai, copilot, codex, freebuff, zai, or a runtime lane). Monitoring only - the proxy never auto-reroutes on quota. Lanes with no quota surface answer "has no quota mechanism"; a lane that is not logged in (e.g. codex) answers with a snapshot whose `detail` says to run `ultiproxy login codex`.
+  - `get_quota_status`: Remaining allocations, units, and seconds until reset for one provider lane (antigravity, xai, copilot, codex, freebuff, zai, or a runtime lane). Monitoring only - the proxy never auto-reroutes on quota. Lanes with no quota surface answer "has no quota mechanism"; a lane that is not logged in (e.g. codex) answers with a snapshot whose `detail` says to start a login with the `initiate_oauth_login` MCP tool.
   - `toggle_model`: Enables or disables a model id at runtime without deleting its alias mapping.
   - `get_client_usage`: Token accounting (prompt, completion, cached) plus request counts for one client key or overall, over a window such as `1h`, `24h`, `7d`.
   - `initiate_oauth_login`: Starts a non-blocking OAuth login for subscription lanes; returns the sign-in URL and the device-flow `user_code`.
@@ -225,7 +225,7 @@ systemctl --user status ultiproxy
 
 ## Configuration Reference
 
-Ultiproxy is zero-config on startup. `ultiproxy serve` (optionally `ULTIPROXY_ADDR=0.0.0.0:9050 ultiproxy serve` to bind a remote interface, or `--data-dir` to place persistent state) starts the daemon with no providers, no aliases and no timeouts defined; nothing has to exist before the first request. There is no config file to read or write.
+Ultiproxy is zero-config on startup. `ultiproxy serve` (optionally `ULTIPROXY_ADDR=0.0.0.0:9050 ultiproxy serve` to bind a remote interface, or `--data-dir` to place persistent state) starts the daemon with no providers, no aliases and no timeouts defined; nothing has to exist before the first request. There is no config file to read or write, and no administration CLI either: the daemon binary only serves (its only flags are `--config` and `--data-dir`, plus a `version` subcommand), so MCP is the sole control plane.
 
 ALL configuration is applied dynamically, at runtime, by agents or operators over MCP (`POST /mcp`, legacy SSE on `/mcp/sse`):
 
