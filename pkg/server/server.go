@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,6 +29,14 @@ type Server struct {
 	catalog   *ModelCatalog
 	timeouts  *TimeoutManager
 	providers *RuntimeProviderStore
+	// catalogOwned remembers which state model entries the last catalog sync
+	// installed, so the next sync can delete the ones the catalog no longer
+	// serves (remove_model_alias) without touching entries that came from
+	// elsewhere - notably toggle_model-created rows for lane-prefixed ids.
+	// catalogOwnedMu guards it: alias administration can arrive concurrently
+	// on the MCP surface.
+	catalogOwnedMu sync.Mutex
+	catalogOwned   map[string]bool
 	// mcpLaneBuilder bridges the runtime store's LaneBuilder into the MCP
 	// add_provider custom-kind path (antigravity, anthropic, codex).
 	mcpLaneBuilder func(name, kind, apiKey string) (provider.Provider, error)
@@ -295,19 +304,42 @@ func (a *stateManagerSourceAdapter) ToggleModel(modelID string, enabled bool) er
 	return nil
 }
 
-// syncCatalogToState copies every alias from the catalog into the state
-// manager's Models map so routing and /v1/models resolve them.
+// syncCatalogToState reconciles the state manager's Models map with the alias
+// catalog so routing and /v1/models resolve the same table the catalog owns.
+//
+// It is a reconciliation, not an upsert: aliases the catalog no longer serves
+// (remove_model_alias) are dropped from state, otherwise they keep routing
+// until the process restarts. Entries the catalog still serves keep their
+// runtime Enabled bit, so administering one alias never re-enables another the
+// operator disabled with toggle_model. Only aliases previously installed by
+// this sync are deleted, so toggle_model rows for ids the catalog never owned
+// (lane-prefixed ids like "zai/glm-5.3-flash") survive alias administration.
 func (s *Server) syncCatalogToState() {
 	if s.sm == nil {
 		return
 	}
+
 	aliases := s.catalog.List()
+
+	s.catalogOwnedMu.Lock()
+	var gone []string
+	for alias := range s.catalogOwned {
+		if _, still := aliases[alias]; !still {
+			gone = append(gone, alias)
+		}
+	}
+	s.catalogOwnedMu.Unlock()
+
 	s.sm.Update(func(snap *state.RuntimeSnapshot) {
 		if snap.Models == nil {
 			snap.Models = make(map[string]state.ModelRuntime)
 		}
+		for _, alias := range gone {
+			delete(snap.Models, alias)
+		}
 		for alias, entry := range aliases {
-			snap.Models[alias] = state.ModelRuntime{
+			prev, known := snap.Models[alias]
+			next := state.ModelRuntime{
 				ID:              alias,
 				Provider:        entry.Provider,
 				Enabled:         true,
@@ -316,8 +348,22 @@ func (s *Server) syncCatalogToState() {
 				PricingTag:      entry.PricingTag,
 				BenchmarkScores: entry.BenchmarkScores,
 			}
+			if known {
+				// Preserve the runtime toggle state of an alias the operator
+				// already switched off.
+				next.Enabled = prev.Enabled
+			}
+			snap.Models[alias] = next
 		}
 	})
+
+	owned := make(map[string]bool, len(aliases))
+	for alias := range aliases {
+		owned[alias] = true
+	}
+	s.catalogOwnedMu.Lock()
+	s.catalogOwned = owned
+	s.catalogOwnedMu.Unlock()
 }
 
 // catalogBridge adapts server.ModelCatalog to the mcp.AliasManager interface

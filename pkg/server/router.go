@@ -56,7 +56,15 @@ func (r *RegistryRouter) Route(ctx context.Context, model string) (string, error
 	if r.sm != nil {
 		snap := r.sm.Snapshot()
 		if snap != nil && snap.Models != nil {
-			if mr, ok := snap.Models[model]; ok && mr.Enabled {
+			if mr, ok := snap.Models[model]; ok {
+				// A disabled model is terminal: toggle_model(false) is a kill
+				// switch, not a discovery hint. Refuse here instead of falling
+				// through to the catalog or a provider-name prefix, either of
+				// which would happily route the very model the operator just
+				// disabled.
+				if !mr.Enabled {
+					return "", &DisabledModelError{Model: model}
+				}
 				if !excluded[mr.Provider] {
 					if pr, ok := snap.Providers[mr.Provider]; ok {
 						if pr.IsAvailable() {
@@ -91,13 +99,20 @@ func (r *RegistryRouter) Route(ctx context.Context, model string) (string, error
 	}
 
 	// 4. Direct or prefix match with provider name (e.g. "zai/glm-5.3-flash").
+	// The match is the lane id itself or a genuine "<lane>/" prefix - never a
+	// substring: a model id that merely embeds a lane name ("amazai-gpt-4o")
+	// belongs to no lane, and routing it would both misroute and hand the
+	// upstream an unstripped model name.
+	lowerModel := strings.ToLower(model)
 	for _, name := range names {
-		if strings.Contains(strings.ToLower(model), strings.ToLower(name)) {
-			if !excluded[name] {
-				return name, nil
-			}
-			return "", fmt.Errorf("provider %q for model %q is unavailable or failed", name, model)
+		lowerName := strings.ToLower(name)
+		if lowerModel != lowerName && !strings.HasPrefix(lowerModel, lowerName+"/") {
+			continue
 		}
+		if !excluded[name] {
+			return name, nil
+		}
+		return "", fmt.Errorf("provider %q for model %q is unavailable or failed", name, model)
 	}
 
 	// 5. Unknown model: reject with unknown_model instead of silently
@@ -113,4 +128,21 @@ type UnknownModelError struct {
 
 func (e *UnknownModelError) Error() string {
 	return fmt.Sprintf("unknown model %q: no catalog alias or provider prefix match", e.Model)
+}
+
+// DisabledModelError indicates the model is known but currently disabled
+// (toggle_model enabled=false, or an alias disabled at runtime). It unwraps to
+// UnknownModelError so the HTTP surface answers with the same 404
+// unknown_model contract clients already handle for ids that map to no lane.
+type DisabledModelError struct {
+	Model string
+}
+
+func (e *DisabledModelError) Error() string {
+	return fmt.Sprintf("model %q is disabled (toggle_model enabled=false); refusing to route", e.Model)
+}
+
+// Unwrap makes DisabledModelError classify as unknown_model on the wire.
+func (e *DisabledModelError) Unwrap() error {
+	return &UnknownModelError{Model: e.Model}
 }

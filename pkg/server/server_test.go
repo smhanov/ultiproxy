@@ -251,7 +251,7 @@ func TestServer_Auth401Paths(t *testing.T) {
 	}
 
 	// C. /v1/chat/completions with wrong key -> 401
-	reqBadAuth := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov-a/gpt-4o"}`))
+	reqBadAuth := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov/gpt-4o"}`))
 	reqBadAuth.Header.Set("Authorization", "Bearer wrong-key")
 	recBadAuth := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(recBadAuth, reqBadAuth)
@@ -260,7 +260,7 @@ func TestServer_Auth401Paths(t *testing.T) {
 	}
 
 	// D. Valid admin key -> 200
-	reqAdmin := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov-a/gpt-4o","messages":[]}`))
+	reqAdmin := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov/gpt-4o","messages":[]}`))
 	reqAdmin.Header.Set("Authorization", "Bearer admin-secret-key-123")
 	recAdmin := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(recAdmin, reqAdmin)
@@ -269,7 +269,7 @@ func TestServer_Auth401Paths(t *testing.T) {
 	}
 
 	// E. Valid client key -> 200
-	reqClient := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov-a/gpt-4o","messages":[]}`))
+	reqClient := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov/gpt-4o","messages":[]}`))
 	reqClient.Header.Set("Authorization", "Bearer alpha-secret-456")
 	recClient := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(recClient, reqClient)
@@ -306,7 +306,7 @@ func TestServer_PerClientAccountingTag(t *testing.T) {
 	registry.Register(provider.Provider{Inference: prov})
 	srv := NewServer(cfg, registry)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov-a/gpt-4o","messages":[]}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov/gpt-4o","messages":[]}`))
 	req.Header.Set("Authorization", "Bearer secret-token-xyz")
 	rec := httptest.NewRecorder()
 
@@ -348,7 +348,7 @@ func TestServer_UsageEvent_TrackUsageCall(t *testing.T) {
 
 	srv := NewServer(nil, registry, WithStorageWriter(writer))
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov-a/gpt-4o","messages":[],"stream":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov/gpt-4o","messages":[],"stream":true}`))
 	rec := httptest.NewRecorder()
 
 	srv.Handler().ServeHTTP(rec, req)
