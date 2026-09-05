@@ -202,7 +202,8 @@ func (s *Server) buildQuotaResponse(ctx context.Context) QuotaDashboardResponse 
 }
 
 func (s *Server) handleStatsSummary(w http.ResponseWriter, r *http.Request) {
-	// Provide stats summary for upctl usage
+	// Provide the stats summary served by GET /api/stats/summary (the
+	// numbers behind the MCP get_client_usage tool).
 	type StatsSummary struct {
 		TotalRequests int64   `json:"total_requests"`
 		TotalTokens   int64   `json:"total_tokens"`
