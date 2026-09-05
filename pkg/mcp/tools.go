@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/smhanov/ultiproxy/pkg/provider"
@@ -192,6 +193,17 @@ var standardTools = []Tool{
 		Description: "List runtime-registered provider lanes (base URL + quirks; secrets are redacted) and the live registry lanes.",
 		InputSchema: &InputSchema{Type: "object", Properties: map[string]PropertyDef{}},
 	},
+	{
+		Name:        "refresh_models",
+		Description: "Re-fetch a lane's upstream model list (GET <base>/v1/models) and cache it on the running lane, so <lane>/<model> ids show up in /v1/models. Needed for lanes registered before startup model discovery existed.",
+		InputSchema: &InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"name": {Type: "string", Description: "Provider lane name, e.g. opencode, vllm"},
+			},
+			Required: []string{"name"},
+		},
+	},
 }
 
 func (s *Server) handleListTools() any {
@@ -242,6 +254,8 @@ func (s *Server) handleCallTool(ctx context.Context, rawParams json.RawMessage) 
 		return s.toolRemoveProvider(ctx, params.Arguments)
 	case "list_providers":
 		return s.toolListProviders(ctx)
+	case "refresh_models":
+		return s.toolRefreshModels(ctx, params.Arguments)
 	default:
 		return nil, &JSONRPCError{
 			Code:    CodeMethodNotFound,
@@ -771,5 +785,73 @@ func (s *Server) toolRemoveProviderTimeout(ctx context.Context, argsRaw json.Raw
 	b, _ := json.MarshalIndent(res, "", "  ")
 	return &CallToolResult{
 		Content: []ToolContent{{Type: "text", Text: string(b)}},
+	}, nil
+}
+
+// modelsFetcher is the optional lane capability that pulls the upstream model
+// list and caches it (OpenAI-compatible lanes implement it via
+// GET <base>/models). It is asserted off bundle.Inference so the MCP layer
+// stays independent of the concrete adapter packages.
+type modelsFetcher interface {
+	FetchModels(ctx context.Context) ([]string, error)
+}
+
+// toolRefreshModels backfills the model cache of a running lane. Lanes
+// registered before startup model discovery existed have an empty cache, so
+// the aggregated /v1/models handler only lists the bare "<lane>" id. This tool
+// re-runs discovery on demand instead of forcing the lane to be re-added.
+func (s *Server) toolRefreshModels(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {
+	var args struct {
+		Name string `json:"name"`
+	}
+	_ = json.Unmarshal(argsRaw, &args)
+	if args.Name == "" {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: "error: name argument is required"}},
+			IsError: true,
+		}, nil
+	}
+
+	notFound := func() *CallToolResult {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: lane %s not found", args.Name)}},
+			IsError: true,
+		}
+	}
+	if s.registry == nil {
+		return notFound(), nil
+	}
+	bundle, ok := s.registry.Get(args.Name)
+	if !ok {
+		return notFound(), nil
+	}
+
+	// A lane with no inference surface has nothing to discover models for.
+	fetcher, ok := bundle.Inference.(modelsFetcher)
+	if !ok {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: lane %s does not support model discovery", args.Name)}},
+			IsError: true,
+		}, nil
+	}
+
+	fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	models, err := fetcher.FetchModels(fetchCtx)
+	if err != nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: fetching models for lane %s: %v", args.Name, err)}},
+			IsError: true,
+		}, nil
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%d models cached for lane %s\n", len(models), args.Name)
+	for _, m := range models {
+		sb.WriteString(m)
+		sb.WriteByte('\n')
+	}
+	return &CallToolResult{
+		Content: []ToolContent{{Type: "text", Text: sb.String()}},
 	}, nil
 }
