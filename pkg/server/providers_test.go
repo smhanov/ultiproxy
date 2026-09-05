@@ -424,3 +424,152 @@ func TestRuntimeProviderStore_FreebuffActorEnrichment(t *testing.T) {
 		t.Error("freebuff_default_tool did not round-trip")
 	}
 }
+
+// TestRuntimeProviderStore_RestoreDoesNotAttachFreebuffActorToOrdinaryLanes
+// covers the restart path for an ordinary OpenAI-compatible lane: the persisted
+// quirks.freebuff_actor boolean is the only Freebuff discriminator, so a lane
+// stored without it must come back with no actor at all -- even though the
+// runtime ActorBuilder is installed -- and must not invoke that builder. The
+// in-memory actor being nil is never evidence of Freebuff.
+func TestRuntimeProviderStore_RestoreDoesNotAttachFreebuffActorToOrdinaryLanes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.json")
+
+	s1 := NewRuntimeProviderStore(path)
+	s1.DefaultDataDir = dir
+	if err := s1.Add(openaicompat.Config{
+		Name:    "vllm",
+		BaseURL: "http://127.0.0.1:1/v1",
+		APIKey:  "sk-local",
+	}); err != nil {
+		t.Fatalf("add vllm: %v", err)
+	}
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read providers.json: %v", err)
+	}
+	if strings.Contains(string(onDisk), "freebuff") {
+		t.Fatalf("ordinary lane persisted a freebuff marker: %s", onDisk)
+	}
+
+	// Restart the way cmd does it: the store loads providers.json while
+	// ActorBuilder is still nil, and the builder is installed afterwards.
+	s2 := NewRuntimeProviderStore(path)
+	s2.DefaultDataDir = dir
+	if cfg := s2.List()["vllm"]; cfg.Quirks.FreebuffActor != nil {
+		t.Fatalf("ordinary lane loaded with an actor: %T", cfg.Quirks.FreebuffActor)
+	}
+	built := 0
+	var builtFor []string
+	s2.ActorBuilder = func(cfg openaicompat.Config) any {
+		built++
+		builtFor = append(builtFor, cfg.Name)
+		return any(fakeFreebuffActor{})
+	}
+
+	registry := provider.NewRegistry()
+	if got := s2.Restore(registry); len(got) != 1 || got[0] != "vllm" {
+		t.Fatalf("Restore registered %v, want [vllm]", got)
+	}
+	if built != 0 {
+		t.Fatalf("ActorBuilder invoked for %v (actor == nil must not mean Freebuff)", builtFor)
+	}
+	if cfg := s2.List()["vllm"]; cfg.Quirks.FreebuffActor != nil {
+		t.Fatalf("ordinary lane gained a Freebuff actor on restore: %T", cfg.Quirks.FreebuffActor)
+	}
+	p, ok := registry.Get("vllm")
+	if !ok {
+		t.Fatal("vllm not registered by Restore")
+	}
+	if p.Quota != nil {
+		t.Errorf("ordinary restored lane exposes a quota provider: %T", p.Quota)
+	}
+	if p.Capabilities.MaxConcurrentRequests == 1 || p.Capabilities.SessionAffinity || p.Capabilities.Queueing {
+		t.Errorf("ordinary restored lane gained freebuff capabilities: %+v", p.Capabilities)
+	}
+}
+
+// TestRuntimeProviderStore_RestoreMixedLanes covers one providers.json holding
+// both an ordinary OpenAI-compatible lane and a freebuff lane: after a restart
+// only the lane persisted with quirks.freebuff_actor true gets an actor, and the
+// builder runs exactly once.
+func TestRuntimeProviderStore_RestoreMixedLanes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.json")
+	file := `{
+  "freebuff": {
+    "kind": "openaicompat",
+    "name": "freebuff",
+    "base_url": "https://www.codebuff.com/api/v1",
+    "api_key": "fb-key",
+    "quirks": {"freebuff_actor": true, "freebuff_default_tool": true}
+  },
+  "ordinary": {
+    "kind": "openaicompat",
+    "name": "ordinary",
+    "base_url": "http://127.0.0.1:1/v1",
+    "api_key": "sk-ord",
+    "quirks": {}
+  }
+}`
+	if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
+		t.Fatalf("write providers.json: %v", err)
+	}
+
+	s := NewRuntimeProviderStore(path)
+	s.DefaultDataDir = dir
+	built := 0
+	var builtFor []string
+	s.ActorBuilder = func(cfg openaicompat.Config) any {
+		built++
+		builtFor = append(builtFor, cfg.Name)
+		return any(fakeFreebuffActor{})
+	}
+
+	registry := provider.NewRegistry()
+	got := s.Restore(registry)
+	if len(got) != 2 || got[0] != "freebuff" || got[1] != "ordinary" {
+		t.Fatalf("Restore registered %v, want [freebuff ordinary]", got)
+	}
+	if built != 1 {
+		t.Fatalf("ActorBuilder called %d times for %v, want exactly once (freebuff only)", built, builtFor)
+	}
+	if len(builtFor) != 1 || builtFor[0] != "freebuff" {
+		t.Fatalf("ActorBuilder built for %v, want [freebuff]", builtFor)
+	}
+
+	fb, ok := registry.Get("freebuff")
+	if !ok {
+		t.Fatal("freebuff lane not registered")
+	}
+	if fb.Quota == nil {
+		t.Error("freebuff restored lane lost its quota provider")
+	}
+	if fb.Capabilities.MaxConcurrentRequests != 1 || !fb.Capabilities.SessionAffinity {
+		t.Errorf("freebuff restored lane lost actor capabilities: %+v", fb.Capabilities)
+	}
+	ord, ok := registry.Get("ordinary")
+	if !ok {
+		t.Fatal("ordinary lane not registered")
+	}
+	if ord.Quota != nil {
+		t.Errorf("ordinary restored lane exposes a quota provider: %T", ord.Quota)
+	}
+	if ord.Capabilities.MaxConcurrentRequests == 1 || ord.Capabilities.SessionAffinity || ord.Capabilities.Queueing {
+		t.Errorf("ordinary restored lane gained freebuff capabilities: %+v", ord.Capabilities)
+	}
+
+	// The loaded freebuff lane still has a nil in-memory actor (the builder only
+	// ran for the restore copy), so re-persisting the file -- which any later
+	// add_provider does -- must not drop the persisted flag.
+	if err := s.Add(openaicompat.Config{Name: "extra", BaseURL: "http://127.0.0.1:2/v1", APIKey: "sk-extra"}); err != nil {
+		t.Fatalf("add extra lane: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read providers.json: %v", err)
+	}
+	if !strings.Contains(string(data), `"freebuff_actor": true`) {
+		t.Fatalf("re-persist dropped the freebuff flag: %s", data)
+	}
+}

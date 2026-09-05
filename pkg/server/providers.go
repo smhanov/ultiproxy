@@ -18,7 +18,10 @@
 //     load the actor is reconstructed through ActorBuilder when one is
 //     installed (cmd/ultiproxy installs the same *freebuffActorAdapter used by
 //     the compile-time lane). When no builder is installed the lane still
-//     loads, just without the serialized-request lock actor.
+//     loads, just without the serialized-request lock actor -- and the flag is
+//     kept in memory (RuntimeProviderStore.freebuff) so Restore can rebuild the
+//     actor once a builder exists, without ever turning an ordinary lane into a
+//     freebuff lane.
 //   - TokenSource is never persisted. openaicompat.New rebuilds token sources
 //     from compiled-in vendor defaults plus the server's DataDir (credential
 //     state lives under <DefaultDataDir>/credentials/<lane>), exactly the way
@@ -129,6 +132,13 @@ type RuntimeProviderStore struct {
 	providers map[string]openaicompat.Config
 	custom    map[string]storedProvider // non-openaicompat kinds (kind != "")
 	restored  bool
+	// freebuff holds the persisted quirks.freebuff_actor flag per
+	// openai-compatible lane. The flag lives only in the JSON DTO: the
+	// in-memory config carries an actor, not a bool, and that actor cannot be
+	// rebuilt while ActorBuilder is still nil -- exactly the state
+	// NewRuntimeProviderStore loads the file in. Restore reads this flag (never
+	// "actor == nil") to decide which lanes are Freebuff.
+	freebuff map[string]bool
 	// DefaultDataDir is the server's general data directory. Runtime lanes do
 	// NOT carry their own data dir; credential state lives under
 	// <DefaultDataDir>/credentials/<lane> exactly like compile-time lanes.
@@ -154,6 +164,7 @@ func NewRuntimeProviderStore(path string) *RuntimeProviderStore {
 		path:      path,
 		providers: make(map[string]openaicompat.Config),
 		custom:    make(map[string]storedProvider),
+		freebuff:  make(map[string]bool),
 	}
 	if path == "" {
 		return s
@@ -166,6 +177,7 @@ func NewRuntimeProviderStore(path string) *RuntimeProviderStore {
 					s.custom[name] = sp
 				} else {
 					s.providers[name] = s.credentialDir(sp.toConfig(s.ActorBuilder))
+					s.freebuff[name] = sp.Quirks.FreebuffActor
 				}
 			}
 		}
@@ -297,8 +309,12 @@ func (s *RuntimeProviderStore) Add(cfg openaicompat.Config) error {
 	if s.providers == nil {
 		s.providers = make(map[string]openaicompat.Config)
 	}
+	if s.freebuff == nil {
+		s.freebuff = make(map[string]bool)
+	}
 	delete(s.custom, cfg.Name)
 	s.providers[cfg.Name] = cfg
+	s.freebuff[cfg.Name] = cfg.Quirks.FreebuffActor != nil
 	s.mu.Unlock()
 	return s.persist()
 }
@@ -328,6 +344,7 @@ func (s *RuntimeProviderStore) AddCustom(name, kind, apiKey string) error {
 		s.custom = make(map[string]storedProvider)
 	}
 	delete(s.providers, name)
+	delete(s.freebuff, name)
 	s.custom[name] = storedProvider{Kind: kind, Name: name, APIKey: apiKey}
 	s.mu.Unlock()
 	return s.persist()
@@ -349,6 +366,7 @@ func (s *RuntimeProviderStore) Remove(name string) error {
 			delete(s.custom, name)
 		}
 	}
+	delete(s.freebuff, name)
 	s.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrProviderNotStored, name)
@@ -372,6 +390,7 @@ func (s *RuntimeProviderStore) Load() (map[string]openaicompat.Config, error) {
 		if os.IsNotExist(err) {
 			s.mu.Lock()
 			s.providers = make(map[string]openaicompat.Config)
+			s.freebuff = make(map[string]bool)
 			s.mu.Unlock()
 			return out, nil
 		}
@@ -384,11 +403,13 @@ func (s *RuntimeProviderStore) Load() (map[string]openaicompat.Config, error) {
 	s.mu.Lock()
 	s.providers = make(map[string]openaicompat.Config, len(stored))
 	s.custom = make(map[string]storedProvider, len(stored))
+	s.freebuff = make(map[string]bool, len(stored))
 	for name, sp := range stored {
 		if sp.Kind != "" && sp.Kind != RuntimeProviderKindOpenAICompat {
 			s.custom[name] = sp
 		} else {
 			s.providers[name] = s.credentialDir(sp.toConfig(s.ActorBuilder))
+			s.freebuff[name] = sp.Quirks.FreebuffActor
 		}
 	}
 	s.mu.Unlock()
@@ -410,10 +431,14 @@ func (s *RuntimeProviderStore) Restore(registry *provider.Registry) []string {
 	s.restored = true
 	snapshot := make(map[string]openaicompat.Config, len(s.providers))
 	customSnap := make(map[string]storedProvider, len(s.custom))
+	freebuffSnap := make(map[string]bool, len(s.freebuff))
 	builder := s.ActorBuilder
 	laneBuilder := s.LaneBuilder
 	for k, v := range s.providers {
 		snapshot[k] = v
+	}
+	for k, v := range s.freebuff {
+		freebuffSnap[k] = v
 	}
 	for k, v := range s.custom {
 		customSnap[k] = v
@@ -423,8 +448,10 @@ func (s *RuntimeProviderStore) Restore(registry *provider.Registry) []string {
 	registered := make([]string, 0, len(snapshot)+len(customSnap))
 	for _, name := range sortedConfigNames(snapshot) {
 		cfg := s.credentialDir(snapshot[name])
-		if builder != nil && cfg.Quirks.FreebuffActor == nil {
-			// storedProvider only keeps a bool flag; rebuild the actor here.
+		if builder != nil && freebuffSnap[name] && cfg.Quirks.FreebuffActor == nil {
+			// storedProvider only keeps a bool flag; rebuild the actor here, and
+			// only for lanes persisted with quirks.freebuff_actor=true. A nil
+			// actor is never itself evidence that a lane is Freebuff.
 			cfg.Quirks.FreebuffActor = builder(cfg)
 		}
 		p, err := openaicompat.New(cfg)
@@ -482,6 +509,12 @@ func (s *RuntimeProviderStore) persist() error {
 	for k, v := range s.providers {
 		sp := toStoredProvider(v)
 		sp.Kind = RuntimeProviderKindOpenAICompat
+		// A freebuff lane loaded while ActorBuilder was still nil carries no
+		// in-memory actor, so toStoredProvider would write the flag as false.
+		// The persisted boolean is the durable record: keep it.
+		if s.freebuff[k] {
+			sp.Quirks.FreebuffActor = true
+		}
 		snapshot[k] = sp
 	}
 	for k, v := range s.custom {
