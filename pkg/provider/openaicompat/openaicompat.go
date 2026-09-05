@@ -59,8 +59,9 @@ type Provider struct {
 	apiKey     string
 	name       string
 
-	mu     sync.RWMutex
-	models []string
+	mu        sync.RWMutex
+	models    []string
+	modelInfo []provider.ModelInfo
 	// pendingXAI holds the in-flight device authorization for a two-phase
 	// MCP-driven login. Guarded by mu.
 	pendingXAI *xaiPendingFlow
@@ -790,7 +791,12 @@ func (p *Provider) FetchModels(ctx context.Context) ([]string, error) {
 
 	var raw struct {
 		Data []struct {
-			ID string `json:"id"`
+			ID            string `json:"id"`
+			MaxModelLen   int    `json:"max_model_len"`
+			ContextLength int    `json:"context_length"`
+			Meta          struct {
+				ContextLength int `json:"context_length"`
+			} `json:"meta"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
@@ -798,17 +804,35 @@ func (p *Provider) FetchModels(ctx context.Context) ([]string, error) {
 	}
 
 	var models []string
+	var info []provider.ModelInfo
 	for _, m := range raw.Data {
-		if m.ID != "" {
-			models = append(models, m.ID)
+		if m.ID == "" {
+			continue
 		}
+		models = append(models, m.ID)
+		info = append(info, provider.ModelInfo{
+			ID:            m.ID,
+			ContextLength: pickContextLength(m.MaxModelLen, m.ContextLength, m.Meta.ContextLength),
+		})
 	}
 
 	p.mu.Lock()
 	p.models = models
+	p.modelInfo = info
 	p.mu.Unlock()
 
 	return models, nil
+}
+
+// pickContextLength returns the first positive window from upstream field
+// variants: vLLM max_model_len, OpenRouter-style context_length, nested meta.
+func pickContextLength(values ...int) int {
+	for _, v := range values {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
 }
 
 // Quota implements provider.QuotaProvider.
@@ -1053,5 +1077,18 @@ func (p *Provider) CachedModels() []string {
 	}
 	out := make([]string, len(p.models))
 	copy(out, p.models)
+	return out
+}
+
+// CachedModelInfo returns discovered ids plus context windows without
+// contacting the upstream. ContextLength is 0 when the upstream omitted it.
+func (p *Provider) CachedModelInfo() []provider.ModelInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.modelInfo) == 0 {
+		return nil
+	}
+	out := make([]provider.ModelInfo, len(p.modelInfo))
+	copy(out, p.modelInfo)
 	return out
 }

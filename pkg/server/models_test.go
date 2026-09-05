@@ -29,16 +29,21 @@ type fakeModelUpstream struct {
 
 func newFakeModelUpstream(t *testing.T, modelIDs ...string) *fakeModelUpstream {
 	t.Helper()
+	rows := make([]map[string]any, 0, len(modelIDs))
+	for _, id := range modelIDs {
+		rows = append(rows, map[string]any{"id": id})
+	}
+	return newFakeModelUpstreamRows(t, rows)
+}
+
+func newFakeModelUpstreamRows(t *testing.T, rows []map[string]any) *fakeModelUpstream {
+	t.Helper()
 	f := &fakeModelUpstream{}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/models":
 			atomic.AddInt32(&f.models, 1)
-			data := make([]map[string]any, 0, len(modelIDs))
-			for _, id := range modelIDs {
-				data = append(data, map[string]any{"id": id})
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
+			_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": rows})
 		case "/v1/chat/completions":
 			atomic.AddInt32(&f.chats, 1)
 			_ = json.NewDecoder(r.Body).Decode(&f.lastBody)
@@ -68,6 +73,7 @@ type modelsResponseShape struct {
 		Created         int64  `json:"created"`
 		OwnedBy         string `json:"owned_by"`
 		ContextLength   int    `json:"context_length"`
+		MaxModelLen     int    `json:"max_model_len"`
 		MaxOutputTokens int    `json:"max_output_tokens"`
 	} `json:"data"`
 }
@@ -283,6 +289,9 @@ func TestHandleModels_AliasLimits(t *testing.T) {
 	}
 	if resp.Data[0].MaxOutputTokens != 77 {
 		t.Errorf("max_output_tokens = %d, want 77", resp.Data[0].MaxOutputTokens)
+	}
+	if resp.Data[0].MaxModelLen != 200000 {
+		t.Errorf("max_model_len = %d, want 200000", resp.Data[0].MaxModelLen)
 	}
 }
 
@@ -606,5 +615,177 @@ func TestHandleModels_MatchesListModelsTool(t *testing.T) {
 				t.Errorf("list_models ids = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func findModel(resp modelsResponseShape, id string) (contextLength, maxModelLen int, ok bool) {
+	for _, e := range resp.Data {
+		if e.ID == id {
+			return e.ContextLength, e.MaxModelLen, true
+		}
+	}
+	return 0, 0, false
+}
+
+func getModelsRaw(t *testing.T, srv *Server) []map[string]any {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/models: %d %s", rec.Code, rec.Body.String())
+	}
+	var wrap struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &wrap); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return wrap.Data
+}
+
+func registerDiscoveredLane(t *testing.T, dir, name string, upstream *fakeModelUpstream) *Server {
+	t.Helper()
+	cfg := DefaultConfig()
+	cfg.DataDir = dir
+	store := NewRuntimeProviderStore(filepath.Join(dir, "providers.json"))
+	store.DefaultDataDir = dir
+	if err := store.Add(openaicompat.Config{
+		Name:    name,
+		BaseURL: upstream.srv.URL,
+		Quirks:  openaicompat.Quirks{ModelListPassthrough: true},
+	}); err != nil {
+		t.Fatalf("add lane: %v", err)
+	}
+	return NewServer(cfg, provider.NewRegistry(),
+		WithStateManager(state.NewStateManager()),
+		WithRuntimeProviderStore(store),
+	)
+}
+
+func TestHandleModels_MaxModelLenFromVLLM(t *testing.T) {
+	dir := t.TempDir()
+	upstream := newFakeModelUpstreamRows(t, []map[string]any{
+		{"id": "Qwen/Qwen3", "max_model_len": 131072},
+	})
+	srv := registerDiscoveredLane(t, dir, "vllm", upstream)
+	before := upstream.modelRequests()
+	raw := getModelsRaw(t, srv)
+	if got := upstream.modelRequests(); got != before {
+		t.Errorf("GET /v1/models re-probed: %d -> %d", before, got)
+	}
+	var hit map[string]any
+	for _, m := range raw {
+		if m["id"] == "vllm/Qwen/Qwen3" {
+			hit = m
+			break
+		}
+	}
+	if hit == nil {
+		t.Fatalf("missing vllm/Qwen/Qwen3 in %v", raw)
+	}
+	if hit["context_length"] != float64(131072) {
+		t.Errorf("context_length = %v, want 131072", hit["context_length"])
+	}
+	if hit["max_model_len"] != float64(131072) {
+		t.Errorf("max_model_len = %v, want 131072", hit["max_model_len"])
+	}
+}
+
+func TestHandleModels_ContextLengthFromOpenRouterStyle(t *testing.T) {
+	dir := t.TempDir()
+	upstream := newFakeModelUpstreamRows(t, []map[string]any{
+		{"id": "gpt-4o", "context_length": 128000},
+	})
+	srv := registerDiscoveredLane(t, dir, "openrouter", upstream)
+	raw := getModelsRaw(t, srv)
+	var hit map[string]any
+	for _, m := range raw {
+		if m["id"] == "openrouter/gpt-4o" {
+			hit = m
+			break
+		}
+	}
+	if hit == nil {
+		t.Fatalf("missing openrouter/gpt-4o")
+	}
+	if hit["context_length"] != float64(128000) || hit["max_model_len"] != float64(128000) {
+		t.Errorf("windows = %v", hit)
+	}
+}
+
+func TestHandleModels_OmitsUnknownWindow(t *testing.T) {
+	dir := t.TempDir()
+	upstream := newFakeModelUpstream(t, "bare-id")
+	srv := registerDiscoveredLane(t, dir, "lane", upstream)
+	raw := getModelsRaw(t, srv)
+	var hit map[string]any
+	for _, m := range raw {
+		if m["id"] == "lane/bare-id" {
+			hit = m
+			break
+		}
+	}
+	if hit == nil {
+		t.Fatal("missing lane/bare-id")
+	}
+	if _, ok := hit["context_length"]; ok {
+		t.Errorf("context_length present: %v", hit["context_length"])
+	}
+	if _, ok := hit["max_model_len"]; ok {
+		t.Errorf("max_model_len present: %v", hit["max_model_len"])
+	}
+}
+
+func TestHandleModels_AliasContextLimitWins(t *testing.T) {
+	dir := t.TempDir()
+	upstream := newFakeModelUpstreamRows(t, []map[string]any{
+		{"id": "Qwen/Qwen3", "max_model_len": 131072},
+	})
+	cfg := DefaultConfig()
+	cfg.DataDir = dir
+	cfg.Server.Models = map[string]ModelAlias{
+		"qwen": {Provider: "vllm", Upstream: "Qwen/Qwen3", ContextLimit: 200000},
+	}
+	store := NewRuntimeProviderStore(filepath.Join(dir, "providers.json"))
+	store.DefaultDataDir = dir
+	if err := store.Add(openaicompat.Config{
+		Name: "vllm", BaseURL: upstream.srv.URL, Quirks: openaicompat.Quirks{ModelListPassthrough: true},
+	}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	srv := NewServer(cfg, provider.NewRegistry(), WithStateManager(state.NewStateManager()), WithRuntimeProviderStore(store))
+	cl, ml, ok := findModel(getModels(t, srv), "qwen")
+	if !ok {
+		t.Fatal("missing alias qwen")
+	}
+	if cl != 200000 || ml != 200000 {
+		t.Errorf("alias window context_length=%d max_model_len=%d, want 200000", cl, ml)
+	}
+}
+
+func TestHandleModels_AliasInheritsDiscoveredWindow(t *testing.T) {
+	dir := t.TempDir()
+	upstream := newFakeModelUpstreamRows(t, []map[string]any{
+		{"id": "Qwen/Qwen3", "max_model_len": 131072},
+	})
+	cfg := DefaultConfig()
+	cfg.DataDir = dir
+	cfg.Server.Models = map[string]ModelAlias{
+		"heapster-7b": {Provider: "vllm", Upstream: "Qwen/Qwen3"},
+	}
+	store := NewRuntimeProviderStore(filepath.Join(dir, "providers.json"))
+	store.DefaultDataDir = dir
+	if err := store.Add(openaicompat.Config{
+		Name: "vllm", BaseURL: upstream.srv.URL, Quirks: openaicompat.Quirks{ModelListPassthrough: true},
+	}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	srv := NewServer(cfg, provider.NewRegistry(), WithStateManager(state.NewStateManager()), WithRuntimeProviderStore(store))
+	cl, ml, ok := findModel(getModels(t, srv), "heapster-7b")
+	if !ok {
+		t.Fatal("missing alias heapster-7b")
+	}
+	if cl != 131072 || ml != 131072 {
+		t.Errorf("inherited window context_length=%d max_model_len=%d, want 131072", cl, ml)
 	}
 }

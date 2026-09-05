@@ -147,6 +147,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		// ContextLength is advisory metadata: it is reported to clients but
 		// not enforced on the request path.
 		ContextLength   int `json:"context_length,omitempty"`
+		MaxModelLen     int `json:"max_model_len,omitempty"`
 		MaxOutputTokens int `json:"max_output_tokens,omitempty"`
 	}
 
@@ -168,6 +169,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			Created:         1700000000,
 			OwnedBy:         ownedBy,
 			ContextLength:   contextLength,
+			MaxModelLen:     contextLength,
 			MaxOutputTokens: maxOutput,
 		})
 	}
@@ -189,7 +191,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			if !m.Enabled {
 				continue
 			}
-			add(m.ID, m.Provider, m.ContextLimit, m.MaxOutput)
+			add(m.ID, m.Provider, resolvedContext(m.ContextLimit, s.discoveredContext(m.Provider, aliasUpstream(s.catalog, m.ID))), m.MaxOutput)
 		}
 	}
 
@@ -205,7 +207,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
-			add(alias, entry.Provider, entry.ContextLimit, entry.MaxOutput)
+			add(alias, entry.Provider, resolvedContext(entry.ContextLimit, s.discoveredContext(entry.Provider, entry.Upstream)), entry.MaxOutput)
 		}
 	}
 
@@ -221,17 +223,25 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if cacher, ok := bundle.Inference.(modelsCacheProvider); ok {
-				discovered := cacher.CachedModels()
-				sort.Strings(discovered)
-				for _, m := range discovered {
-					add(name+"/"+m, name, 0, 0)
+				if meta, ok := bundle.Inference.(provider.ModelInfoCache); ok {
+					info := meta.CachedModelInfo()
+					sort.Slice(info, func(i, j int) bool { return info[i].ID < info[j].ID })
+					for _, m := range info {
+						add(name+"/"+m.ID, name, m.ContextLength, 0)
+					}
+				} else {
+					discovered := cacher.CachedModels()
+					sort.Strings(discovered)
+					for _, m := range discovered {
+						add(name+"/"+m, name, 0, 0)
+					}
 				}
 			}
 			// Escape hatch for lanes with no model discovery: a real default
 			// model still yields exactly one routable, advertised id.
 			if def, ok := bundle.Inference.(defaultModelProvider); ok {
 				if m := def.DefaultModel(); m != "" {
-					add(name+"/"+m, name, 0, 0)
+					add(name+"/"+m, name, s.discoveredContext(name, m), 0)
 				}
 			}
 		}
@@ -244,6 +254,49 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// resolvedContext prefers an operator-set alias context_limit over a
+// discovered upstream window. Zero means unknown and stays omitted.
+func resolvedContext(aliasLimit, discovered int) int {
+	if aliasLimit > 0 {
+		return aliasLimit
+	}
+	if discovered > 0 {
+		return discovered
+	}
+	return 0
+}
+
+func aliasUpstream(catalog *ModelCatalog, alias string) string {
+	if catalog == nil {
+		return ""
+	}
+	entry, ok := catalog.Get(alias)
+	if !ok {
+		return ""
+	}
+	return entry.Upstream
+}
+
+func (s *Server) discoveredContext(lane, upstream string) int {
+	if s == nil || s.registry == nil || lane == "" || upstream == "" {
+		return 0
+	}
+	bundle, ok := s.registry.Get(lane)
+	if !ok || bundle.Inference == nil {
+		return 0
+	}
+	meta, ok := bundle.Inference.(provider.ModelInfoCache)
+	if !ok {
+		return 0
+	}
+	for _, m := range meta.CachedModelInfo() {
+		if m.ID == upstream {
+			return m.ContextLength
+		}
+	}
+	return 0
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {

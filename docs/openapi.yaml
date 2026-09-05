@@ -641,6 +641,10 @@ components:
           type: string
         context_length:
           type: integer
+          description: Context window in tokens (advisory). Duplicate of max_model_len.
+        max_model_len:
+          type: integer
+          description: vLLM-compatible alias of context_length. Same integer; omitted when unknown.
         max_output_tokens:
           type: integer
         pricing:

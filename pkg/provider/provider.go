@@ -25,6 +25,22 @@ var ErrProviderNotFound = errors.New("provider: not found")
 // they do not support.
 var ErrNotImplemented = errors.New("provider: not implemented")
 
+// ModelInfo is one cached upstream model: the id plus an optional context
+// window in tokens. ContextLength 0 means unknown (do not advertise 0 as a
+// real window). OpenAI-compatible discovery fills this from max_model_len
+// or context_length on GET /v1/models.
+type ModelInfo struct {
+	ID            string
+	ContextLength int
+}
+
+// ModelInfoCache is implemented by lanes that retain per-model metadata
+// from discovery. The aggregated /v1/models handler type-asserts this so
+// listing never fans out.
+type ModelInfoCache interface {
+	CachedModelInfo() []ModelInfo
+}
+
 // QuotaWindow is one quota/rate-limit pool reported by a QuotaProvider.
 type QuotaWindow struct {
 	Label            string    `json:"label"`

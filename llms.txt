@@ -84,6 +84,7 @@ curl -s http://localhost:9050/v1/messages \
       "created": 1729600000,
       "owned_by": "github-copilot",
       "context_length": 200000,
+      "max_model_len": 200000,
       "max_output_tokens": 8192,
       "benchmarks": { "swe_bench": 49.2, "humaneval": 92.4 },
       "provider": { "id": "copilot", "status": "ok" }
