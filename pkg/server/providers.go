@@ -295,6 +295,17 @@ func (s *RuntimeProviderStore) Add(cfg openaicompat.Config) error {
 	if cfg.DataDir == "" && s.DefaultDataDir != "" {
 		cfg.DataDir = filepath.Join(s.DefaultDataDir, "credentials", cfg.Name)
 	}
+	// A freebuff lane added over MCP carries only a non-nil marker (the real
+	// actor is not JSON-serializable and cannot cross that boundary). Build the
+	// serialized-request actor here from the lane's own key / data dir so the
+	// stored config is immediately usable, exactly like a restored lane.
+	if cfg.Quirks.FreebuffActor != nil && s.ActorBuilder != nil {
+		if _, ok := cfg.Quirks.FreebuffActor.(openaicompat.FreebuffActor); !ok {
+			if actor := s.ActorBuilder(cfg); actor != nil {
+				cfg.Quirks.FreebuffActor = actor
+			}
+		}
+	}
 	s.mu.Lock()
 	if s.providers == nil {
 		s.providers = make(map[string]openaicompat.Config)

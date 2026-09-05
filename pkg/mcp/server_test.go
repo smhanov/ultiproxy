@@ -636,3 +636,100 @@ func TestMCP_AddCustomProviderCodex(t *testing.T) {
 		t.Fatal("registry does not contain the codex lane")
 	}
 }
+
+// TestMCP_AddProviderFreebuffQuirks covers the freebuff lane added as an
+// OpenAI-compatible lane with quirks.freebuff_actor=true: the lane must carry
+// the freebuff quirks (serialized requests, default tool, actor-backed quota)
+// even though the actor itself cannot cross the MCP boundary.
+func TestMCP_AddProviderFreebuffQuirks(t *testing.T) {
+	dir := t.TempDir()
+	store := newFileProviderStore(filepath.Join(dir, "providers.json"))
+	registry := provider.NewRegistry()
+	srv := NewServer(registry, nil, WithProviderStore(store))
+
+	res := callMCPTool(t, srv, 1, "add_provider",
+		`{"name":"freebuff","base_url":"https://www.codebuff.com/api/v1","api_key":"fb-key","quirks":{"freebuff_actor":true,"freebuff_default_tool":true}}`)
+	if res.IsError {
+		t.Fatalf("add_provider failed: %s", res.Content[0].Text)
+	}
+	if !strings.Contains(res.Content[0].Text, `"registered": true`) {
+		t.Fatalf("add_provider response unexpected: %s", res.Content[0].Text)
+	}
+
+	lane, ok := registry.Get("freebuff")
+	if !ok {
+		t.Fatal("registry does not contain the freebuff lane")
+	}
+	if lane.Inference == nil || lane.Inference.Name() != "freebuff" {
+		t.Fatalf("freebuff lane is not an inference provider: %+v", lane)
+	}
+	// The actor marker keeps the quota surface attached and serializes requests.
+	if lane.Quota == nil {
+		t.Fatal("expected a Quota provider on the freebuff lane")
+	}
+	if lane.Capabilities.MaxConcurrentRequests != 1 {
+		t.Errorf("MaxConcurrentRequests = %d, want 1 (serialized freebuff session)", lane.Capabilities.MaxConcurrentRequests)
+	}
+
+	stored := store.List()["freebuff"]
+	if stored.APIKey != "fb-key" {
+		t.Errorf("stored api key = %q, want fb-key", stored.APIKey)
+	}
+	if stored.Quirks.FreebuffActor == nil {
+		t.Error("stored config lost the freebuff actor marker")
+	}
+	if !stored.Quirks.FreebuffDefaultTool {
+		t.Error("stored config lost freebuff_default_tool")
+	}
+
+	// The flag is surfaced (as a boolean, never the actor itself) on listing.
+	list := callMCPTool(t, srv, 2, "list_providers", `{}`)
+	if list.IsError {
+		t.Fatalf("list_providers failed: %s", list.Content[0].Text)
+	}
+	if !strings.Contains(list.Content[0].Text, `"freebuff_actor": true`) {
+		t.Errorf("list_providers does not report freebuff_actor: %s", list.Content[0].Text)
+	}
+	if strings.Contains(list.Content[0].Text, "fb-key") {
+		t.Errorf("list_providers leaked the api key: %s", list.Content[0].Text)
+	}
+}
+
+// TestMCP_AddCustomProviderFreebuff covers kind=freebuff: the add_provider
+// call must reach the injected builder with the lane kind and api key so the
+// freebuff lane can be registered at runtime without any CLI or config file.
+func TestMCP_AddCustomProviderFreebuff(t *testing.T) {
+	dir := t.TempDir()
+	store := newFileProviderStore(filepath.Join(dir, "providers.json"))
+	registry := provider.NewRegistry()
+
+	var gotName, gotKind, gotAPIKey string
+	srv := NewServer(registry, nil,
+		WithProviderStore(store),
+		WithCustomLaneBuilder(func(name, kind, apiKey string) (provider.Provider, error) {
+			gotName, gotKind, gotAPIKey = name, kind, apiKey
+			return provider.Provider{Inference: stubCustomLane{name: name}}, nil
+		}),
+	)
+
+	res := callMCPTool(t, srv, 1, "add_provider",
+		`{"name":"freebuff","kind":"freebuff","api_key":"fb-kind-key"}`)
+	if res.IsError {
+		t.Fatalf("add_provider failed: %s", res.Content[0].Text)
+	}
+	if !strings.Contains(res.Content[0].Text, `"kind": "freebuff"`) {
+		t.Fatalf("add_provider response unexpected: %s", res.Content[0].Text)
+	}
+	if gotName != "freebuff" || gotKind != "freebuff" {
+		t.Fatalf("builder got name=%q kind=%q, want freebuff/freebuff", gotName, gotKind)
+	}
+	if gotAPIKey != "fb-kind-key" {
+		t.Fatalf("builder api key = %q, want fb-kind-key", gotAPIKey)
+	}
+	if _, ok := registry.Get("freebuff"); !ok {
+		t.Fatal("registry does not contain the freebuff lane")
+	}
+	if store.List()["freebuff"].BaseURL != "custom://freebuff" {
+		t.Fatalf("custom lane not persisted: %+v", store.List()["freebuff"])
+	}
+}

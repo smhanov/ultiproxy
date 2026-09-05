@@ -344,7 +344,7 @@ func registerProviders(registry *provider.Registry) {
 		if err := os.MkdirAll(stateDir, 0755); err != nil {
 			log.Printf("[providers] freebuff: %v", err)
 		} else {
-			fbActor := newFreebuffActor(stateDir)
+			fbActor := newFreebuffActor(stateDir, "")
 			if fbActor == nil {
 				log.Printf("[providers] freebuff: actor unavailable")
 			} else {
@@ -385,14 +385,21 @@ func freebuffToken(stateDir string) string {
 }
 
 // newFreebuffActor builds the serialized-request actor for a freebuff lane,
-// reusing the persisted instance id (if any). It returns nil when no token is
-// available. Used by the compile-time lane above and by the runtime provider
-// store hook (providers.json quirks.freebuff_actor=true).
-func newFreebuffActor(stateDir string) any {
-	fbTok := freebuffToken(stateDir)
+// reusing the persisted instance id (if any). An explicit token (the api_key
+// handed to add_provider, or a lane's stored key) wins; without one the token
+// is discovered from the ultiproxy-owned sources (env, then the state-dir
+// token file). It returns nil when no token is available at all. Used by the
+// compile-time lane above, by the runtime provider store hook (providers.json
+// quirks.freebuff_actor=true) and by runtimeLaneBuilder for kind=freebuff.
+func newFreebuffActor(stateDir, token string) any {
+	fbTok := strings.TrimSpace(token)
+	if fbTok == "" {
+		fbTok = freebuffToken(stateDir)
+	}
 	if fbTok == "" {
 		return nil
 	}
+	persistFreebuffToken(stateDir, fbTok)
 	instanceID := ""
 	if data, err := os.ReadFile(filepath.Join(stateDir, "freebuff_instance_id")); err == nil {
 		instanceID = strings.TrimSpace(string(data))
@@ -414,8 +421,30 @@ func newFreebuffActor(stateDir string) any {
 	return &freebuffActorAdapter{actor: fbActor}
 }
 
+// persistFreebuffToken records an explicitly supplied freebuff token in the
+// ultiproxy-owned state dir so a runtime lane keeps working after a restart
+// even if its key is not re-supplied. An existing token file is never
+// overwritten (rotation goes through login or a new add_provider token).
+func persistFreebuffToken(stateDir, token string) {
+	if token == "" || stateDir == "" {
+		return
+	}
+	tokenFile := filepath.Join(stateDir, "freebuff_token")
+	if _, err := os.Stat(tokenFile); err == nil {
+		return
+	}
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		log.Printf("[providers] freebuff token persist: %v", err)
+		return
+	}
+	if err := os.WriteFile(tokenFile, []byte(token+"\n"), 0o600); err != nil {
+		log.Printf("[providers] freebuff token persist: %v", err)
+	}
+}
+
 // runtimeFreebuffActorBuilder adapts newFreebuffActor to the runtime provider
-// store hook: the lane's own DataDir wins, otherwise fall back to the daemon
+// store hook: the lane's own key (cfg.APIKey, e.g. an add_provider api_key)
+// wins, the lane's own DataDir comes next, otherwise fall back to the daemon
 // state dir.
 func runtimeFreebuffActorBuilder(fallbackStateDir string) func(openaicompat.Config) any {
 	return func(cfg openaicompat.Config) any {
@@ -423,6 +452,6 @@ func runtimeFreebuffActorBuilder(fallbackStateDir string) func(openaicompat.Conf
 		if dir == "" {
 			dir = fallbackStateDir
 		}
-		return newFreebuffActor(dir)
+		return newFreebuffActor(dir, cfg.APIKey)
 	}
 }

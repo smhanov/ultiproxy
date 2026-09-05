@@ -151,12 +151,12 @@ var standardTools = []Tool{
 	},
 	{
 		Name:        "add_provider",
-		Description: "Register a provider lane at runtime (no config file): an OpenAI-compatible lane by default, or a custom-wire lane via kind (antigravity, anthropic, codex). Persists across restarts in providers.json.",
+		Description: "Register a provider lane at runtime (no config file): an OpenAI-compatible lane by default, or a custom-wire lane via kind (antigravity, anthropic, codex, freebuff). Persists across restarts in providers.json.",
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
 				"name":            {Type: "string", Description: "Lane name, lowercase [a-z0-9_-], e.g. vllm, zai, openrouter"},
-				"kind":            {Type: "string", Description: "Lane kind: empty or openaicompat for OpenAI-compatible lanes, antigravity, anthropic (requires api_key) or codex"},
+				"kind":            {Type: "string", Description: "Lane kind: empty or openaicompat for OpenAI-compatible lanes, antigravity, anthropic (requires api_key), codex or freebuff (Codebuff account lane; api_key optional, falls back to the ultiproxy-owned state token)"},
 				"base_url":        {Type: "string", Description: "Upstream base URL, e.g. https://api.deepseek.com/v1 (required for OpenAI-compatible lanes)"},
 				"api_key":         {Type: "string", Description: "Static API key (required for kind=anthropic, optional otherwise)"},
 				"data_dir":        {Type: "string", Description: "Optional data dir for token/credential storage"},
@@ -168,7 +168,7 @@ var standardTools = []Tool{
 				"token_url":       {Type: "string", Description: "Token URL for auth_via_oauth_manager"},
 				"quirks": {
 					Type:        "object",
-					Description: "Vendor quirks: {coding_plan_path, max_tokens_by_model, echo_reasoning, model_list_passthrough, auth_via_workspace_cookie, auth_via_oauth_manager, credits_quota_observer, auth_via_supabase_refresh, freebuff_default_tool, default_model} (OpenAI-compatible lanes only)",
+					Description: "Vendor quirks: {coding_plan_path, max_tokens_by_model, echo_reasoning, model_list_passthrough, auth_via_workspace_cookie, auth_via_oauth_manager, credits_quota_observer, auth_via_supabase_refresh, freebuff_actor, freebuff_default_tool, default_model} (OpenAI-compatible lanes only; freebuff_actor marks a Codebuff lane, the serialized-request actor is built from the api_key/state token)",
 				},
 			},
 			// base_url is validated per kind by the tool itself: custom kinds

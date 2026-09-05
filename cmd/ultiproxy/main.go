@@ -19,6 +19,7 @@ import (
 	"github.com/smhanov/ultiproxy/pkg/provider/antigravity"
 	"github.com/smhanov/ultiproxy/pkg/provider/codex"
 	"github.com/smhanov/ultiproxy/pkg/provider/copilot"
+	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 	"github.com/smhanov/ultiproxy/pkg/server"
 	"github.com/smhanov/ultiproxy/pkg/state"
 	"github.com/smhanov/ultiproxy/pkg/storage"
@@ -192,6 +193,33 @@ func runtimeLaneBuilder(name, kind, dataDir, apiKey string) (provider.Provider, 
 		}
 		p := copilot.New(copilot.Config{Token: tok})
 		return p.ProviderBundle(), nil
+	case "freebuff":
+		// Freebuff (Codebuff) lane: the OpenAI-compatible wire at
+		// https://www.codebuff.com/api/v1 plus the serialized-request actor
+		// that owns the session lock, the default tool injection and the
+		// usage quota. The key comes from the add_provider call (persisted
+		// with the lane) or, failing that, from the ultiproxy-owned state
+		// token; newFreebuffActor persists an explicit key for later runs.
+		// The lane still builds without any token so it can register (and
+		// report an honest quota) before a login/key exists.
+		fbActor := newFreebuffActor(dataDir, apiKey)
+		if fbActor == nil {
+			log.Printf("[providers] freebuff: no token for runtime lane %q (set api_key or ULTIPROXY_FREEBUFF_TOKEN)", name)
+		}
+		p, err := openaicompat.New(openaicompat.Config{
+			Name:    name,
+			BaseURL: "https://www.codebuff.com/api/v1",
+			APIKey:  apiKey,
+			DataDir: dataDir,
+			Quirks: openaicompat.Quirks{
+				FreebuffActor:       fbActor,
+				FreebuffDefaultTool: true,
+			},
+		})
+		if err != nil {
+			return provider.Provider{}, fmt.Errorf("freebuff: %w", err)
+		}
+		return p.Provider(), nil
 	default:
 		return provider.Provider{}, fmt.Errorf("unsupported runtime lane kind %q", kind)
 	}

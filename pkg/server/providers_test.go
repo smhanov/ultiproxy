@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -275,5 +276,81 @@ func TestRuntimeProviderStore_CustomLaneAPIKeyAcrossRestart(t *testing.T) {
 	}
 	if _, ok := registry2.Get("codex"); !ok {
 		t.Fatal("codex lane not registered after restart")
+	}
+}
+
+// freebuffMarkerActor is the non-actor marker an MCP add_provider call can
+// carry: it marks the lane as freebuff without being a usable actor.
+type freebuffMarkerActor struct{}
+
+// fakeFreebuffActor stands in for the real adapter the cmd installs.
+type fakeFreebuffActor struct{}
+
+func (fakeFreebuffActor) Acquire(ctx context.Context) error { return nil }
+func (fakeFreebuffActor) Release()                          {}
+
+// TestRuntimeProviderStore_FreebuffActorEnrichment covers a freebuff lane
+// added over MCP: the stored marker actor is swapped for the real one through
+// ActorBuilder immediately (so the live lane works), the flag persists as
+// quirks.freebuff_actor=true, and a restart rebuilds the actor again.
+func TestRuntimeProviderStore_FreebuffActorEnrichment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.json")
+
+	built := 0
+	builder := func(cfg openaicompat.Config) any {
+		built++
+		return any(fakeFreebuffActor{})
+	}
+
+	s1 := NewRuntimeProviderStore(path)
+	s1.DefaultDataDir = dir
+	s1.ActorBuilder = builder
+
+	if err := s1.Add(openaicompat.Config{
+		Name:    "freebuff",
+		BaseURL: "https://www.codebuff.com/api/v1",
+		APIKey:  "fb-key",
+		Quirks: openaicompat.Quirks{
+			FreebuffActor:       freebuffMarkerActor{},
+			FreebuffDefaultTool: true,
+		},
+	}); err != nil {
+		t.Fatalf("Add freebuff: %v", err)
+	}
+
+	// The marker was replaced with the actor the builder produced.
+	stored := s1.List()["freebuff"]
+	if _, ok := stored.Quirks.FreebuffActor.(fakeFreebuffActor); !ok {
+		t.Fatalf("stored actor = %T, want fakeFreebuffActor", stored.Quirks.FreebuffActor)
+	}
+	if built != 1 {
+		t.Errorf("ActorBuilder called %d times, want 1", built)
+	}
+
+	// The persisted projection is the boolean flag, never the actor.
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read providers.json: %v", err)
+	}
+	if !strings.Contains(string(onDisk), `"freebuff_actor": true`) {
+		t.Fatalf("providers.json missing freebuff_actor: %s", onDisk)
+	}
+	if strings.Contains(string(onDisk), "fakeFreebuffActor") {
+		t.Fatalf("providers.json leaked the actor: %s", onDisk)
+	}
+
+	// Restart: the flag rebuilds the actor for the restored lane.
+	s2 := NewRuntimeProviderStore(path)
+	s2.ActorBuilder = builder
+	loaded, err := s2.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, ok := loaded["freebuff"].Quirks.FreebuffActor.(fakeFreebuffActor); !ok {
+		t.Fatalf("restored actor = %T, want fakeFreebuffActor", loaded["freebuff"].Quirks.FreebuffActor)
+	}
+	if !loaded["freebuff"].Quirks.FreebuffDefaultTool {
+		t.Error("freebuff_default_tool did not round-trip")
 	}
 }

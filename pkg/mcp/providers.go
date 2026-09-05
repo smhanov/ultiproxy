@@ -30,9 +30,12 @@ type ProviderStore interface {
 }
 
 // providerQuirksArgs is the JSON-able subset of openaicompat.Quirks accepted by
-// the add_provider tool. Quirks.FreebuffActor is deliberately absent: it is an
-// injected *FreebuffAccountActor (not JSON-serializable), so freebuff lanes stay
-// compile-time registrations for now.
+// the add_provider tool. Quirks.FreebuffActor cannot cross the MCP boundary (it
+// is an injected *FreebuffAccountActor, not JSON-serializable), so freebuff
+// lanes are declared with the freebuff_actor boolean: the placeholder it
+// installs marks the lane as freebuff so the provider store persists
+// quirks.freebuff_actor=true and rebuilds the real actor from the lane's
+// api_key / state token (see RuntimeProviderStore.Add and Restore).
 type providerQuirksArgs struct {
 	CodingPlanPath         bool           `json:"coding_plan_path"`
 	MaxTokensByModel       map[string]int `json:"max_tokens_by_model"`
@@ -42,6 +45,7 @@ type providerQuirksArgs struct {
 	AuthViaOAuthManager    bool           `json:"auth_via_oauth_manager"`
 	CreditsQuotaObserver   string         `json:"credits_quota_observer"`
 	AuthViaSupabaseRefresh bool           `json:"auth_via_supabase_refresh"`
+	FreebuffActor          bool           `json:"freebuff_actor"`
 	FreebuffDefaultTool    bool           `json:"freebuff_default_tool"`
 	DefaultModel           string         `json:"default_model"`
 }
@@ -55,7 +59,7 @@ type addProviderArgs struct {
 }
 
 func (a addProviderArgs) config() openaicompat.Config {
-	return openaicompat.Config{
+	cfg := openaicompat.Config{
 		Name:    a.Name,
 		BaseURL: a.BaseURL,
 		APIKey:  a.APIKey,
@@ -72,6 +76,15 @@ func (a addProviderArgs) config() openaicompat.Config {
 			DefaultModel:           a.Quirks.DefaultModel,
 		},
 	}
+	if a.Quirks.FreebuffActor {
+		// Non-nil placeholder: it marks the lane as a freebuff lane (serialized
+		// requests, session affinity, actor-backed quota) so the store persists
+		// freebuff_actor=true. The store swaps it for the real actor built from
+		// the lane's api_key / state token; without one it stays a marker and
+		// quota reports the missing actor honestly.
+		cfg.Quirks.FreebuffActor = struct{}{}
+	}
+	return cfg
 }
 
 func toolError(format string, args ...any) *CallToolResult {
@@ -123,6 +136,16 @@ func (s *Server) toolAddProvider(ctx context.Context, argsRaw json.RawMessage) (
 
 	if err := s.providers.Add(cfg); err != nil {
 		return toolError("%v", err), nil
+	}
+	// The store may enrich what was added (the freebuff actor cannot cross the
+	// MCP boundary): re-read the stored config and rebuild when it changed so
+	// the lane registered right now matches what a restart would restore.
+	if stored, ok := s.providers.List()[cfg.Name]; ok {
+		if stored.Quirks.FreebuffActor != nil && cfg.Quirks.FreebuffActor != stored.Quirks.FreebuffActor {
+			if rebuilt, err := openaicompat.New(stored); err == nil {
+				p = rebuilt
+			}
+		}
 	}
 	if s.registry != nil {
 		s.registry.Register(p.Provider())
@@ -262,6 +285,7 @@ func (s *Server) toolListProviders(ctx context.Context) (*CallToolResult, *JSONR
 				"auth_via_oauth_manager":    cfg.Quirks.AuthViaOAuthManager,
 				"auth_via_supabase_refresh": cfg.Quirks.AuthViaSupabaseRefresh,
 				"credits_quota_observer":    cfg.Quirks.CreditsQuotaObserver,
+				"freebuff_actor":            cfg.Quirks.FreebuffActor != nil,
 				"freebuff_default_tool":     cfg.Quirks.FreebuffDefaultTool,
 				"default_model":             cfg.Quirks.DefaultModel,
 				"max_tokens_by_model":       cfg.Quirks.MaxTokensByModel,
