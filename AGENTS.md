@@ -14,6 +14,14 @@
 - Prefer behavior/invariant criteria over implementation-detail criteria. Do not force a specific internal design unless that design constraint is itself part of the requirement.
 - A task is not complete until every acceptance criterion has concrete evidence. If a criterion cannot be verified, leave the task `in-progress` or `blocked` and record the reason in the plan instead of claiming completion.
 
+**Test-first development for behavior changes (RED → GREEN → REFACTOR → VERIFY):**
+- For bug fixes, protocol/behavior changes, persistence/lifecycle changes, concurrency changes, and nontrivial new functionality, write the smallest meaningful test for the acceptance criterion **before editing production code**.
+- Run that focused test and observe it fail for the expected behavioral reason. A compile error, bad fixture, unrelated failure, or test that already passes does not count as RED. Never claim test-first development unless the failing result was actually observed before the production-code change.
+- Only after RED is established, make the minimum production change needed to satisfy the behavior. Do not delete, weaken, skip, or rewrite the test merely to obtain GREEN; if the requirement/test is wrong, update the plan/acceptance criterion explicitly first.
+- Refactor only after GREEN, keeping the focused tests green. Then VERIFY from narrow to broad: focused regression test → affected package/contract tests → repository-wide gates where appropriate. Use `go test -race` for concurrency/lifecycle work when practical.
+- Tests verify behavior/invariants, not private implementation details. Prefer the highest useful observable boundary: wire/contract tests for protocol behavior, restart/readback tests for persistence, and bounded cancellation/concurrency tests for lifecycle bugs.
+- Test-first is not required for documentation/comments, purely mechanical renames, deletions better proven by search/build, or genuinely trivial low-risk changes. Still provide the acceptance evidence appropriate to those changes.
+
 **Before finishing work:**
 - If verified complete, move the task from Active to Completed with the date and commit hash; use `working-tree` only when no commit was requested.
 - If unfinished, leave it `in-progress`; if blocked, mark it `blocked` and name the blocking task ID(s).
