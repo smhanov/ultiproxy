@@ -284,9 +284,19 @@ func (s *OAuthManagerTokenSource) Token(ctx context.Context) (*llmauth.Token, er
 	}, nil
 }
 
-// Invalidate invalidates cached tokens.
+// Invalidate revokes the wrapped credential so the next Token call refreshes it
+// instead of returning the token the caller just reported as bad (typically a
+// 401 from the upstream, or an explicit provider Refresh).
+//
+// accessToken is the token the caller saw fail. An empty value means "the
+// current one" (provider.Refresh has nothing in hand); a non-matching value is
+// a stale token that has already been replaced, in which case the healthy
+// current credential is left alone.
 func (s *OAuthManagerTokenSource) Invalidate(accessToken string) {
-	// auth.Manager will refresh when Get is called if expired or invalidated
+	if s == nil || s.mgr == nil {
+		return
+	}
+	s.mgr.Invalidate(s.clientID, accessToken)
 }
 
 var _ llmauth.InvalidatableTokenSource = (*OAuthManagerTokenSource)(nil)

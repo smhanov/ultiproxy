@@ -15,7 +15,10 @@ servers:
     description: Loopback address
 
 security:
+  # Either spelling is accepted on every authenticated route: the OpenAI-style
+  # bearer header, or the Anthropic-style x-api-key header.
   - bearerAuth: []
+  - apiKeyHeader: []
 
 paths:
   /v1/chat/completions:
@@ -116,10 +119,15 @@ paths:
       description: |
         Returns the quota status across all pooled provider subscriptions so monitoring probes
         and dashboard web UIs work without modification.
+
+        Authentication follows the rest of the surface: with client keys (or an
+        admin api_key) configured the request must carry one, because the
+        response names the provider lanes and their live quota state. A daemon
+        started with no keys configured serves it unauthenticated, exactly like
+        every other route.
       operationId: getQuotaStatus
       tags:
         - Dashboard & Quotas
-      security: []
       responses:
         '200':
           description: Provider quota status summary and window details
@@ -127,13 +135,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/QuotaDashboardResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
 
   /api/stats/summary:
     get:
       summary: System usage and accounting summary
       description: |
-        Returns aggregated usage metrics, total prompt/completion tokens, cache hit rates,
-        active clients, and estimated cost savings achieved by pooling subscriptions.
+        Returns aggregated usage metrics read live from the daemon's SQLite telemetry store:
+        request count, prompt/completion/cached token totals, the number of distinct client
+        keys that produced traffic, a per-provider breakdown, and the estimated cost saved by
+        pooling subscriptions.
+
+        `estimated_cost_saved_usd` is the pay-as-you-go equivalent of the recorded traffic
+        (the sum of each model's alias-priced usage cost): the pooled subscriptions are flat
+        fee, so that is what the same tokens would have cost from a metered API. A daemon
+        built without storage answers the full shape with zeros.
       operationId: getStatsSummary
       tags:
         - Accounting & Metrics
@@ -153,9 +170,25 @@ paths:
       description: |
         Returns per-API-key accounting metrics, tracking which agent or developer consumed tokens,
         request counts, errors, and current rate-limiting states.
+
+        `client_id` is the configured client key name when the stored key digest is known, and
+        the digest itself otherwise (rows recorded before keys were configured, or with no key at
+        all, report `anonymous`). Records are ordered by request count, descending.
       operationId: getStatsByClient
       tags:
         - Accounting & Metrics
+      parameters:
+        - name: window
+          in: query
+          required: false
+          description: |
+            Lookback window for the aggregation, as a Go duration or a day count
+            (for example 1h, 24h, 7d, 30d). Defaults to 7d. An unparseable value
+            is rejected with 400.
+          schema:
+            type: string
+            default: 7d
+            example: 7d
       responses:
         '200':
           description: Per-client usage breakdown
@@ -165,6 +198,8 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/ClientUsageRecord'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
         '401':
           $ref: '#/components/responses/UnauthorizedError'
 
@@ -271,7 +306,12 @@ components:
       type: http
       scheme: bearer
       bearerFormat: APIKey
-      description: "Ultiproxy bearer token specified in ~/.config/ultiproxy/config.yaml (e.g. Authorization: Bearer sk-up-...)"
+      description: "Ultiproxy client key sent as Authorization: Bearer <key> (the OpenAI-compatible form). The key comes from the daemon config: the admin api_key or one of the client_keys."
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: "Ultiproxy client key sent as x-api-key: <key> (the Anthropic form, so an unmodified Anthropic SDK authenticates against POST /v1/messages). The same key set as bearerAuth is accepted."
 
   responses:
     BadRequestError:
@@ -836,9 +876,11 @@ components:
         - total_completion_tokens
         - active_clients
         - estimated_cost_saved_usd
+        - provider_breakdown
       properties:
         total_requests:
           type: integer
+          description: Terminal request rows recorded in the telemetry store.
         total_prompt_tokens:
           type: integer
         total_completion_tokens:
@@ -847,12 +889,22 @@ components:
           type: integer
         active_clients:
           type: integer
+          description: Distinct client key hashes that produced at least one request.
         estimated_cost_saved_usd:
           type: number
+          description: |
+            Pay-as-you-go equivalent of the recorded traffic (the sum of the
+            alias-priced usage cost); the pooled subscriptions are flat fee, so
+            this is what the same tokens would have cost from a metered API.
         provider_breakdown:
           type: object
+          description: Requests, tokens and terminal errors per provider lane (keyed by lane name).
           additionalProperties:
             type: object
+            required:
+              - requests
+              - tokens
+              - errors
             properties:
               requests:
                 type: integer
@@ -860,6 +912,14 @@ components:
                 type: integer
               errors:
                 type: integer
+        total_tokens:
+          type: integer
+          deprecated: true
+          description: Prompt + completion tokens; kept for the pre-contract payload.
+        total_cost:
+          type: number
+          deprecated: true
+          description: Sum of the recorded usage cost; same value as estimated_cost_saved_usd.
 
     ClientUsageRecord:
       type: object
@@ -872,8 +932,13 @@ components:
       properties:
         client_id:
           type: string
+          description: Configured client key name, or the key digest when unknown, or "anonymous".
         client_name:
           type: string
+          description: Present only when the digest maps to a configured client key name.
+        client_key_hash:
+          type: string
+          description: sha256 hex digest of the client key as recorded in telemetry.
         request_count:
           type: integer
         prompt_tokens:
@@ -882,10 +947,17 @@ components:
           type: integer
         cached_tokens:
           type: integer
+        total_tokens:
+          type: integer
+        cost:
+          type: number
+          description: Alias-priced USD cost of the window's traffic.
         error_count:
           type: integer
+          description: Requests that terminated with an error class.
         rate_limited_count:
           type: integer
+          description: Requests whose error class is a rate limit.
         last_active:
           type: string
           format: date-time

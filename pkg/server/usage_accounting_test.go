@@ -330,9 +330,18 @@ func TestAccounting_StatsSummaryAggregates(t *testing.T) {
 		t.Fatalf("GET /api/stats/summary = %d: %s", rec.Code, rec.Body.String())
 	}
 	var stats struct {
-		TotalRequests int64   `json:"total_requests"`
-		TotalTokens   int64   `json:"total_tokens"`
-		TotalCost     float64 `json:"total_cost"`
+		TotalRequests         int64   `json:"total_requests"`
+		TotalTokens           int64   `json:"total_tokens"`
+		TotalCost             float64 `json:"total_cost"`
+		TotalPromptTokens     int64   `json:"total_prompt_tokens"`
+		TotalCompletionTokens int64   `json:"total_completion_tokens"`
+		ActiveClients         int64   `json:"active_clients"`
+		EstimatedCostSaved    float64 `json:"estimated_cost_saved_usd"`
+		ProviderBreakdown     map[string]struct {
+			Requests int64 `json:"requests"`
+			Tokens   int64 `json:"tokens"`
+			Errors   int64 `json:"errors"`
+		} `json:"provider_breakdown"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &stats); err != nil {
 		t.Fatalf("decode stats summary: %v (%s)", err, rec.Body.String())
@@ -345,6 +354,23 @@ func TestAccounting_StatsSummaryAggregates(t *testing.T) {
 	}
 	if diff := stats.TotalCost - 0.00028; diff < -1e-12 || diff > 1e-12 {
 		t.Errorf("stats total_cost = %v, want 0.00028", stats.TotalCost)
+	}
+	// The fields docs/openapi.yaml advertises for StatsSummaryResponse.
+	if stats.TotalPromptTokens != 200 || stats.TotalCompletionTokens != 80 {
+		t.Errorf("stats prompt/completion tokens = %d/%d, want 200/80", stats.TotalPromptTokens, stats.TotalCompletionTokens)
+	}
+	if stats.ActiveClients != 0 {
+		t.Errorf("stats active_clients = %d, want 0 (no client keys configured in this fixture)", stats.ActiveClients)
+	}
+	if diff := stats.EstimatedCostSaved - 0.00028; diff < -1e-12 || diff > 1e-12 {
+		t.Errorf("stats estimated_cost_saved_usd = %v, want 0.00028", stats.EstimatedCostSaved)
+	}
+	provBreakdown, ok := stats.ProviderBreakdown["prov"]
+	if !ok {
+		t.Fatalf("stats provider_breakdown has no prov entry: %+v", stats.ProviderBreakdown)
+	}
+	if provBreakdown.Requests != 2 || provBreakdown.Tokens != 280 || provBreakdown.Errors != 0 {
+		t.Errorf("stats prov breakdown = %+v, want 2 requests / 280 tokens / 0 errors", provBreakdown)
 	}
 }
 

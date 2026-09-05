@@ -23,7 +23,7 @@ Complete OpenAPI 3.1 specification is available in `docs/openapi.yaml`.
 
 ### 1. OpenAI Chat Completions
 - **Route**: `POST /v1/chat/completions`
-- **Auth**: `Authorization: Bearer <api-key>`
+- **Auth**: `Authorization: Bearer <api-key>` (an `x-api-key: <api-key>` header is accepted on every route as well)
 - **Description**: Standard OpenAI chat completions endpoint supporting text, multi-turn dialogue, tool calls, image payloads, and streaming SSE.
 - **Supported Parameters**:
   - `model` (string, required): Model ID (e.g., `gpt-4o`, `claude-3-5-sonnet`, `deepseek-r1`, `copilot/gpt-4o`)
@@ -104,7 +104,7 @@ curl -s http://localhost:9050/v1/messages \
 
 ### 4. Quota Dashboard API
 - **Route**: `GET /api/quota`
-- **Auth**: Public or Bearer token
+- **Auth**: Bearer token (`Authorization: Bearer <api-key>` or `x-api-key: <api-key>`) whenever client keys or an admin key are configured; the daemon serves it unauthenticated only when no keys are configured at all, like every other route.
 - **Description**: Returns live subscription health, reset windows, and quota gauges across all 12 providers.
 - **Contract Schema**:
 ```json
@@ -161,10 +161,15 @@ curl -s http://localhost:9050/v1/messages \
 
 ### 5. Accounting & Stats Endpoints
 - **Route**: `GET /api/stats/summary`
-  - Aggregated prompt, completion, and cache tokens.
-  - Overall proxy request throughput and estimated USD cost savings.
+  - **Auth**: same as every other route (Bearer or `x-api-key` when keys are configured).
+  - Aggregated prompt, completion, and cached tokens, request count, distinct active client keys, and a `provider_breakdown` map of `{requests, tokens, errors}` per lane.
+  - `estimated_cost_saved_usd` is the pay-as-you-go equivalent of the recorded traffic (the sum of the alias-priced usage cost): the pooled subscriptions are flat fee, so that is what the same tokens would have cost on a metered API. `total_tokens` / `total_cost` are the older names for the same totals and are kept for compatibility.
+  - Numbers come from the daemon's SQLite telemetry store; a daemon built without storage answers the same shape with zeros.
 - **Route**: `GET /api/stats/by-client`
-  - Per-API-key metrics: request counts, prompt/completion tokens, cache hit rates, error counts.
+  - **Auth**: same as every other route.
+  - `?window=1h|24h|7d|30d` (default `7d`); an unparseable window is a 400.
+  - Returns an array of per-client records ordered by request count, descending: `client_id`, `client_name`, `client_key_hash`, `request_count`, `prompt_tokens`, `completion_tokens`, `cached_tokens`, `total_tokens`, `cost`, `error_count`, `rate_limited_count`, `last_active`.
+  - `client_id` is the configured client key name when the recorded digest is known, the digest itself when it is not, and `anonymous` for rows recorded without a key.
   - Enables team quota isolation and agent auditability.
 
 ### 6. Model Context Protocol (MCP) Endpoints

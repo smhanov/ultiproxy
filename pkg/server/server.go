@@ -247,6 +247,7 @@ func (s *Server) setupRoutes() {
 	// Quota Dashboard routes
 	s.mux.HandleFunc("GET /api/quota", s.handleQuotaDashboard)
 	s.mux.HandleFunc("GET /api/stats/summary", s.handleStatsSummary)
+	s.mux.HandleFunc("GET /api/stats/by-client", s.handleStatsByClient)
 	s.mux.HandleFunc("GET /quota.txt", s.handleQuotaText)
 	s.mux.HandleFunc("GET /quota.md", s.handleQuotaMarkdown)
 

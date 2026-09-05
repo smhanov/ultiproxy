@@ -91,7 +91,7 @@ Verify it is alive:
 curl http://localhost:9050/healthz     # {"status":"ok"}
 ```
 
-By default the daemon listens on `127.0.0.1:9050` and accepts every request, which is the right posture for a localhost-only install. Declaring client keys turns on Bearer authentication and gives you per-key attribution; upstream credentials are never exposed to clients either way.
+By default the daemon listens on `127.0.0.1:9050` and accepts every request, which is the right posture for a localhost-only install. Declaring client keys turns on authentication and gives you per-key attribution; upstream credentials are never exposed to clients either way. Two spellings are accepted on every route (including `/api/quota` and the stats endpoints): `Authorization: Bearer <key>` for OpenAI-style clients and `x-api-key: <key>` for Anthropic SDKs and Claude Code.
 
 ### 2. Connect your agent to the embedded MCP server
 
@@ -290,8 +290,9 @@ curl -s http://localhost:9050/v1/chat/completions \
 | `GET /v1/models` | Only routable model ids: aliases (with `context_length` / `max_output_tokens`), `<lane>/<model>` per discovered upstream model, and `<lane>/<default>` for lanes with a default model (e.g. `antigravity/gemini-3.7-flash-high`). No bare lane names -- a lane name is a routing prefix, not a model (`"model": "<lane>"` still routes, as a legacy form). A lane with an empty discovery cache and no default lists nothing. Served from the discovery cache only -- listing never fans out to an upstream; set `ULTIPROXY_HIDE_TEST_LANES=1` to keep test lanes (`probe`, `fake`) out. |
 | `POST /mcp`, `GET /mcp` | Streamable HTTP MCP server (JSON-RPC 2.0). |
 | `GET /mcp/sse` | Legacy SSE MCP transport. |
-| `GET /api/quota`, `/quota.txt`, `/quota.md` | Live quota dashboard, plain-text and Markdown views. |
-| `GET /api/stats/summary` | Aggregated tokens, requests and estimated cost savings. |
+| `GET /api/quota`, `/quota.txt`, `/quota.md` | Live quota dashboard, plain-text and Markdown views. Authenticated like every other route when client keys are configured. |
+| `GET /api/stats/summary` | Aggregated request, prompt/completion/cached token and client counts, per-provider breakdown, and the pay-as-you-go equivalent cost (`estimated_cost_saved_usd`). |
+| `GET /api/stats/by-client` | Per-client-key accounting over a `?window=` lookback (default `7d`): request, token, cost and error counts plus `last_active`. |
 | `GET /healthz`, `GET /llms.txt` | Health probe and machine-readable overview for LLMs. |
 
 ---

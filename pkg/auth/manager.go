@@ -44,6 +44,10 @@ type Manager struct {
 
 	mu    sync.RWMutex
 	cache map[string]Credential
+	// revoked remembers the keys whose cached credential was invalidated but
+	// not yet refreshed, so Get refreshes them even while they are still well
+	// inside their expiry window.
+	revoked map[string]struct{}
 }
 
 // NewManager creates a new credential Manager.
@@ -57,6 +61,7 @@ func NewManager(storageDir string, refresher Refresher, opts ...Option) (*Manage
 		refresher:  refresher,
 		nowFn:      time.Now,
 		cache:      make(map[string]Credential),
+		revoked:    make(map[string]struct{}),
 	}
 
 	for _, opt := range opts {
@@ -97,6 +102,9 @@ func (m *Manager) Store(ctx context.Context, key string, cred Credential) error 
 	}
 	m.mu.Lock()
 	m.cache[key] = cred
+	if m.revoked != nil {
+		delete(m.revoked, key)
+	}
 	m.mu.Unlock()
 	return nil
 }
@@ -175,7 +183,46 @@ func (m *Manager) LoadFromDisk(key string) (Credential, error) {
 	return cred, nil
 }
 
+// Invalidate revokes the credential cached for key so that the next Get
+// refreshes it instead of returning a token the caller has reported as bad.
+// Revocation survives until a refresh succeeds: without it, a caller asking for
+// a fresh token (an explicit refresh, or a 401 from the upstream) would keep
+// reading back the very credential it rejected.
+//
+// A non-empty accessToken only revokes when it is still the credential in
+// hand, so invalidating a stale token that has already been replaced leaves the
+// current one alone.
+func (m *Manager) Invalidate(key, accessToken string) bool {
+	if m == nil {
+		return false
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if accessToken != "" {
+		if cred, ok := m.cache[key]; ok && cred.AccessToken != accessToken {
+			return false
+		}
+	}
+	if m.revoked == nil {
+		m.revoked = make(map[string]struct{})
+	}
+	m.revoked[key] = struct{}{}
+	return true
+}
+
+// revokedKey reports whether the credential for key is waiting to be refreshed.
+func (m *Manager) revokedKey(key string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.revoked[key]
+	return ok
+}
+
 // Get returns a valid token, refreshing if within 5 minutes of expiry.
+// A credential invalidated through Invalidate is refreshed on the next Get even
+// when it is still well within its expiry window.
 // If expired and refresh fails, returns error.
 func (m *Manager) Get(ctx context.Context, key string) (Credential, error) {
 	m.mu.RLock()
@@ -197,7 +244,8 @@ func (m *Manager) Get(ctx context.Context, key string) (Credential, error) {
 	timeUntilExpiry := cred.ExpiresAt.Sub(now)
 
 	// If more than 5 minutes remaining, token is fully valid without refresh
-	if timeUntilExpiry > 5*time.Minute {
+	// (unless it was explicitly invalidated).
+	if timeUntilExpiry > 5*time.Minute && !m.revokedKey(key) {
 		return cred, nil
 	}
 
@@ -208,7 +256,7 @@ func (m *Manager) Get(ctx context.Context, key string) (Credential, error) {
 		latest := m.cache[key]
 		m.mu.RUnlock()
 
-		if latest.ExpiresAt.Sub(m.now()) > 5*time.Minute {
+		if latest.ExpiresAt.Sub(m.now()) > 5*time.Minute && !m.revokedKey(key) {
 			return latest, nil
 		}
 
@@ -224,6 +272,11 @@ func (m *Manager) Get(ctx context.Context, key string) (Credential, error) {
 			// If already expired, return error
 			if m.now().After(latest.ExpiresAt) {
 				return nil, fmt.Errorf("%w: refresh failed: %v", ErrExpired, refErr)
+			}
+			// An explicitly invalidated credential must never be handed back
+			// as if it were still good: the caller is the one who rejected it.
+			if m.revokedKey(key) {
+				return nil, fmt.Errorf("credential invalidated: refresh failed: %v", refErr)
 			}
 			// Not yet expired: return current valid token
 			return latest, nil
@@ -241,6 +294,9 @@ func (m *Manager) Get(ctx context.Context, key string) (Credential, error) {
 		}
 		m.mu.Lock()
 		m.cache[key] = refreshed
+		if m.revoked != nil {
+			delete(m.revoked, key)
+		}
 		m.mu.Unlock()
 
 		return refreshed, nil

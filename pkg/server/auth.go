@@ -80,13 +80,12 @@ func (m *AuthMiddleware) Wrap(next http.Handler) http.Handler {
 			return
 		}
 
-		authHeader := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authHeader, "Bearer ") {
+		presentedKey, ok := presentedAPIKey(r)
+		if !ok {
 			writeAuthError(w)
 			return
 		}
 
-		presentedKey := strings.TrimPrefix(authHeader, "Bearer ")
 		presentedHash := sha256.Sum256([]byte(presentedKey))
 
 		matched := false
@@ -120,6 +119,28 @@ func (m *AuthMiddleware) Wrap(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// presentedAPIKey extracts the credential a client presented. Two spellings are
+// accepted and Authorization wins when both are present:
+//
+//	Authorization: Bearer <key>   -- the OpenAI-compatible form
+//	x-api-key: <key>              -- the Anthropic form, so an unmodified
+//	                                 Anthropic SDK authenticates against /v1/messages
+//
+// Both are checked against the same set of configured keys (the static admin
+// key plus every client key), so a key is never tied to one surface.
+func presentedAPIKey(r *http.Request) (string, bool) {
+	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+		key := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		if key != "" {
+			return key, true
+		}
+	}
+	if key := strings.TrimSpace(r.Header.Get("x-api-key")); key != "" {
+		return key, true
+	}
+	return "", false
 }
 
 func writeAuthError(w http.ResponseWriter) {

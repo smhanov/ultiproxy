@@ -2,12 +2,16 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/smhanov/ultiproxy/pkg/state"
+	"github.com/smhanov/ultiproxy/pkg/storage"
 )
 
 // QuotaDashboardResponse matches quota dashboard JSON structure.
@@ -201,21 +205,273 @@ func (s *Server) buildQuotaResponse(ctx context.Context) QuotaDashboardResponse 
 	}
 }
 
+// StatsSummaryResponse is the GET /api/stats/summary contract published in
+// docs/openapi.yaml (components/schemas/StatsSummaryResponse). Every field the
+// spec marks required is always present, including for an empty store.
+//
+// estimated_cost_saved_usd is the pay-as-you-go equivalent of the recorded
+// traffic (the sum of usage.cost, priced from each model's alias pricing): the
+// pooled subscriptions are flat fee, so that amount is what the same tokens
+// would have cost from a metered API.
+//
+// total_tokens and total_cost predate the published schema and stay in the
+// payload for existing clients; the spec documents them as deprecated.
+type StatsSummaryResponse struct {
+	TotalRequests         int64                              `json:"total_requests"`
+	TotalPromptTokens     int64                              `json:"total_prompt_tokens"`
+	TotalCompletionTokens int64                              `json:"total_completion_tokens"`
+	TotalCachedTokens     int64                              `json:"total_cached_tokens"`
+	ActiveClients         int64                              `json:"active_clients"`
+	EstimatedCostSavedUSD float64                            `json:"estimated_cost_saved_usd"`
+	ProviderBreakdown     map[string]*ProviderStatsBreakdown `json:"provider_breakdown"`
+
+	// Deprecated: kept for clients written against the pre-contract payload.
+	TotalTokens int64   `json:"total_tokens"`
+	TotalCost   float64 `json:"total_cost"`
+}
+
+// ProviderStatsBreakdown is one entry of the /api/stats/summary
+// provider_breakdown map.
+type ProviderStatsBreakdown struct {
+	Requests int64 `json:"requests"`
+	Tokens   int64 `json:"tokens"`
+	Errors   int64 `json:"errors"`
+}
+
+// handleStatsSummary serves GET /api/stats/summary: the aggregate usage and
+// accounting numbers behind the MCP get_client_usage tool, straight from the
+// telemetry store. A daemon built without storage answers the contract with
+// zeros rather than a 503, so monitoring setups keep working.
 func (s *Server) handleStatsSummary(w http.ResponseWriter, r *http.Request) {
-	// Provide the stats summary served by GET /api/stats/summary (the
-	// numbers behind the MCP get_client_usage tool).
-	type StatsSummary struct {
-		TotalRequests int64   `json:"total_requests"`
-		TotalTokens   int64   `json:"total_tokens"`
-		TotalCost     float64 `json:"total_cost"`
-	}
+	resp := StatsSummaryResponse{ProviderBreakdown: map[string]*ProviderStatsBreakdown{}}
 
-	res := StatsSummary{}
 	if s.writer != nil && s.writer.DB() != nil {
-		_ = s.writer.DB().QueryRowContext(r.Context(), "SELECT COUNT(*) FROM requests").Scan(&res.TotalRequests)
-		_ = s.writer.DB().QueryRowContext(r.Context(), "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0), COALESCE(SUM(cost), 0.0) FROM usage").Scan(&res.TotalTokens, &res.TotalCost)
+		var err error
+		resp, err = statsSummaryFromStore(r.Context(), s.writer.DB())
+		if err != nil {
+			s.writeStatsError(w, http.StatusInternalServerError, "failed to query stats summary: "+err.Error())
+			return
+		}
 	}
 
+	respondJSON(w, http.StatusOK, resp)
+}
+
+// statsSummaryFromStore aggregates the requests/usage tables into the published
+// summary shape: totals, distinct client keys, and a per-provider breakdown. A
+// request row with no usage still counts as a request; a usage row only exists
+// for a request that produced tokens.
+func statsSummaryFromStore(ctx context.Context, db *sql.DB) (StatsSummaryResponse, error) {
+	resp := StatsSummaryResponse{ProviderBreakdown: map[string]*ProviderStatsBreakdown{}}
+
+	rows, err := db.QueryContext(ctx, `
+SELECT
+    COALESCE(r.provider, '') AS provider,
+    COUNT(r.id) AS requests,
+    COALESCE(SUM(u.prompt_tokens), 0) AS prompt_tokens,
+    COALESCE(SUM(u.completion_tokens), 0) AS completion_tokens,
+    COALESCE(SUM(u.cached_tokens), 0) AS cached_tokens,
+    COALESCE(SUM(u.prompt_tokens + u.completion_tokens), 0) AS total_tokens,
+    COALESCE(SUM(u.cost), 0.0) AS cost,
+    SUM(CASE WHEN COALESCE(r.error_class, '') NOT IN ('', 'in_flight') THEN 1 ELSE 0 END) AS errors
+FROM requests r
+LEFT JOIN usage u ON r.id = u.request_id
+GROUP BY provider
+ORDER BY provider;
+`)
+	if err != nil {
+		return resp, fmt.Errorf("query provider breakdown: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			provider                                            string
+			requests, prompt, completion, cached, total, errors int64
+			cost                                                float64
+		)
+		if err := rows.Scan(&provider, &requests, &prompt, &completion, &cached, &total, &cost, &errors); err != nil {
+			return resp, fmt.Errorf("scan provider breakdown row: %w", err)
+		}
+
+		resp.TotalRequests += requests
+		resp.TotalPromptTokens += prompt
+		resp.TotalCompletionTokens += completion
+		resp.TotalCachedTokens += cached
+		resp.TotalTokens += total
+		resp.TotalCost += cost
+
+		if provider == "" {
+			provider = "unknown"
+		}
+		resp.ProviderBreakdown[provider] = &ProviderStatsBreakdown{
+			Requests: requests,
+			Tokens:   total,
+			Errors:   errors,
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return resp, fmt.Errorf("iterate provider breakdown rows: %w", err)
+	}
+
+	// Cost savings are the metered-API equivalent of the recorded traffic.
+	resp.EstimatedCostSavedUSD = resp.TotalCost
+
+	if err := db.QueryRowContext(ctx, `
+SELECT COUNT(DISTINCT r.client_key_hash) FROM requests r WHERE COALESCE(r.client_key_hash, '') <> '';
+`).Scan(&resp.ActiveClients); err != nil {
+		return resp, fmt.Errorf("query active clients: %w", err)
+	}
+
+	return resp, nil
+}
+
+// ClientUsageRecord is one entry of the GET /api/stats/by-client array, as
+// published in docs/openapi.yaml (components/schemas/ClientUsageRecord).
+// client_id is the configured client key name when the digest is known, and the
+// digest itself otherwise, so anonymous rows stay distinguishable.
+type ClientUsageRecord struct {
+	ClientID         string  `json:"client_id"`
+	ClientName       string  `json:"client_name,omitempty"`
+	ClientKeyHash    string  `json:"client_key_hash,omitempty"`
+	RequestCount     int64   `json:"request_count"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	CachedTokens     int64   `json:"cached_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	Cost             float64 `json:"cost"`
+	ErrorCount       int64   `json:"error_count"`
+	RateLimitedCount int64   `json:"rate_limited_count"`
+	LastActive       string  `json:"last_active"`
+}
+
+// handleStatsByClient serves GET /api/stats/by-client: per-client-key accounting
+// over a lookback window (the `window` query parameter, e.g. 1h/24h/7d/30d,
+// defaulting to 7d). The response is the array of records the OpenAPI contract
+// promises, ordered by request count descending.
+func (s *Server) handleStatsByClient(w http.ResponseWriter, r *http.Request) {
+	window := r.URL.Query().Get("window")
+	if window == "" {
+		window = "7d"
+	}
+	dur, err := storage.ParseWindowDuration(window)
+	if err != nil {
+		s.writeStatsError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	since := time.Now().UTC().Add(-dur).Format(time.RFC3339)
+
+	if s.writer == nil || s.writer.DB() == nil {
+		respondJSON(w, http.StatusOK, []ClientUsageRecord{})
+		return
+	}
+
+	records, err := s.clientUsageFromStore(r.Context(), s.writer.DB(), since)
+	if err != nil {
+		s.writeStatsError(w, http.StatusInternalServerError, "failed to query stats by client: "+err.Error())
+		return
+	}
+	if records == nil {
+		records = []ClientUsageRecord{}
+	}
+	respondJSON(w, http.StatusOK, records)
+}
+
+// clientUsageFromStore aggregates the requests/usage tables per client key hash.
+func (s *Server) clientUsageFromStore(ctx context.Context, db *sql.DB, since string) ([]ClientUsageRecord, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT
+    COALESCE(r.client_key_hash, '') AS client_key_hash,
+    COUNT(r.id) AS requests,
+    COALESCE(SUM(u.prompt_tokens), 0) AS prompt_tokens,
+    COALESCE(SUM(u.completion_tokens), 0) AS completion_tokens,
+    COALESCE(SUM(u.cached_tokens), 0) AS cached_tokens,
+    COALESCE(SUM(u.prompt_tokens + u.completion_tokens), 0) AS total_tokens,
+    COALESCE(SUM(u.cost), 0.0) AS cost,
+    SUM(CASE WHEN COALESCE(r.error_class, '') NOT IN ('', 'in_flight') THEN 1 ELSE 0 END) AS errors,
+    SUM(CASE WHEN LOWER(COALESCE(r.error_class, '')) LIKE 'rate_limit%' THEN 1 ELSE 0 END) AS rate_limited,
+    COALESCE(MAX(r.created_at), '') AS last_active
+FROM requests r
+LEFT JOIN usage u ON r.id = u.request_id
+WHERE r.created_at >= ?
+GROUP BY client_key_hash
+ORDER BY requests DESC, client_key_hash ASC;
+`, since)
+	if err != nil {
+		return nil, fmt.Errorf("query client usage: %w", err)
+	}
+	defer rows.Close()
+
+	// Configured client names resolve the stored digest to something an
+	// operator recognises; unknown digests are reported as-is.
+	names := s.clientNameByHash()
+
+	var records []ClientUsageRecord
+	for rows.Next() {
+		var rec ClientUsageRecord
+		if err := rows.Scan(
+			&rec.ClientKeyHash,
+			&rec.RequestCount,
+			&rec.PromptTokens,
+			&rec.CompletionTokens,
+			&rec.CachedTokens,
+			&rec.TotalTokens,
+			&rec.Cost,
+			&rec.ErrorCount,
+			&rec.RateLimitedCount,
+			&rec.LastActive,
+		); err != nil {
+			return nil, fmt.Errorf("scan client usage row: %w", err)
+		}
+
+		if name, ok := names[rec.ClientKeyHash]; ok {
+			rec.ClientID = name
+			rec.ClientName = name
+		} else {
+			rec.ClientID = rec.ClientKeyHash
+		}
+		if rec.ClientID == "" {
+			rec.ClientID = "anonymous"
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate client usage rows: %w", err)
+	}
+
+	return records, nil
+}
+
+// clientNameByHash maps the sha256 hex digest stored in requests.client_key_hash
+// to the configured client key name.
+func (s *Server) clientNameByHash() map[string]string {
+	out := make(map[string]string)
+	if s == nil || s.cfg == nil {
+		return out
+	}
+	for name, key := range s.cfg.Server.ClientKeys {
+		if key == "" {
+			continue
+		}
+		sum := sha256.Sum256([]byte(key))
+		out[hex.EncodeToString(sum[:])] = name
+	}
+	return out
+}
+
+func respondJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(res)
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func (s *Server) writeStatsError(w http.ResponseWriter, status int, msg string) {
+	respondJSON(w, status, map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    "invalid_request_error",
+			"param":   nil,
+			"code":    "stats_query_failed",
+		},
+	})
 }
