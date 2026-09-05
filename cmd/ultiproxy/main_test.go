@@ -225,6 +225,18 @@ func TestNewFreebuffActorExplicitToken(t *testing.T) {
 	}); !ok {
 		t.Fatalf("actor %T does not implement FetchUsage", actor)
 	}
+	// The openaicompat freebuff quirk duck-types the session-lifecycle surface
+	// before every chat (reconcile + bind); if the adapter drops any of these
+	// methods the assertion silently fails and every chat 428s with
+	// waiting_room_required.
+	if _, ok := actor.(interface {
+		Reconcile(...context.Context) error
+		BoundModel() string
+		DeleteSession(...context.Context) error
+		Bind(any, ...string) error
+	}); !ok {
+		t.Fatalf("actor %T does not implement the freebuff session-lifecycle interface", actor)
+	}
 	tok, err := os.ReadFile(filepath.Join(dir, "freebuff_token"))
 	if err != nil {
 		t.Fatalf("freebuff_token not written: %v", err)

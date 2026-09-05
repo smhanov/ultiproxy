@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -408,13 +409,14 @@ func TestOpenAICompat_AugureRefreshAndDefaultModel(t *testing.T) {
 }
 
 type fakeActor struct {
-	mu           sync.Mutex
-	lock         sync.Mutex
-	active       int
-	maxActive    int
-	acquireCount int
-	instanceID   string
-	token        string
+	mu              sync.Mutex
+	lock            sync.Mutex
+	active          int
+	maxActive       int
+	acquireCount    int
+	instanceID      string
+	token           string
+	startedAgentIDs []string
 }
 
 func (a *fakeActor) Acquire(ctx context.Context) error {
@@ -460,6 +462,425 @@ func (a *fakeActor) FetchUsage(ctx context.Context, fingerprintID string) ([]byt
 // SessionInfo returns a canned session (instance + model) for quota Detail.
 func (a *fakeActor) SessionInfo(ctx context.Context) (string, string, error) {
 	return a.instanceID, "test-model", nil
+}
+
+// startRunAgentIDs records the agentId of every StartRun call.
+func (a *fakeActor) startRunAgentIDs() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.startedAgentIDs...)
+}
+
+// fakeAgentRun satisfies the GetRunID() string surface applyRequestTransforms
+// accepts for StartRun results.
+type fakeAgentRun struct{ id string }
+
+func (r *fakeAgentRun) GetRunID() string { return r.id }
+
+// StartRun records the requested agentId and returns a canned run id.
+func (a *fakeActor) StartRun(ctx context.Context, agentID string) (any, error) {
+	a.mu.Lock()
+	a.startedAgentIDs = append(a.startedAgentIDs, agentID)
+	a.mu.Unlock()
+	return &fakeAgentRun{id: "run-abc-123"}, nil
+}
+
+// fakeSessionManager satisfies the optional freebuff session-lifecycle surface
+// (Reconcile/BoundModel/DeleteSession/Bind) so tests can drive each lifecycle
+// branch without HTTP. The provider duck-types this surface.
+type fakeSessionManager struct {
+	reconciled bool
+	bound      string // value BoundModel() reports
+	bindCalls  []string
+	deletes    int
+	bindErr    error
+}
+
+func (f *fakeSessionManager) Reconcile(...context.Context) error {
+	f.reconciled = true
+	return nil
+}
+
+func (f *fakeSessionManager) BoundModel() string { return f.bound }
+
+func (f *fakeSessionManager) DeleteSession(...context.Context) error {
+	f.deletes++
+	return nil
+}
+
+func (f *fakeSessionManager) Bind(_ any, optionalModel ...string) error {
+	if f.bindErr != nil {
+		return f.bindErr
+	}
+	model := ""
+	if len(optionalModel) > 0 {
+		model = optionalModel[0]
+	}
+	f.bindCalls = append(f.bindCalls, model)
+	return nil
+}
+
+// TestOpenAICompat_FreebuffSessionLifecycle: before each chat the lane must
+// reconcile the free session and bind it to the canonical upstream model when
+// no session is bound (status none) — POST /freebuff/session with the full
+// publisher model id, not the bare request alias. This mirrors the old node
+// bridge's server.js and fixes "428 waiting_room_required" on a fresh account.
+func TestOpenAICompat_FreebuffSessionLifecycle_BindWhenNone(t *testing.T) {
+	sm := &fakeSessionManager{} // BoundModel()=="" → session none
+	server := freebuffChatStubServer()
+	defer server.Close()
+
+	p, err := New(Config{
+		BaseURL:    server.URL,
+		APIKey:     "test-token",
+		HTTPClient: server.Client(),
+		Quirks: Quirks{
+			FreebuffActor:       sm,
+			FreebuffDefaultTool: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+
+	msgs := []*ir.Message{{Role: "user", Blocks: []ir.Block{ir.TextBlock{Text: "hi"}}}}
+	if _, err := p.Generate(context.Background(), msgs, provider.WithModel("glm-5.3-flash")); err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	if !sm.reconciled {
+		t.Error("expected Reconcile (GET /freebuff/session) before chat")
+	}
+	if len(sm.bindCalls) != 1 {
+		t.Fatalf("expected exactly 1 Bind call, got %d (%v)", len(sm.bindCalls), sm.bindCalls)
+	}
+	if sm.bindCalls[0] != "z-ai/glm-5.3-flash" {
+		t.Errorf("Bind model = %q, want canonical publisher id %q (not the bare alias)", sm.bindCalls[0], "z-ai/glm-5.3-flash")
+	}
+	if sm.deletes != 0 {
+		t.Errorf("expected no DeleteSession on fresh account, got %d", sm.deletes)
+	}
+}
+
+// TestOpenAICompat_FreebuffSessionLifecycle_ModelSwitch: an active session
+// bound to a different model must be deleted and re-bound to the requested one.
+func TestOpenAICompat_FreebuffSessionLifecycle_ModelSwitch(t *testing.T) {
+	sm := &fakeSessionManager{bound: "deepseek/deepseek-v4-flash"}
+	server := freebuffChatStubServer()
+	defer server.Close()
+
+	p, err := New(Config{
+		BaseURL:    server.URL,
+		APIKey:     "test-token",
+		HTTPClient: server.Client(),
+		Quirks: Quirks{
+			FreebuffActor:       sm,
+			FreebuffDefaultTool: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+
+	msgs := []*ir.Message{{Role: "user", Blocks: []ir.Block{ir.TextBlock{Text: "hi"}}}}
+	if _, err := p.Generate(context.Background(), msgs, provider.WithModel("glm-5.3-flash")); err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	if sm.deletes != 1 {
+		t.Errorf("expected 1 DeleteSession on model switch, got %d", sm.deletes)
+	}
+	if len(sm.bindCalls) != 1 || sm.bindCalls[0] != "z-ai/glm-5.3-flash" {
+		t.Errorf("expected re-Bind to z-ai/glm-5.3-flash, got %v", sm.bindCalls)
+	}
+}
+
+// TestOpenAICompat_FreebuffSessionLifecycle_ActiveMatch: a session already
+// bound to the requested model is left alone — no delete, no re-bind.
+func TestOpenAICompat_FreebuffSessionLifecycle_ActiveMatch(t *testing.T) {
+	sm := &fakeSessionManager{bound: "z-ai/glm-5.3-flash"}
+	server := freebuffChatStubServer()
+	defer server.Close()
+
+	p, err := New(Config{
+		BaseURL:    server.URL,
+		APIKey:     "test-token",
+		HTTPClient: server.Client(),
+		Quirks: Quirks{
+			FreebuffActor:       sm,
+			FreebuffDefaultTool: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+
+	msgs := []*ir.Message{{Role: "user", Blocks: []ir.Block{ir.TextBlock{Text: "hi"}}}}
+	if _, err := p.Generate(context.Background(), msgs, provider.WithModel("glm-5.3-flash")); err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	if sm.deletes != 0 || len(sm.bindCalls) != 0 {
+		t.Errorf("expected session reuse (0 deletes, 0 binds), got %d deletes, %d binds", sm.deletes, len(sm.bindCalls))
+	}
+}
+
+// TestOpenAICompat_FreebuffSessionLifecycle_BindError: a bind failure (e.g.
+// 429 rate_limited or 403 banned from POST /freebuff/session) aborts the chat
+// with that error instead of sending a doomed upstream request.
+func TestOpenAICompat_FreebuffSessionLifecycle_BindError(t *testing.T) {
+	sm := &fakeSessionManager{bindErr: fmt.Errorf("failed to bind model, status: 429: rate_limited")}
+	server := freebuffChatStubServer()
+	defer server.Close()
+
+	p, err := New(Config{
+		BaseURL:    server.URL,
+		APIKey:     "test-token",
+		HTTPClient: server.Client(),
+		Quirks: Quirks{
+			FreebuffActor:       sm,
+			FreebuffDefaultTool: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+
+	msgs := []*ir.Message{{Role: "user", Blocks: []ir.Block{ir.TextBlock{Text: "hi"}}}}
+	_, err = p.Generate(context.Background(), msgs, provider.WithModel("glm-5.3-flash"))
+	if err == nil {
+		t.Fatal("expected Generate to fail when Bind fails")
+	}
+	if !strings.Contains(err.Error(), "rate_limited") {
+		t.Errorf("error = %v, want it to carry the bind failure", err)
+	}
+}
+
+// freebuffChatStubServer answers /agent-runs and /chat/completions like the
+// freebuff upstream (session lifecycle happens through the fake actor).
+func freebuffChatStubServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/agent-runs") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"runId":"run-abc-123"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"fb-1","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+}
+
+// fakeAdoptingActor mimics the real actor's bind flow: it starts with no
+// instance id and adopts the upstream-minted one on Bind (like
+// FreebuffAccountActor does). It exposes what the chat headers SHOULD carry.
+type fakeAdoptingActor struct {
+	fakeActor
+	minted string
+}
+
+func (a *fakeAdoptingActor) Bind(_ any, optionalModel ...string) error {
+	a.mu.Lock()
+	a.instanceID = a.minted
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *fakeAdoptingActor) Reconcile(...context.Context) error { return nil }
+
+func (a *fakeAdoptingActor) BoundModel() string { return "" } // fresh account
+
+func (a *fakeAdoptingActor) DeleteSession(...context.Context) error { return nil }
+
+// TestOpenAICompat_FreebuffInstanceHeaderAfterBind: the x-freebuff-instance-id
+// header on the chat request must carry the POST-bind instance id (the one the
+// upstream minted and the actor adopted), not the pre-bind (empty) one.
+// Headers built before the session lifecycle leave the session unmatchable and
+// upstream 428s waiting_room_required.
+func TestOpenAICompat_FreebuffInstanceHeaderAfterBind(t *testing.T) {
+	var mu sync.Mutex
+	var chatInstHeader string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/agent-runs"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"runId":"run-abc-123"}`))
+		case strings.HasSuffix(r.URL.Path, "/chat/completions"):
+			mu.Lock()
+			chatInstHeader = r.Header.Get("x-freebuff-instance-id")
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"fb-1","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	actor := &fakeAdoptingActor{minted: "fb-minted-42"}
+	p, err := New(Config{
+		BaseURL:    server.URL,
+		APIKey:     "test-token",
+		HTTPClient: server.Client(),
+		Quirks: Quirks{
+			FreebuffActor:       actor,
+			FreebuffDefaultTool: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+
+	msgs := []*ir.Message{{Role: "user", Blocks: []ir.Block{ir.TextBlock{Text: "hi"}}}}
+	if _, err := p.Generate(context.Background(), msgs, provider.WithModel("glm")); err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	mu.Lock()
+	got := chatInstHeader
+	mu.Unlock()
+	if got != "fb-minted-42" {
+		t.Errorf("chat x-freebuff-instance-id = %q, want the post-bind minted id %q", got, "fb-minted-42")
+	}
+}
+
+// TestOpenAICompat_FreebuffAgentModelMapping: free mode only accepts specific
+// agent/model combos, so the lane must translate the request's model into the
+// upstream agentId for POST /agent-runs (upstream 403s free_mode_invalid_agent_model
+// otherwise) and the returned runId must flow into codebuff_metadata.run_id.
+func TestOpenAICompat_FreebuffAgentModelMapping(t *testing.T) {
+	var mu sync.Mutex
+	var chatMetadata map[string]any
+	var chatModel any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]any
+		_ = json.Unmarshal(body, &payload)
+
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/agent-runs"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"runId":"run-abc-123"}`))
+		case strings.HasSuffix(r.URL.Path, "/chat/completions"):
+			mu.Lock()
+			meta, _ := payload["codebuff_metadata"].(map[string]any)
+			chatMetadata = meta
+			chatModel = payload["model"]
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"fb-1","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	actor := &fakeActor{instanceID: "fb-inst-007"}
+	p, err := New(Config{
+		BaseURL:    server.URL,
+		APIKey:     "test-token",
+		HTTPClient: server.Client(),
+		Quirks: Quirks{
+			FreebuffActor:       actor,
+			FreebuffDefaultTool: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+
+	msgs := []*ir.Message{
+		{Role: "user", Blocks: []ir.Block{ir.TextBlock{Text: "hi"}}},
+	}
+	// Bare alias in: upstream must still see the canonical publisher model.
+	if _, err := p.Generate(context.Background(), msgs, provider.WithModel("glm")); err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	// The upstream agentId for the glm-5.3-flash free agent — the raw model id
+	// is rejected with free_mode_invalid_agent_model.
+	ids := actor.startRunAgentIDs()
+	if len(ids) != 1 {
+		t.Fatalf("expected exactly 1 StartRun call, got %d (%v)", len(ids), ids)
+	}
+	if ids[0] != "base3-free-glm-5-3-flash" {
+		t.Errorf("StartRun agentId = %q, want %q (the base3-free agent, not the raw model id)", ids[0], "base3-free-glm-5-3-flash")
+	}
+
+	// codebuff_metadata.run_id must be the runId minted by START, not a placeholder.
+	if chatMetadata == nil {
+		t.Fatal("chat payload missing codebuff_metadata")
+	}
+	if got, _ := chatMetadata["run_id"].(string); got != "run-abc-123" {
+		t.Errorf("codebuff_metadata.run_id = %q, want the START-minted %q", got, "run-abc-123")
+	}
+
+	// The chat body's model must be the canonical publisher-qualified id the
+	// upstream knows (both the old bridge and the shipped CLI send it).
+	if got, _ := chatModel.(string); got != "z-ai/glm-5.3-flash" {
+		t.Errorf("chat body model = %q, want canonical %q", got, "z-ai/glm-5.3-flash")
+	}
+}
+
+// TestOpenAICompat_FreebuffAgentModelMapping_AliasesAndUnknown: free-tier model
+// aliases (bare names like "glm" or "deepseek") map to their agents too, and an
+// unknown model passes through unchanged (fail-open, so newly listed upstream
+// models still reach the API).
+func TestOpenAICompat_FreebuffAgentModelMapping_AliasesAndUnknown(t *testing.T) {
+	cases := []struct {
+		model string
+		want  string
+	}{
+		{"glm", "base3-free-glm-5-3-flash"},
+		{"glm-5.3-flash", "base3-free-glm-5-3-flash"},
+		{"deepseek", "base3-free-deepseek-flash"},
+		{"deepseek/deepseek-v4-flash", "base3-free-deepseek-flash"},
+		{"mimo-v2.5", "base3-free-mimo"},
+		{"kimi-k3-eco", "base3-free-kimi-k3-eco"},
+		{"openai/gpt-5.6-luna", "base3-free-luna"},
+		{"solar", "base3-free-solar-pro4"},
+		{"totally-new-model", "totally-new-model"}, // fail-open passthrough
+	}
+
+	for _, tc := range cases {
+		actor := &fakeActor{instanceID: "fb-inst-007"}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/agent-runs") {
+				_, _ = w.Write([]byte(`{"runId":"run-x"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"fb-1","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}]}`))
+		}))
+		p, err := New(Config{
+			BaseURL:    server.URL,
+			APIKey:     "test-token",
+			HTTPClient: server.Client(),
+			Quirks: Quirks{
+				FreebuffActor:       actor,
+				FreebuffDefaultTool: true,
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+
+		msgs := []*ir.Message{
+			{Role: "user", Blocks: []ir.Block{ir.TextBlock{Text: "hi"}}},
+		}
+		if _, err := p.Generate(context.Background(), msgs, provider.WithModel(tc.model)); err != nil {
+			t.Fatalf("Generate(%q) failed: %v", tc.model, err)
+		}
+		server.Close()
+
+		ids := actor.startRunAgentIDs()
+		if len(ids) != 1 {
+			t.Fatalf("model %q: expected 1 StartRun call, got %d", tc.model, len(ids))
+		}
+		if ids[0] != tc.want {
+			t.Errorf("model %q: StartRun agentId = %q, want %q", tc.model, ids[0], tc.want)
+		}
+	}
 }
 
 func TestOpenAICompat_FreebuffActorLock(t *testing.T) {

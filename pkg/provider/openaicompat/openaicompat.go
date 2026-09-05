@@ -264,12 +264,97 @@ func (p *Provider) resolveMaxTokens(model string, requested int) int {
 	return 0
 }
 
+// freebuffCanonicalModel maps a request model (any alias form) to the
+// canonical publisher-qualified upstream model id used for session binding
+// (x-freebuff-model). Unknown models pass through unchanged.
+func freebuffCanonicalModel(model string) string {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	for canonical, aliases := range freebuffCanonicalByAlias {
+		for _, a := range aliases {
+			if normalized == a {
+				return canonical
+			}
+		}
+	}
+	return model
+}
+
+// freebuffCanonicalByAlias: canonical publisher model -> accepted aliases
+// (lowercased). Source: freebuff modelMap + live session rateLimitsByModel.
+var freebuffCanonicalByAlias = map[string][]string{
+	"z-ai/glm-5.3-flash":         {"z-ai/glm-5.3-flash", "glm-5.3-flash", "glm"},
+	"deepseek/deepseek-v4-flash": {"deepseek/deepseek-v4-flash", "deepseek-v4-flash", "deepseek"},
+	"openai/gpt-5.6-luna":        {"openai/gpt-5.6-luna", "gpt-5.6-luna", "luna"},
+	"minimax/minimax-m3":         {"minimax/minimax-m3", "minimax-m3", "minimax"},
+	"mimo/mimo-v2.5":             {"mimo/mimo-v2.5", "mimo-v2.5", "mimo"},
+	"upstage/solar-pro4":         {"upstage/solar-pro4", "solar-pro-4", "solar"},
+	"crof/kimi-k3-eco":           {"crof/kimi-k3-eco", "kimi-k3-eco", "kimi"},
+}
+
+// freebuffAgentID translates a request model into the free-mode agentId the
+// /agent-runs endpoint expects (mirrors the old node bridge's modelMap.json,
+// ~/workspace/freebuff-proxy/src/modelMap.json). Unknown models pass through
+// unchanged (fail-open): upstream, not the proxy, owns the canonical list.
+func freebuffAgentID(model string) string {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	if normalized == "" {
+		return model
+	}
+	if strings.HasPrefix(normalized, "base3-free-") {
+		return model // already an agentId
+	}
+	if id, ok := freebuffAgentByModel[normalized]; ok {
+		return id
+	}
+	// Also accept "<publisher>/<model>" for a known bare model and vice versa.
+	if _, rest, found := strings.Cut(normalized, "/"); found {
+		if id, ok := freebuffAgentByModel[rest]; ok {
+			return id
+		}
+	}
+	return model
+}
+
+// freebuffAgentByModel maps free-tier model ids (bare and publisher-qualified
+// forms) to their base3-free agent ids. Source of truth: the free session's
+// rateLimitsByModel on a live account + modelMap.json from the Sept 3 bridge.
+var freebuffAgentByModel = map[string]string{
+	"deepseek/deepseek-v4-flash": "base3-free-deepseek-flash",
+	"deepseek-v4-flash":          "base3-free-deepseek-flash",
+	"deepseek":                   "base3-free-deepseek-flash",
+	"z-ai/glm-5.3-flash":         "base3-free-glm-5-3-flash",
+	"glm-5.3-flash":              "base3-free-glm-5-3-flash",
+	"glm":                        "base3-free-glm-5-3-flash",
+	"openai/gpt-5.6-luna":        "base3-free-luna",
+	"gpt-5.6-luna":               "base3-free-luna",
+	"luna":                       "base3-free-luna",
+	"minimax/minimax-m3":         "base3-free-minimax-m3",
+	"minimax-m3":                 "base3-free-minimax-m3",
+	"minimax":                    "base3-free-minimax-m3",
+	"mimo/mimo-v2.5":             "base3-free-mimo",
+	"mimo-v2.5":                  "base3-free-mimo",
+	"mimo":                       "base3-free-mimo",
+	"upstage/solar-pro4":         "base3-free-solar-pro4",
+	"solar-pro-4":                "base3-free-solar-pro4",
+	"solar":                      "base3-free-solar-pro4",
+	"crof/kimi-k3-eco":           "base3-free-kimi-k3-eco",
+	"kimi-k3-eco":                "base3-free-kimi-k3-eco",
+	"kimi":                       "base3-free-kimi-k3-eco",
+	"google/gemini-3.8-flash":    "base3-free-gemini-3-8-flash",
+	"gemini-3.8-flash":           "base3-free-gemini-3-8-flash",
+}
+
 func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Message, opts []provider.Option) (context.Context, []*ir.Message, []provider.Option, error) {
 	reqConfig := provider.NewRequestConfig(opts...)
 
 	// 1. Model resolution
 	model := p.resolveModel(reqConfig.Model)
 	if model != "" {
+		// Freebuff: normalize aliases to the canonical publisher-qualified id
+		// so the body model, session bind, and agent run all agree.
+		if p.cfg.Quirks.FreebuffDefaultTool {
+			model = freebuffCanonicalModel(model)
+		}
 		opts = append(opts, provider.WithModel(model))
 	}
 
@@ -317,10 +402,39 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 		}
 	}
 
-	// 5. Freebuff headers (x-freebuff-instance-id, x-freebuff-acting-user-id,
-	// User-Agent) — ported from the pre-F2 freebuff lane's setHeaders. Codebuff
-	// requires these; without them the Actor rejects the request.
+	// 5+6. Freebuff session lifecycle BEFORE header construction, then the
+	// freebuff headers and default tool/codebuff_metadata transform.
 	if p.cfg.Quirks.FreebuffActor != nil {
+		// Lifecycle first: reconcile, bind to the canonical publisher model
+		// when unbound (fresh account), delete+re-bind on model switch. Bind
+		// may adopt an upstream-minted instance id, so this must run before
+		// the x-freebuff-instance-id header is built.
+		if p.cfg.Quirks.FreebuffDefaultTool {
+			if sm, ok := p.cfg.Quirks.FreebuffActor.(interface {
+				Reconcile(...context.Context) error
+				BoundModel() string
+				DeleteSession(...context.Context) error
+				Bind(any, ...string) error
+			}); ok {
+				canonical := freebuffCanonicalModel(model)
+				if err := sm.Reconcile(ctx); err != nil {
+					return nil, nil, nil, fmt.Errorf("freebuff session check: %w", err)
+				}
+				switch bound := sm.BoundModel(); {
+				case bound == "":
+					if err := sm.Bind(ctx, canonical); err != nil {
+						return nil, nil, nil, err
+					}
+				case bound != canonical:
+					if err := sm.DeleteSession(ctx); err != nil {
+						return nil, nil, nil, fmt.Errorf("freebuff session switch: %w", err)
+					}
+					if err := sm.Bind(ctx, canonical); err != nil {
+						return nil, nil, nil, err
+					}
+				}
+			}
+		}
 		opts = append(opts, provider.WithHeader("User-Agent", "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.25 runtime/node.js/v22.23.2"))
 		if inst, ok := p.cfg.Quirks.FreebuffActor.(freebuffInstanceIDer); ok {
 			if id := inst.InstanceID(); id != "" {
@@ -394,7 +508,11 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 		if rp, ok := p.cfg.Quirks.FreebuffActor.(interface {
 			StartRun(context.Context, string) (any, error)
 		}); ok {
-			if r, err := rp.StartRun(ctx, model); err == nil {
+			// Free mode only accepts specific agent/model combos: /agent-runs
+			// wants the base3-free-* agentId, not the raw model id (upstream
+			// 403s free_mode_invalid_agent_model otherwise). Unknown models
+			// pass through unchanged so newly listed upstream models still work.
+			if r, err := rp.StartRun(ctx, freebuffAgentID(model)); err == nil {
 				if s, ok := r.(string); ok && s != "" {
 					runID = s
 				} else if rID, ok := r.(interface{ GetRunID() string }); ok {

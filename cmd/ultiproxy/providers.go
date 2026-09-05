@@ -64,6 +64,27 @@ func (a *freebuffActorAdapter) SessionInfo(ctx context.Context) (string, string,
 	return sess.InstanceID, sess.Model, nil
 }
 
+// The openaicompat freebuff quirk duck-types this session-lifecycle surface
+// before every chat (reconcile, bind to the canonical model, delete+re-bind on
+// model switch). The adapter must forward all of it — dropping any method
+// silently disables the lifecycle and every chat 428s waiting_room_required.
+
+func (a *freebuffActorAdapter) Reconcile(ctxs ...context.Context) error {
+	return a.actor.Reconcile(ctxs...)
+}
+
+func (a *freebuffActorAdapter) BoundModel() string {
+	return a.actor.BoundModel()
+}
+
+func (a *freebuffActorAdapter) DeleteSession(ctxs ...context.Context) error {
+	return a.actor.DeleteSession(ctxs...)
+}
+
+func (a *freebuffActorAdapter) Bind(ctxOrModel any, optionalModel ...string) error {
+	return a.actor.Bind(ctxOrModel, optionalModel...)
+}
+
 // readJSONField loads a key from a JSON file, returning "" if unavailable.
 func readJSONField(path string, fields ...string) (string, bool) {
 	data, err := os.ReadFile(path)
