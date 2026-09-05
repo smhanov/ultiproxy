@@ -800,3 +800,90 @@ func TestMCP_AddCustomProviderFreebuff(t *testing.T) {
 		t.Fatalf("custom lane not persisted: %+v", store.List()["freebuff"])
 	}
 }
+
+// listableLane is a lane whose model surface list_models must mirror without
+// touching an upstream: a discovery cache and/or a lane default model.
+type listableLane struct {
+	name   string
+	cached []string
+	def    string
+}
+
+func (l *listableLane) Name() string           { return l.name }
+func (l *listableLane) CachedModels() []string { return l.cached }
+func (l *listableLane) DefaultModel() string   { return l.def }
+func (l *listableLane) Generate(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (*ir.Response, error) {
+	return nil, nil
+}
+func (l *listableLane) Stream(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (<-chan ir.Event, error) {
+	return nil, nil
+}
+
+// callListModels invokes the list_models tool and decodes its JSON object of
+// id -> entry into a map.
+func callListModels(t *testing.T, srv *Server) map[string]struct {
+	Provider string `json:"provider"`
+	Enabled  bool   `json:"enabled"`
+} {
+	t.Helper()
+	res := callMCPTool(t, srv, 1, "list_models", `{}`)
+	if len(res.Content) == 0 {
+		t.Fatalf("list_models returned no content")
+	}
+	out := map[string]struct {
+		Provider string `json:"provider"`
+		Enabled  bool   `json:"enabled"`
+	}{}
+	if err := json.Unmarshal([]byte(res.Content[0].Text), &out); err != nil {
+		t.Fatalf("decode list_models output: %v (%s)", err, res.Content[0].Text)
+	}
+	return out
+}
+
+// TestMCPToolCall_ListModelsMirrorsModelsEndpoint: list_models applies exactly
+// the filtering GET /v1/models applies - aliases plus "<lane>/<model>" ids
+// (discovered or lane default), never a bare lane name.
+func TestMCPToolCall_ListModelsMirrorsModelsEndpoint(t *testing.T) {
+	registry := provider.NewRegistry()
+	registry.Register(provider.Provider{Inference: &listableLane{name: "discovered", cached: []string{"m1"}}})
+	registry.Register(provider.Provider{Inference: &listableLane{name: "defaultonly", def: "tofino-3"}})
+	registry.Register(provider.Provider{Inference: &listableLane{name: "neither"}})
+
+	srv := NewServer(registry, newStubStateSource())
+	models := callListModels(t, srv)
+
+	for _, want := range []string{"gpt-4o", "claude-3-7-sonnet", "discovered/m1", "defaultonly/tofino-3"} {
+		if _, ok := models[want]; !ok {
+			t.Errorf("list_models missing %q: %v", want, models)
+		}
+	}
+	for _, lane := range registry.Names() {
+		if _, ok := models[lane]; ok {
+			t.Errorf("list_models advertises bare lane name %q as a model id", lane)
+		}
+	}
+	for id := range models {
+		if strings.HasPrefix(id, "neither/") {
+			t.Errorf("list_models invented id %q for a lane with no discovery and no default", id)
+		}
+	}
+}
+
+// TestMCPToolCall_ListModelsHidesTestLanes: ULTIPROXY_HIDE_TEST_LANES=1 keeps
+// probe/fake lanes out of list_models, matching GET /v1/models.
+func TestMCPToolCall_ListModelsHidesTestLanes(t *testing.T) {
+	registry := provider.NewRegistry()
+	registry.Register(provider.Provider{Inference: &listableLane{name: "probe", cached: []string{"m1"}}})
+	registry.Register(provider.Provider{Inference: &listableLane{name: "reallane", cached: []string{"m1"}}})
+
+	t.Setenv("ULTIPROXY_HIDE_TEST_LANES", "1")
+	models := callListModels(t, NewServer(registry, newStubStateSource()))
+	for id := range models {
+		if id == "probe" || strings.HasPrefix(id, "probe/") {
+			t.Errorf("list_models listed test lane id %q with ULTIPROXY_HIDE_TEST_LANES=1", id)
+		}
+	}
+	if _, ok := models["reallane/m1"]; !ok {
+		t.Errorf("list_models hid a real lane: %v", models)
+	}
+}

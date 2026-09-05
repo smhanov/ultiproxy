@@ -173,7 +173,7 @@ Everything below is available on `tools/list` at `http://localhost:9050/mcp`, wi
 
 | Tool | What it does |
 | :--- | :--- |
-| `list_models` | Client-visible model ids with their lane, enabled state, context limit, max output, pricing tag and capabilities. |
+| `list_models` | Client-visible model ids with their lane, enabled state, context limit, max output, pricing tag, capabilities and source (`alias` / `discovery` / `default`). Same id set as `GET /v1/models`, so the two surfaces cannot drift; ids disabled with `toggle_model` stay listed with `enabled: false`. |
 | `get_quota_status` | Real-time quota/credit status for one lane (`antigravity`, `xai`, `copilot`, `codex`, `freebuff`, `zai`, ...): used %, remaining, units, reset times. Monitoring only -- never auto-reroutes. |
 | `toggle_model` | Enable/disable a model id at runtime without deleting its mapping. |
 | `get_client_usage` | Token (prompt, completion, cached) and request usage per client key or overall, over a window such as `1h`, `24h`, `7d`. |
@@ -287,7 +287,7 @@ curl -s http://localhost:9050/v1/chat/completions \
 | :--- | :--- |
 | `POST /v1/chat/completions` | OpenAI chat completions (text, tools, images, SSE streaming). |
 | `POST /v1/messages` | Anthropic Messages API (Claude Code and friends). |
-| `GET /v1/models` | Everything routable: aliases (with `context_length` / `max_output_tokens`), one `<lane>` entry per lane, and `<lane>/<model>` per discovered upstream model. Served from the discovery cache only -- listing never fans out to an upstream. |
+| `GET /v1/models` | Only routable model ids: aliases (with `context_length` / `max_output_tokens`), `<lane>/<model>` per discovered upstream model, and `<lane>/<default>` for lanes with a default model (e.g. `antigravity/gemini-3.7-flash-high`). No bare lane names -- a lane name is a routing prefix, not a model (`"model": "<lane>"` still routes, as a legacy form). A lane with an empty discovery cache and no default lists nothing. Served from the discovery cache only -- listing never fans out to an upstream; set `ULTIPROXY_HIDE_TEST_LANES=1` to keep test lanes (`probe`, `fake`) out. |
 | `POST /mcp`, `GET /mcp` | Streamable HTTP MCP server (JSON-RPC 2.0). |
 | `GET /mcp/sse` | Legacy SSE MCP transport. |
 | `GET /api/quota`, `/quota.txt`, `/quota.md` | Live quota dashboard, plain-text and Markdown views. |

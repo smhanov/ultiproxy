@@ -248,12 +248,21 @@ func New(cfg Config) *Provider {
 	return p
 }
 
-// ProjectID returns the Cloud Code project bound to this session.
 func (p *Provider) ProjectID() string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.projectID
 }
+
+// defaultModel is the compiled-in model an antigravity request falls back to
+// when the caller names no model (buildRequest). It doubles as the lane's
+// advertised default id, "antigravity/<defaultModel>", which is routable even
+// though the lane has no model-discovery surface.
+const defaultModel = "gemini-3.7-flash-high"
+
+// DefaultModel implements the lane-default escape hatch used by the model
+// listing surfaces (/v1/models and the list_models MCP tool).
+func (p *Provider) DefaultModel() string { return defaultModel }
 
 func (p *Provider) setProjectID(id string) {
 	p.mu.Lock()
@@ -909,7 +918,7 @@ func (p *Provider) buildRequest(msgs []*ir.Message, cfg *provider.RequestConfig)
 
 	model := cfg.Model
 	if model == "" {
-		model = "gemini-3.7-flash-high"
+		model = defaultModel
 	}
 
 	return &cloudCodeRequest{

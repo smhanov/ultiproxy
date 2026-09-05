@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -51,6 +52,48 @@ type modelsCacheProvider interface {
 	CachedModels() []string
 }
 
+// defaultModelProvider is implemented by lanes that have a real default
+// upstream model to send when a request names no model: openaicompat lanes
+// with quirks.default_model, and antigravity's compiled-in default. The
+// aggregated /v1/models handler uses it as the escape hatch that keeps a
+// non-discoverable lane advertised: "<lane>/<default>" is a routable id, so it
+// is listed even when the discovery cache is empty.
+type defaultModelProvider interface {
+	DefaultModel() string
+}
+
+// EnvHideTestLanes removes clearly-test lanes (probe/fake/...) from the model
+// listing. Set it to 1 on a daemon whose registry carries wiring-exercise
+// lanes, so production clients never see them as models.
+const EnvHideTestLanes = "ULTIPROXY_HIDE_TEST_LANES"
+
+// hideTestLanes reports whether test lanes must be left out of the model
+// listing. Anything but an explicit truthy value keeps them listed, so the
+// default changes nothing for real lanes.
+func hideTestLanes() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvHideTestLanes))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// isTestLane reports whether a lane name marks a lane that exists to exercise
+// ultiproxy's own wiring rather than serve a real upstream ("probe", "fake",
+// "mock", "test", and the same words as a prefix).
+func isTestLane(name string) bool {
+	switch name {
+	case "probe", "fake", "mock", "test":
+		return true
+	}
+	for _, prefix := range []string{"probe-", "fake-", "mock-", "test-"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // handleModels serves the aggregated model list.
 //
 // Sources, in order (first occurrence of an id wins):
@@ -59,13 +102,16 @@ type modelsCacheProvider interface {
 //     any runtime toggle_model entries), honouring the Enabled flag;
 //  2. the alias catalog itself, so a server built without a state manager
 //     still lists its configured aliases;
-//  3. every registered lane: one entry named exactly "<lane>" (lanes accept
-//     prefix-routed models, and lanes with no model discovery at all —
-//     anthropic, codex, custom kinds — have nothing else to advertise), plus
-//     one entry per cached discovered upstream model as "<lane>/<model>".
-//     Those prefixed ids are exactly what routing accepts. A passthrough
-//     lane whose discovery cache is empty contributes no model entries: no
-//     fake ids are invented for it, and it is never probed on the fly.
+//  3. every registered lane: one entry per cached discovered upstream model
+//     as "<lane>/<model>", plus "<lane>/<default>" when the lane has a real
+//     default model. Those ids are exactly what routing accepts. A lane name
+//     on its own is NOT listed: "model": "<lane>" still routes (legacy
+//     prefix form), but a lane name is not a model, and advertising it sent
+//     clients to ids that reach no model. A lane with no discovery cache and
+//     no default model - anthropic, codex, custom kinds - contributes no
+//     entries at all: no fake ids are invented for it, and it is never probed
+//     on the fly. Lanes named like test wiring ("probe", "fake", ...) are
+//     skipped entirely when ULTIPROXY_HIDE_TEST_LANES is set.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	type ModelEntry struct {
 		ID      string `json:"id"`
@@ -141,23 +187,28 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Registered lanes.
 	if s.registry != nil {
+		hideTest := hideTestLanes()
 		for _, name := range s.registry.Names() {
+			if hideTest && isTestLane(name) {
+				continue
+			}
 			bundle, ok := s.registry.Get(name)
-			if !ok {
+			if !ok || bundle.Inference == nil {
 				continue
 			}
-			add(name, name, 0, 0)
-			if bundle.Inference == nil {
-				continue
+			if cacher, ok := bundle.Inference.(modelsCacheProvider); ok {
+				discovered := cacher.CachedModels()
+				sort.Strings(discovered)
+				for _, m := range discovered {
+					add(name+"/"+m, name, 0, 0)
+				}
 			}
-			cacher, ok := bundle.Inference.(modelsCacheProvider)
-			if !ok {
-				continue
-			}
-			discovered := cacher.CachedModels()
-			sort.Strings(discovered)
-			for _, m := range discovered {
-				add(name+"/"+m, name, 0, 0)
+			// Escape hatch for lanes with no model discovery: a real default
+			// model still yields exactly one routable, advertised id.
+			if def, ok := bundle.Inference.(defaultModelProvider); ok {
+				if m := def.DefaultModel(); m != "" {
+					add(name+"/"+m, name, 0, 0)
+				}
 			}
 		}
 	}

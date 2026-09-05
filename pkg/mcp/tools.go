@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/smhanov/ultiproxy/pkg/provider"
+	"github.com/smhanov/ultiproxy/pkg/state"
 )
 
 var standardTools = []Tool{
@@ -23,8 +26,11 @@ Returns a JSON object mapping every model id to its metadata:
 - context_limit: context window in tokens; advisory metadata surfaced as context_length on GET /v1/models, never enforced against the prompt
 - max_output: hard cap on generated tokens; a request's max_tokens is clamped down to it
 - pricing_tag, benchmark_scores: pricing / quality labels carried by the alias
+- source: where the id comes from - "alias" (set_model_alias catalog), "discovery" (the lane's cached upstream model list, exposed as "<lane>/<model>"), or "default" (a lane's default model, exposed as "<lane>/<default>", e.g. antigravity/gemini-3.7-flash-high)
 
-These entries are the alias catalog (see set_model_alias). Two further routing shapes are not listed here but always work: any registered lane name on its own ("<lane>") prefix-routes any upstream model id, and lanes with model discovery accept "<lane>/<upstream_model>" - GET /v1/models returns that full list. Use list_providers for lane-level inventory/health and list_model_aliases for the raw alias table.`,
+This is the same id set GET /v1/models advertises. Only routable ids appear: a bare lane name is never listed, because a lane name is a routing prefix, not a model. Lanes whose discovery cache is empty and that have no default model contribute nothing (refresh_models refills the cache). Ids disabled with toggle_model stay listed with "enabled": false so they can be switched back on, while GET /v1/models omits them. Setting ULTIPROXY_HIDE_TEST_LANES=1 additionally drops clearly-test lanes such as "probe" or "fake" from both surfaces.
+
+One routing shape is deliberately NOT advertised but still works, for backward compatibility: "model": "<lane>" with no slash routes to that lane and lets it pick its own upstream model. Prefer the listed ids. Use list_providers for lane-level inventory/health and list_model_aliases for the raw alias table.`,
 		InputSchema: &InputSchema{
 			Type:       "object",
 			Properties: map[string]PropertyDef{},
@@ -370,18 +376,7 @@ func (s *Server) handleCallTool(ctx context.Context, rawParams json.RawMessage) 
 }
 
 func (s *Server) toolListModels(ctx context.Context) (*CallToolResult, *JSONRPCError) {
-	var models any
-	if s.stateSource != nil {
-		snap := s.stateSource.Snapshot()
-		if snap != nil {
-			models = snap.Models
-		}
-	}
-	if models == nil {
-		models = map[string]any{}
-	}
-
-	b, _ := json.MarshalIndent(models, "", "  ")
+	b, _ := json.MarshalIndent(s.listedModels(), "", "  ")
 	return &CallToolResult{
 		Content: []ToolContent{
 			{
@@ -390,6 +385,161 @@ func (s *Server) toolListModels(ctx context.Context) (*CallToolResult, *JSONRPCE
 			},
 		},
 	}, nil
+}
+
+// listedModel is one list_models entry. The id set is the same set GET
+// /v1/models advertises; the value carries the metadata an agent needs to pick
+// a model or flip its enabled state.
+type listedModel struct {
+	ID              string             `json:"id"`
+	Provider        string             `json:"provider"`
+	Enabled         bool               `json:"enabled"`
+	ContextLimit    int                `json:"context_limit,omitempty"`
+	MaxOutput       int                `json:"max_output,omitempty"`
+	PricingTag      string             `json:"pricing_tag,omitempty"`
+	BenchmarkScores map[string]float64 `json:"benchmarks,omitempty"`
+	// Source is where the id comes from: "alias" (catalog / state model map),
+	// "discovery" (cached upstream catalog) or "default" (the lane's default
+	// model).
+	Source string `json:"source"`
+}
+
+// modelsCacheProvider, defaultModelProvider, EnvHideTestLanes, hideTestLanes
+// and isTestLane mirror the pkg/server surfaces (mcp cannot import server
+// without an import cycle). Keep them in sync: list_models must apply exactly
+// the filtering GET /v1/models applies, and the tests on both sides assert
+// that agreement.
+type modelsCacheProvider interface {
+	CachedModels() []string
+}
+
+type defaultModelProvider interface {
+	DefaultModel() string
+}
+
+const EnvHideTestLanes = "ULTIPROXY_HIDE_TEST_LANES"
+
+func hideTestLanes() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvHideTestLanes))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+func isTestLane(name string) bool {
+	switch name {
+	case "probe", "fake", "mock", "test":
+		return true
+	}
+	for _, prefix := range []string{"probe-", "fake-", "mock-", "test-"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// listedModels builds the id -> entry map list_models returns, mirroring the
+// GET /v1/models filtering: aliases plus "<lane>/<model>" ids (discovered or
+// lane default), never a bare lane name, and never a test lane when
+// ULTIPROXY_HIDE_TEST_LANES is set. One deliberate difference: ids disabled at
+// runtime (toggle_model) stay listed with "enabled": false so an agent can see
+// them and switch them back on; /v1/models omits them entirely.
+func (s *Server) listedModels() map[string]listedModel {
+	out := make(map[string]listedModel)
+	set := func(id string, e listedModel) {
+		if id == "" {
+			return
+		}
+		if _, exists := out[id]; exists {
+			return
+		}
+		e.ID = id
+		out[id] = e
+	}
+
+	var snap *state.RuntimeSnapshot
+	if s.stateSource != nil {
+		snap = s.stateSource.Snapshot()
+	}
+
+	// 1. State snapshot model map (aliases synced from the catalog, plus any
+	//    runtime toggle_model entries), Enabled reported as-is.
+	if snap != nil && snap.Models != nil {
+		keys := make([]string, 0, len(snap.Models))
+		for k := range snap.Models {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			m := snap.Models[k]
+			set(m.ID, listedModel{
+				Provider:        m.Provider,
+				Enabled:         m.Enabled,
+				ContextLimit:    m.ContextLimit,
+				MaxOutput:       m.MaxOutput,
+				PricingTag:      m.PricingTag,
+				BenchmarkScores: m.BenchmarkScores,
+				Source:          "alias",
+			})
+		}
+	}
+
+	// 2. Alias catalog (covers servers built without a state source).
+	if s.aliases != nil {
+		entries := s.aliases.List()
+		for _, alias := range s.aliases.Sorted() {
+			entry, ok := entries[alias]
+			if !ok {
+				continue
+			}
+			enabled := true
+			if snap != nil && snap.Models != nil {
+				if mr, ok := snap.Models[alias]; ok {
+					enabled = mr.Enabled
+				}
+			}
+			set(alias, listedModel{
+				Provider:        entry.Provider,
+				Enabled:         enabled,
+				ContextLimit:    entry.ContextLimit,
+				MaxOutput:       entry.MaxOutput,
+				PricingTag:      entry.PricingTag,
+				BenchmarkScores: entry.BenchmarkScores,
+				Source:          "alias",
+			})
+		}
+	}
+
+	// 3. Registered lanes: "<lane>/<model>" ids only, read from the discovery
+	//    cache (never a live fetch) plus the lane default model.
+	if s.registry != nil {
+		hideTest := hideTestLanes()
+		for _, name := range s.registry.Names() {
+			if hideTest && isTestLane(name) {
+				continue
+			}
+			bundle, ok := s.registry.Get(name)
+			if !ok || bundle.Inference == nil {
+				continue
+			}
+			if cacher, ok := bundle.Inference.(modelsCacheProvider); ok {
+				discovered := append([]string(nil), cacher.CachedModels()...)
+				sort.Strings(discovered)
+				for _, m := range discovered {
+					set(name+"/"+m, listedModel{Provider: name, Enabled: true, Source: "discovery"})
+				}
+			}
+			if def, ok := bundle.Inference.(defaultModelProvider); ok {
+				if m := def.DefaultModel(); m != "" {
+					set(name+"/"+m, listedModel{Provider: name, Enabled: true, Source: "default"})
+				}
+			}
+		}
+	}
+
+	return out
 }
 
 func (s *Server) toolGetQuotaStatus(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {

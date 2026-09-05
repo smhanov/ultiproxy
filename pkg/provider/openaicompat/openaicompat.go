@@ -1032,6 +1032,15 @@ func (p *Provider) ModelDiscoveryEnabled() bool {
 	return p.cfg.Quirks.ModelListPassthrough
 }
 
+// DefaultModel returns the lane's configured default upstream model
+// (quirks.default_model, e.g. augure's "tofino-3"), "" when the lane has
+// none. Callers that must list routable ids without contacting the upstream
+// (the aggregated /v1/models handler and the list_models MCP tool) use it to
+// advertise "<lane>/<default>" for lanes that have no discovery cache.
+func (p *Provider) DefaultModel() string {
+	return p.cfg.Quirks.DefaultModel
+}
+
 // CachedModels returns the upstream model ids discovered so far (startup
 // discovery for ModelListPassthrough lanes, or the last successful
 // FetchModels) WITHOUT contacting the upstream. Callers that must never fan

@@ -155,10 +155,14 @@ func TestDiscovery_AddProviderDiscoversAndReports(t *testing.T) {
 
 	resp := getModels(t, srv)
 	ids := resp.ids()
-	for _, want := range []string{"deepseek", "deepseek/deepseek-chat", "deepseek/deepseek-reasoner"} {
+	for _, want := range []string{"deepseek/deepseek-chat", "deepseek/deepseek-reasoner"} {
 		if _, ok := ids[want]; !ok {
 			t.Errorf("model %q missing from /v1/models: %v", want, ids)
 		}
+	}
+	// The bare lane name is a routing prefix, not a model: never advertised.
+	if _, ok := ids["deepseek"]; ok {
+		t.Errorf("bare lane name %q advertised as a model id: %v", "deepseek", ids)
 	}
 
 	// Listing is cache-only: no extra upstream calls, ever.
@@ -432,12 +436,12 @@ func TestDiscovery_LanesWithoutFetchModelsAreLeftAlone(t *testing.T) {
 	ticker.tick()
 	ticker.tick()
 
+	// A lane with no discovery surface and no default model lists nothing:
+	// neither an invented "codex/<model>" id nor the bare lane name (that is a
+	// routing prefix, not a model).
 	ids := getModels(t, srv).ids()
-	if _, ok := ids["codex"]; !ok {
-		t.Errorf("the lane entry is missing from /v1/models: %v", ids)
-	}
 	for id := range ids {
-		if strings.HasPrefix(id, "codex/") {
+		if id == "codex" || strings.HasPrefix(id, "codex/") {
 			t.Errorf("invented model id for a lane without model discovery: %q", id)
 		}
 	}
