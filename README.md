@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License">
-  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.23-00ADD8.svg?logo=go" alt="Go 1.23"></a>
+  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.25-00ADD8.svg?logo=go" alt="Go 1.25"></a>
   <a href="#contributing"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
   <img src="https://img.shields.io/badge/Port-:9050-22d3ee.svg" alt="Port 9050">
   <img src="https://img.shields.io/badge/MCP-Native-e879f9.svg" alt="MCP Native">
@@ -42,11 +42,35 @@ Ultiproxy starts with **zero configuration**: nothing to author, nothing to relo
 # Precompiled binary into ~/.local/bin (no root required):
 curl -fsSL https://ultiproxy.dev/install.sh | sh
 
-# ...or build from source:
+# ...or build from source (see the sibling-checkout note below):
+git clone https://github.com/smhanov/ultiproxy
+cd ultiproxy
 go build -o ultiproxy ./cmd/ultiproxy
 ```
 
 The installer also installs a hardened systemd user unit on Linux. Review it first with `bash dist/install.sh --dry-run` if you prefer.
+
+<details>
+<summary><strong>Building from source: the <code>../llmhub</code> sibling checkout</strong></summary>
+
+`go.mod` resolves the provider library through a local replace:
+
+```
+replace github.com/smhanov/llmhub => ../llmhub
+```
+
+A source build therefore **requires a sibling `llmhub` checkout next to this repository** -- `go build ./cmd/ultiproxy` fails with a module-resolution error if `../llmhub` is missing:
+
+```bash
+git clone https://github.com/smhanov/ultiproxy
+git clone https://github.com/smhanov/llmhub      # must sit beside ultiproxy
+cd ultiproxy
+go build -o ultiproxy ./cmd/ultiproxy
+```
+
+Keep the sibling `llmhub` on its `origin/main`; upstream changes go through PRs (see `AGENTS.md`). Building Go **1.25** or newer is required (`go.mod` declares `go 1.25.0`). Release binaries have no such dependency.
+
+</details>
 
 ### 1. Start the daemon
 

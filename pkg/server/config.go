@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 
@@ -55,6 +56,8 @@ func DefaultConfig() *Config {
 }
 
 // LoadConfig loads configuration from a YAML file. If path is empty, DefaultConfig is returned.
+// Unknown YAML keys are rejected, so a config written for an older schema
+// fails loudly instead of partially applying.
 func LoadConfig(path string) (*Config, error) {
 	cfg := DefaultConfig()
 	if path == "" {
@@ -66,7 +69,13 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
 
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	// KnownFields(true) makes configuration fail closed: a stale key from an
+	// old template (server.listen, server.api_keys, routing:, ...) aborts
+	// startup with a parse error instead of being silently dropped, which
+	// used to leave authentication off while the operator believed it was on.
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 

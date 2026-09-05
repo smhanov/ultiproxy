@@ -235,6 +235,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
+// handleLLMsTxt serves the agent-facing documentation. An llms.txt found at
+// the configured path wins (operators can override the document without
+// rebuilding); when that path is missing -- the normal case for a binary
+// installed by dist/install.sh, which copies no documentation next to the
+// executable -- the copy embedded at build time is served instead.
 func (s *Server) handleLLMsTxt(w http.ResponseWriter, r *http.Request) {
 	path := s.cfg.Server.LLMsTxtPath
 	if path == "" {
@@ -242,8 +247,11 @@ func (s *Server) handleLLMsTxt(w http.ResponseWriter, r *http.Request) {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		http.NotFound(w, r)
-		return
+		data = embeddedLLMsTxt()
+		if len(data) == 0 {
+			http.NotFound(w, r)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write(data)

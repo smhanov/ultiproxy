@@ -80,7 +80,7 @@ if [ "${DRY_RUN}" -eq 1 ]; then
   echo "2. Download ${DOWNLOAD_URL} and ${SHA256_URL}"
   echo "3. Verify SHA256 checksum of release archive"
   echo "4. Create directory ${INSTALL_DIR} and extract binary to ${BINARY_PATH}"
-  echo "5. Create configuration template at ${CONFIG_FILE} (if not already present)"
+  echo "5. Create a current-schema configuration (server.addr, server.api_key, data_dir, storage.db_path) at ${CONFIG_FILE}"
   echo "6. Create state directory at ${STATE_DIR}"
   if [ "${TARGET_OS}" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
     echo "7. Install systemd user service to ${SYSTEMD_SERVICE_FILE}"
@@ -154,53 +154,60 @@ echo "Installed binary to ${BINARY_PATH}"
 # Ensure state directory exists
 mkdir -p "${STATE_DIR}"
 
-# Create config template if missing
+# generate_api_key mints the single admin bearer token written to the config.
+generate_api_key() {
+  if command -v openssl >/dev/null 2>&1; then
+    printf 'sk-up-%s' "$(openssl rand -hex 24)"
+    return 0
+  fi
+  printf 'sk-up-%s' "$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+}
+
+# installed_api_key reports the admin key already present in an existing config
+# (empty when there is none), so the post-install hints never show a key that
+# was not actually written.
+installed_api_key() {
+  [ -f "${CONFIG_FILE}" ] || return 0
+  sed -n 's/^[[:space:]]*api_key:[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "${CONFIG_FILE}" | head -n 1
+}
+
+# Create config template if missing. The template only uses the current config
+# schema (server.addr, server.api_key, data_dir, storage.db_path); lanes, model
+# aliases and timeouts are added at runtime over MCP and persist in the data
+# dir, so there is deliberately nothing else to write here.
+API_KEY="$(installed_api_key)"
 if [ ! -f "${CONFIG_FILE}" ]; then
+  API_KEY="$(generate_api_key)"
   echo "Generating initial configuration at ${CONFIG_FILE}..."
   mkdir -p "${CONFIG_DIR}"
-  cat <<'CONFIG_EOF' > "${CONFIG_FILE}"
+  cat <<CONFIG_EOF > "${CONFIG_FILE}"
 # Ultiproxy Configuration
-# Universal LLM Subscription Proxy (:9050)
+# Agent-first LLM subscription proxy on :9050.
+#
+# This file only carries the keys the current schema understands:
+#   server.addr, server.api_key, data_dir, storage.db_path
+# Anything else makes the daemon refuse to start (unknown keys are rejected).
+#
+# Providers (lanes), model aliases and per-lane timeouts are NOT configured
+# here: add them over MCP while the daemon runs and they persist in the data
+# dir (providers.json, aliases.json, timeouts.json).
 
 server:
-  listen: "127.0.0.1:9050"
-  # Client bearer tokens accepted by Ultiproxy
-  api_keys:
-    - "sk-up-local-agent-key"
+  # Bind address. Override per-run with ULTIPROXY_ADDR=0.0.0.0:9050 to serve
+  # remote agents without editing this file.
+  addr: "127.0.0.1:9050"
 
-routing:
-  strategy: "quota-priority" # quota-priority | round-robin | latency
-  fallback_to_openrouter: true
+  # Single admin bearer token for clients. Remove (or leave empty) for an
+  # open-access localhost install; declare scoped client keys over MCP for
+  # per-key attribution instead.
+  api_key: "${API_KEY}"
 
-providers:
-  # GitHub Copilot (uses github token or oauth)
-  copilot:
-    enabled: true
-    # token: "ghu_..."
+# Runtime state (providers, aliases, timeouts, credentials) lives here.
+data_dir: "${STATE_DIR}"
 
-  # OpenAI Codex / Plus
-  openai:
-    enabled: true
-    # api_key: "sk-proj-..."
-
-  # Anthropic Claude
-  anthropic:
-    enabled: true
-    # api_key: "sk-ant-..."
-
-  # DeepSeek
-  deepseek:
-    enabled: false
-    # api_key: "sk-..."
-
-  # Local vLLM (zero marginal cost)
-  vllm:
-    enabled: false
-    base_url: "http://127.0.0.1:8000/v1"
-
-accounting:
-  enabled: true
-  db_path: "~/.local/state/ultiproxy/accounting.db"
+# SQLite telemetry database.
+storage:
+  db_path: "${STATE_DIR}/ultiproxy.db"
 CONFIG_EOF
   chmod 600 "${CONFIG_FILE}"
 fi
@@ -218,6 +225,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/ultiproxy serve --config %h/.config/ultiproxy/config.yaml --data-dir %h/.local/state/ultiproxy
+WorkingDirectory=%h/.local/state/ultiproxy
 Restart=on-failure
 RestartSec=5
 EnvironmentFile=-%h/.config/ultiproxy/env
@@ -247,8 +255,9 @@ if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
 fi
 
 echo "Next steps:"
-echo "1. Configure your upstream subscription credentials:"
-echo "   nano ${CONFIG_FILE}"
+echo "1. Add your subscriptions with the agent-facing MCP tools at"
+echo "   http://localhost:9050/mcp (add_provider, set_model_alias, ...)."
+echo "   No credentials are needed in ${CONFIG_FILE}."
 echo ""
 echo "2. Start Ultiproxy:"
 if [ "${TARGET_OS}" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
@@ -260,6 +269,20 @@ fi
 echo ""
 echo "3. Verify health & endpoints:"
 echo "   curl http://localhost:9050/healthz"
-echo "   curl http://localhost:9050/v1/models -H 'Authorization: Bearer sk-up-local-agent-key'"
+echo "   curl http://localhost:9050/llms.txt"
 echo "   curl http://localhost:9050/api/quota"
 echo ""
+if [ -f "${CONFIG_FILE}" ] && [ -z "${API_KEY}" ]; then
+  echo "Notice: existing ${CONFIG_FILE} declares no server.api_key, so the daemon"
+  echo "accepts every request until one is added. Unknown keys from an older"
+  echo "template now abort startup; rewrite that file with the current schema."
+  echo ""
+fi
+if [ -n "${API_KEY}" ]; then
+  echo "Clients send the admin bearer key below (minted on first install) as"
+  echo "\"Authorization: Bearer <key>\"). It is stored in ${CONFIG_FILE}:"
+  echo "   ${API_KEY}"
+  echo "   curl http://localhost:9050/v1/models -H 'Authorization: Bearer ${API_KEY}'"
+  echo "Delete server.api_key in ${CONFIG_FILE} for an open-access localhost install."
+  echo ""
+fi

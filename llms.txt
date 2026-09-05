@@ -185,7 +185,7 @@ curl -s http://localhost:9050/v1/messages \
   - `refresh_models`: Re-fetches `GET <base>/v1/models` and caches the ids so `<lane>/<model>` appears in `/v1/models`.
 
 ### 7. Discovery & Health
-- **Route**: `GET /llms.txt` — Machine-readable overview for LLMs.
+- **Route**: `GET /llms.txt` — Machine-readable overview for LLMs. The document is served from `llms.txt` in the process working directory when present, and otherwise from the copy embedded in the binary at build time (`go:embed`, see `llms_embed.go`), so an installed daemon serves it with no source checkout present.
 - **Route**: `GET /healthz` — Service health and upstream connectivity status.
 
 ---

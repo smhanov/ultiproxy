@@ -6,6 +6,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/ultiproxy serve --config %h/.config/ultiproxy/config.yaml --data-dir %h/.local/state/ultiproxy
+WorkingDirectory=%h/.local/state/ultiproxy
 Restart=on-failure
 RestartSec=5
 EnvironmentFile=-%h/.config/ultiproxy/env
