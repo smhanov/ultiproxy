@@ -87,13 +87,18 @@ func (m *Manager) keyPath(key string) string {
 	return filepath.Join(m.storageDir, filename)
 }
 
-// Store saves a credential in-memory and atomically persists it to disk.
+// Store durably persists a credential and only then publishes it to the
+// in-memory cache. Ordering matters: when the disk write fails the caller gets
+// the error and the new token is NOT left live in memory, so a working process
+// can never hold a credential that a restart would silently lose.
 func (m *Manager) Store(ctx context.Context, key string, cred Credential) error {
+	if err := m.persist(key, cred); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	m.cache[key] = cred
 	m.mu.Unlock()
-
-	return m.persist(key, cred)
+	return nil
 }
 
 // persist writes temp file in same dir, fsyncs, renames, and enforces generation CAS.
@@ -229,14 +234,14 @@ func (m *Manager) Get(ctx context.Context, key string) (Credential, error) {
 			refreshed.Generation = latest.Generation + 1
 		}
 
-		// Update cache and persist to disk
-		m.mu.Lock()
-		m.cache[key] = refreshed
-		m.mu.Unlock()
-
+		// Persist first, publish afterwards: a failed persist must not leave
+		// the refreshed token live in memory (Store has the same ordering).
 		if err := m.persist(key, refreshed); err != nil {
 			return nil, fmt.Errorf("failed to persist refreshed credential: %w", err)
 		}
+		m.mu.Lock()
+		m.cache[key] = refreshed
+		m.mu.Unlock()
 
 		return refreshed, nil
 	})

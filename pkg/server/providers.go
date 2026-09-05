@@ -157,8 +157,14 @@ type RuntimeProviderStore struct {
 const RuntimeProviderKindOpenAICompat = "openaicompat"
 
 // NewRuntimeProviderStore builds a runtime provider store. When path is
-// non-empty and the file exists, its entries are preloaded into memory (same
-// best-effort behaviour as NewModelCatalog: a malformed file is ignored).
+// non-empty and the file exists, its entries are preloaded into memory.
+//
+// A missing file is the normal first-boot state. A file that exists but cannot
+// be parsed is control-plane corruption and is reported loudly instead of being
+// silently treated as an empty store: the error is logged naming the path (so
+// startup shows it even though this constructor has no error return), no lanes
+// are loaded from it, and Load keeps returning the parse error. Fix or remove
+// the file and restart.
 func NewRuntimeProviderStore(path string) *RuntimeProviderStore {
 	s := &RuntimeProviderStore{
 		path:      path,
@@ -169,20 +175,35 @@ func NewRuntimeProviderStore(path string) *RuntimeProviderStore {
 	if path == "" {
 		return s
 	}
-	if data, err := os.ReadFile(path); err == nil {
-		var stored map[string]storedProvider
-		if json.Unmarshal(data, &stored) == nil {
-			for name, sp := range stored {
-				if sp.Kind != "" && sp.Kind != RuntimeProviderKindOpenAICompat {
-					s.custom[name] = sp
-				} else {
-					s.providers[name] = s.credentialDir(sp.toConfig(s.ActorBuilder))
-					s.freebuff[name] = sp.Quirks.FreebuffActor
-				}
-			}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("[providers] cannot read runtime provider store %s: %v -- runtime lanes were NOT loaded; fix the file permissions and restart", path, err)
+		}
+		return s
+	}
+	var stored map[string]storedProvider
+	if err := json.Unmarshal(data, &stored); err != nil {
+		log.Printf("[providers] corrupt runtime provider store %s: %v -- runtime lanes were NOT loaded; fix or remove the file and restart", path, err)
+		return s
+	}
+	s.mu.Lock()
+	s.applyStored(stored)
+	s.mu.Unlock()
+	return s
+}
+
+// applyStored merges a parsed persistence file into the store's maps. It must
+// be called with s.mu held; NewRuntimeProviderStore and Load share it.
+func (s *RuntimeProviderStore) applyStored(stored map[string]storedProvider) {
+	for name, sp := range stored {
+		if sp.Kind != "" && sp.Kind != RuntimeProviderKindOpenAICompat {
+			s.custom[name] = sp
+		} else {
+			s.providers[name] = s.credentialDir(sp.toConfig(s.ActorBuilder))
+			s.freebuff[name] = sp.Quirks.FreebuffActor
 		}
 	}
-	return s
 }
 
 // Path returns the persistence path ("" for an in-memory store).
@@ -305,18 +326,24 @@ func (s *RuntimeProviderStore) Add(cfg openaicompat.Config) error {
 			}
 		}
 	}
+	// Mutation, snapshot and write are one critical section, so concurrent MCP
+	// add_provider calls serialize and cannot clobber each other's temporary
+	// file or rename an older snapshot over a newer mutation. The lane is
+	// published to live state only after the write succeeded: a failed persist
+	// leaves the store untouched and the error is returned to the caller.
 	s.mu.Lock()
-	if s.providers == nil {
-		s.providers = make(map[string]openaicompat.Config)
+	defer s.mu.Unlock()
+	providers := cloneProviderConfigs(s.providers)
+	custom := cloneStoredProviders(s.custom)
+	freebuff := cloneBoolFlags(s.freebuff)
+	delete(custom, cfg.Name)
+	providers[cfg.Name] = cfg
+	freebuff[cfg.Name] = cfg.Quirks.FreebuffActor != nil
+	if err := s.persistState(providers, custom, freebuff); err != nil {
+		return err
 	}
-	if s.freebuff == nil {
-		s.freebuff = make(map[string]bool)
-	}
-	delete(s.custom, cfg.Name)
-	s.providers[cfg.Name] = cfg
-	s.freebuff[cfg.Name] = cfg.Quirks.FreebuffActor != nil
-	s.mu.Unlock()
-	return s.persist()
+	s.providers, s.custom, s.freebuff = providers, custom, freebuff
+	return nil
 }
 
 // AddCustom stores a non-OpenAI-compatible lane (kind plus, for kinds that
@@ -339,15 +366,20 @@ func (s *RuntimeProviderStore) AddCustom(name, kind, apiKey string) error {
 	if kind == "" || kind == RuntimeProviderKindOpenAICompat {
 		return fmt.Errorf("custom provider kind %q invalid (use %q only for openai-compatible lanes)", kind, RuntimeProviderKindOpenAICompat)
 	}
+	// Same persist-before-publish ordering as Add.
 	s.mu.Lock()
-	if s.custom == nil {
-		s.custom = make(map[string]storedProvider)
+	defer s.mu.Unlock()
+	providers := cloneProviderConfigs(s.providers)
+	custom := cloneStoredProviders(s.custom)
+	freebuff := cloneBoolFlags(s.freebuff)
+	delete(providers, name)
+	delete(freebuff, name)
+	custom[name] = storedProvider{Kind: kind, Name: name, APIKey: apiKey}
+	if err := s.persistState(providers, custom, freebuff); err != nil {
+		return err
 	}
-	delete(s.providers, name)
-	delete(s.freebuff, name)
-	s.custom[name] = storedProvider{Kind: kind, Name: name, APIKey: apiKey}
-	s.mu.Unlock()
-	return s.persist()
+	s.providers, s.custom, s.freebuff = providers, custom, freebuff
+	return nil
 }
 
 // Remove deletes a lane from the store and persists the change. It returns
@@ -356,22 +388,28 @@ func (s *RuntimeProviderStore) Remove(name string) error {
 	if s == nil {
 		return errors.New("runtime provider store not configured")
 	}
+	// Same persist-before-publish ordering as Add: on a failed write the lane
+	// stays live and the caller still sees the error.
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, ok := s.providers[name]
-	if ok {
-		delete(s.providers, name)
-	} else {
+	if !ok {
 		_, ok = s.custom[name]
-		if ok {
-			delete(s.custom, name)
-		}
 	}
-	delete(s.freebuff, name)
-	s.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrProviderNotStored, name)
 	}
-	return s.persist()
+	providers := cloneProviderConfigs(s.providers)
+	custom := cloneStoredProviders(s.custom)
+	freebuff := cloneBoolFlags(s.freebuff)
+	delete(providers, name)
+	delete(custom, name)
+	delete(freebuff, name)
+	if err := s.persistState(providers, custom, freebuff); err != nil {
+		return err
+	}
+	s.providers, s.custom, s.freebuff = providers, custom, freebuff
+	return nil
 }
 
 // Load re-reads the persisted file into memory and returns the resulting
@@ -404,14 +442,7 @@ func (s *RuntimeProviderStore) Load() (map[string]openaicompat.Config, error) {
 	s.providers = make(map[string]openaicompat.Config, len(stored))
 	s.custom = make(map[string]storedProvider, len(stored))
 	s.freebuff = make(map[string]bool, len(stored))
-	for name, sp := range stored {
-		if sp.Kind != "" && sp.Kind != RuntimeProviderKindOpenAICompat {
-			s.custom[name] = sp
-		} else {
-			s.providers[name] = s.credentialDir(sp.toConfig(s.ActorBuilder))
-			s.freebuff[name] = sp.Quirks.FreebuffActor
-		}
-	}
+	s.applyStored(stored)
 	s.mu.Unlock()
 	return s.List(), nil
 }
@@ -499,41 +530,57 @@ func sortedConfigNames(m map[string]openaicompat.Config) []string {
 	return names
 }
 
-// persist writes the store atomically (temp file + rename), like catalog.go.
-func (s *RuntimeProviderStore) persist() error {
+// persistState writes one complete store state atomically through a uniquely
+// named temp file followed by a rename (see writeFileAtomic in catalog.go), so
+// concurrent mutations never share a temporary path. Callers must hold s.mu and
+// pass exactly the state they are about to publish.
+func (s *RuntimeProviderStore) persistState(providers map[string]openaicompat.Config, custom map[string]storedProvider, freebuff map[string]bool) error {
 	if s == nil || s.path == "" {
 		return nil
 	}
-	s.mu.RLock()
-	snapshot := make(map[string]storedProvider, len(s.providers)+len(s.custom))
-	for k, v := range s.providers {
+	snapshot := make(map[string]storedProvider, len(providers)+len(custom))
+	for k, v := range providers {
 		sp := toStoredProvider(v)
 		sp.Kind = RuntimeProviderKindOpenAICompat
 		// A freebuff lane loaded while ActorBuilder was still nil carries no
 		// in-memory actor, so toStoredProvider would write the flag as false.
 		// The persisted boolean is the durable record: keep it.
-		if s.freebuff[k] {
+		if freebuff[k] {
 			sp.Quirks.FreebuffActor = true
 		}
 		snapshot[k] = sp
 	}
-	for k, v := range s.custom {
+	for k, v := range custom {
 		snapshot[k] = v
 	}
-	s.mu.RUnlock()
 
 	data, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
 		return err
 	}
-	if dir := filepath.Dir(s.path); dir != "" {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
+	return writeFileAtomic(s.path, data)
+}
+
+func cloneProviderConfigs(in map[string]openaicompat.Config) map[string]openaicompat.Config {
+	out := make(map[string]openaicompat.Config, len(in)+1)
+	for k, v := range in {
+		out[k] = v
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
+	return out
+}
+
+func cloneStoredProviders(in map[string]storedProvider) map[string]storedProvider {
+	out := make(map[string]storedProvider, len(in)+1)
+	for k, v := range in {
+		out[k] = v
 	}
-	return os.Rename(tmp, s.path)
+	return out
+}
+
+func cloneBoolFlags(in map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(in)+1)
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }

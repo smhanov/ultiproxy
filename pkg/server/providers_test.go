@@ -1,13 +1,17 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/smhanov/ultiproxy/pkg/provider"
@@ -571,5 +575,180 @@ func TestRuntimeProviderStore_RestoreMixedLanes(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"freebuff_actor": true`) {
 		t.Fatalf("re-persist dropped the freebuff flag: %s", data)
+	}
+}
+
+// TestRuntimeProviderStore_CorruptPersistenceFileIsLoud (T022 AC3): a
+// truncated or garbage providers.json must not be silently treated as an empty
+// store: construction logs the corruption (naming the file) and Load still
+// reports the parse error.
+func TestRuntimeProviderStore_CorruptPersistenceFileIsLoud(t *testing.T) {
+	for name, content := range map[string]string{
+		"truncated": `{"vllm": {"base_url": "http://127.0.0.1:1/v1"`,
+		"garbage":   "\x00\x01not json",
+		"empty":     "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "providers.json")
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			var buf bytes.Buffer
+			log.SetOutput(&buf)
+			s := NewRuntimeProviderStore(path)
+			log.SetOutput(os.Stderr)
+
+			msg := buf.String()
+			if msg == "" {
+				t.Fatalf("corrupt %s providers.json produced no log output at all", name)
+			}
+			if !strings.Contains(msg, "corrupt") || !strings.Contains(msg, path) {
+				t.Fatalf("corruption log must name the file and the problem, got %q", msg)
+			}
+			if len(s.List()) != 0 {
+				t.Errorf("corrupt file contributed %d lanes; want none loaded", len(s.List()))
+			}
+			if _, err := s.Load(); err == nil {
+				t.Error("Load must still report the corrupt persistence file")
+			}
+		})
+	}
+}
+
+// TestRuntimeProviderStore_PersistFailureLeavesLiveStateUnchanged (T022 AC2):
+// when the disk write fails, the lane must not become live (and must not
+// clobber an existing lane), while the caller still gets the error.
+func TestRuntimeProviderStore_PersistFailureLeavesLiveStateUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+
+	s := NewRuntimeProviderStore(filepath.Join(dir, "providers.json"))
+	if err := s.Add(openaicompat.Config{
+		Name:    "vllm",
+		BaseURL: "http://127.0.0.1:1/v1",
+		APIKey:  "sk-local",
+	}); err != nil {
+		t.Fatalf("add vllm: %v", err)
+	}
+	s.path = filepath.Join(blocker, "providers.json")
+
+	if err := s.Add(openaicompat.Config{
+		Name:    "newlane",
+		BaseURL: "http://127.0.0.1:2/v1",
+	}); err == nil {
+		t.Fatal("Add must fail when persistence fails")
+	}
+	if s.Has("newlane") {
+		t.Error("lane became live although persistence failed")
+	}
+	if len(s.List()) != 1 {
+		t.Errorf("store holds %d lanes after failed Add; want 1", len(s.List()))
+	}
+
+	// Replacing an existing lane must not half-apply either.
+	if err := s.Add(openaicompat.Config{
+		Name:    "vllm",
+		BaseURL: "http://127.0.0.1:9/v1",
+	}); err == nil {
+		t.Fatal("Add (replace) must fail when persistence fails")
+	}
+	if got := s.List()["vllm"].BaseURL; got != "http://127.0.0.1:1/v1" {
+		t.Errorf("existing lane was modified despite failed persist: %q", got)
+	}
+
+	if err := s.AddCustom("anthropic", "anthropic", ""); err == nil {
+		t.Fatal("AddCustom must fail when persistence fails")
+	}
+	if s.Has("anthropic") {
+		t.Error("custom lane became live although persistence failed")
+	}
+
+	if err := s.Remove("vllm"); err == nil {
+		t.Fatal("Remove must fail when persistence fails")
+	}
+	if !s.Has("vllm") {
+		t.Error("Remove was applied to live state although persistence failed")
+	}
+}
+
+// TestRuntimeProviderStore_ConcurrentAddsBothSurviveOnDisk (T022 AC1): two or
+// more concurrent Add calls must all reach providers.json, and the file must
+// stay valid JSON holding the last completed mutation -- no shared .tmp and no
+// lost lanes.
+func TestRuntimeProviderStore_ConcurrentAddsBothSurviveOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.json")
+	s := NewRuntimeProviderStore(path)
+
+	const workers = 16
+	errs := make([]error, workers)
+	names := make([]string, workers)
+	for i := range names {
+		names[i] = fmt.Sprintf("lane-%02d", i)
+	}
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = s.Add(openaicompat.Config{
+				Name:    names[i],
+				BaseURL: fmt.Sprintf("http://127.0.0.1:%d/v1", i+1),
+				APIKey:  "sk-local",
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Add(%q) reported a persistence error: %v", names[i], err)
+		}
+	}
+	if err := s.Add(openaicompat.Config{
+		Name:    "final",
+		BaseURL: "http://127.0.0.1:999/v1",
+	}); err != nil {
+		t.Fatalf("Add(final): %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read providers.json: %v", err)
+	}
+	var onDisk map[string]storedProvider
+	if err := json.Unmarshal(data, &onDisk); err != nil {
+		t.Fatalf("providers.json is not valid JSON (torn write): %v\n%s", err, data)
+	}
+	want := append([]string{"final"}, names...)
+	for _, name := range want {
+		if _, ok := onDisk[name]; !ok {
+			t.Errorf("lane %q lost from providers.json after concurrent writes: %s", name, data)
+		}
+	}
+
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("leftover temp file %q next to providers.json", e.Name())
+		}
+	}
+
+	s2 := NewRuntimeProviderStore(path)
+	loaded, err := s2.Load()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	for _, name := range want {
+		if _, ok := loaded[name]; !ok {
+			t.Errorf("lane %q missing after reload", name)
+		}
 	}
 }

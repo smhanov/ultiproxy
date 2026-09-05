@@ -12,6 +12,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -57,15 +58,26 @@ func NewModelCatalog(configModels map[string]ModelAlias, persistPath string) (*M
 	for alias, entry := range configModels {
 		c.aliases[alias] = entry
 	}
-	if persistPath != "" {
-		if data, err := os.ReadFile(persistPath); err == nil {
-			var extra map[string]ModelAlias
-			if json.Unmarshal(data, &extra) == nil {
-				for alias, entry := range extra {
-					c.aliases[alias] = entry
-				}
-			}
+	if persistPath == "" {
+		return c, nil
+	}
+	data, err := os.ReadFile(persistPath)
+	switch {
+	case err == nil:
+		var extra map[string]ModelAlias
+		if err := json.Unmarshal(data, &extra); err != nil {
+			// A truncated/garbage aliases.json is control-plane corruption, not
+			// "no runtime state": report it so startup logs it instead of
+			// silently coming up with an empty runtime overlay.
+			return nil, fmt.Errorf("model catalog: corrupt persistence file %s: %w (fix or remove the file and restart)", persistPath, err)
 		}
+		for alias, entry := range extra {
+			c.aliases[alias] = entry
+		}
+	case errors.Is(err, os.ErrNotExist):
+		// No persisted runtime state yet.
+	default:
+		return nil, fmt.Errorf("model catalog: read persistence file %s: %w", persistPath, err)
 	}
 	return c, nil
 }
@@ -113,47 +125,102 @@ func (c *ModelCatalog) Get(alias string) (ModelAlias, bool) {
 }
 
 // Set adds or replaces an alias and persists it.
+//
+// The mutation, its snapshot and the disk write all happen under the write
+// lock, so two concurrent MCP set_model_alias calls cannot interleave their
+// snapshots or their temporary files, and the new alias only becomes live once
+// the write succeeded. A failed persist therefore leaves the catalog exactly
+// as it was while still returning the error to the caller.
 func (c *ModelCatalog) Set(alias string, entry ModelAlias) error {
 	if alias == "" || entry.Provider == "" || entry.Upstream == "" {
 		return errors.New("alias, provider and upstream are required")
 	}
 	c.mu.Lock()
-	c.aliases[alias] = entry
-	c.mu.Unlock()
-	return c.persist()
+	defer c.mu.Unlock()
+	next := cloneAliases(c.aliases)
+	next[alias] = entry
+	if err := c.persistAliases(next); err != nil {
+		return err
+	}
+	c.aliases = next
+	return nil
 }
 
-// Remove deletes an alias and persists the change.
+// Remove deletes an alias and persists the change, with the same
+// persist-before-publish ordering as Set.
 func (c *ModelCatalog) Remove(alias string) error {
 	c.mu.Lock()
-	delete(c.aliases, alias)
-	c.mu.Unlock()
-	return c.persist()
+	defer c.mu.Unlock()
+	next := cloneAliases(c.aliases)
+	delete(next, alias)
+	if err := c.persistAliases(next); err != nil {
+		return err
+	}
+	c.aliases = next
+	return nil
 }
 
-func (c *ModelCatalog) persist() error {
+// persistAliases writes one complete alias state atomically. Callers must hold
+// c.mu so the state they pass is the state that gets published.
+func (c *ModelCatalog) persistAliases(state map[string]ModelAlias) error {
 	if c.persistPath == "" {
 		return nil
 	}
-	c.mu.RLock()
-	snapshot := make(map[string]ModelAlias, len(c.aliases))
-	for k, v := range c.aliases {
-		snapshot[k] = v
-	}
-	c.mu.RUnlock()
-
-	data, err := json.MarshalIndent(snapshot, "", "  ")
+	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
-	if dir := filepath.Dir(c.persistPath); dir != "" {
+	return writeFileAtomic(c.persistPath, data)
+}
+
+func cloneAliases(in map[string]ModelAlias) map[string]ModelAlias {
+	out := make(map[string]ModelAlias, len(in)+1)
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// writeFileAtomic persists data to path through a uniquely named temporary
+// file in the same directory followed by a rename:
+//
+//   - the temp name is unique per writer (os.CreateTemp), so concurrent
+//     mutations never write or rename each other's half-written file;
+//   - the rename is atomic, so a crash can never leave a truncated path
+//     behind for the next startup to misread;
+//   - the temp file is removed again if anything fails before the rename.
+//
+// catalog.go, timeouts.go and providers.go all persist through this helper.
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
+			return fmt.Errorf("create directory %s: %w", dir, err)
 		}
 	}
-	tmp := c.persistPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp file in %s: %w", dir, err)
 	}
-	return os.Rename(tmp, c.persistPath)
+	tmp := f.Name()
+	defer os.Remove(tmp) // no-op once the rename below succeeded
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("sync %s: %w", tmp, err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return fmt.Errorf("chmod %s: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", tmp, path, err)
+	}
+	return nil
 }

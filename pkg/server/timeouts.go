@@ -2,8 +2,10 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -38,17 +40,41 @@ func NewTimeoutManager(config map[string]string, defaultDur time.Duration, persi
 			tm.timeouts[provider] = d
 		}
 	}
-	if persistPath != "" {
-		if data, err := os.ReadFile(persistPath); err == nil {
-			var runtime map[string]string
-			if json.Unmarshal(data, &runtime) == nil {
-				for provider, durStr := range runtime {
-					if d, err := time.ParseDuration(durStr); err == nil && d > 0 {
-						tm.timeouts[provider] = d
-					}
-				}
-			}
+	if persistPath == "" {
+		return tm, nil
+	}
+	data, err := os.ReadFile(persistPath)
+	switch {
+	case err == nil:
+		var runtime map[string]string
+		if err := json.Unmarshal(data, &runtime); err != nil {
+			// A truncated/garbage timeouts.json is control-plane corruption, not
+			// "no runtime state". The error is returned AND logged, because some
+			// callers (server.NewServer) discard it; the returned manager stays
+			// usable with the config defaults so a discarded error degrades to
+			// config timeouts instead of a nil-pointer panic.
+			err := fmt.Errorf("timeout manager: corrupt persistence file %s: %w (fix or remove the file and restart)", persistPath, err)
+			log.Printf("[timeouts] %v -- runtime timeout overrides were NOT loaded", err)
+			return tm, err
 		}
+		for provider, durStr := range runtime {
+			// A stored value that no longer parses is corruption of the same
+			// file, not a value to drop on the floor: the operator would end
+			// up with the default timeout and no hint why.
+			d, err := time.ParseDuration(durStr)
+			if err != nil || d <= 0 {
+				err := fmt.Errorf("timeout manager: corrupt persistence file %s: provider %q has invalid timeout %q (fix or remove the file and restart)", persistPath, provider, durStr)
+				log.Printf("[timeouts] %v -- runtime timeout overrides were NOT loaded", err)
+				return tm, err
+			}
+			tm.timeouts[provider] = d
+		}
+	case errors.Is(err, os.ErrNotExist):
+		// No persisted runtime state yet.
+	default:
+		err := fmt.Errorf("timeout manager: read persistence file %s: %w", persistPath, err)
+		log.Printf("[timeouts] %v -- runtime timeout overrides were NOT loaded", err)
+		return tm, err
 	}
 	return tm, nil
 }
@@ -64,22 +90,39 @@ func (tm *TimeoutManager) Timeout(provider string) time.Duration {
 }
 
 // Set updates a provider timeout and persists the change.
+//
+// Mutation, snapshot and write are one critical section, so concurrent MCP
+// set_provider_timeout calls serialize and cannot clobber each other's
+// temporary file or rename an older snapshot over a newer mutation. The new
+// timeout goes live only after the write succeeded: a failed persist leaves
+// the effective timeouts unchanged and the error is returned.
 func (tm *TimeoutManager) Set(provider string, d time.Duration) error {
 	if provider == "" || d <= 0 {
 		return errTimeoutInvalid
 	}
 	tm.mu.Lock()
-	tm.timeouts[provider] = d
-	tm.mu.Unlock()
-	return tm.persist()
+	defer tm.mu.Unlock()
+	next := cloneTimeouts(tm.timeouts)
+	next[provider] = d
+	if err := tm.persistTimeouts(next); err != nil {
+		return err
+	}
+	tm.timeouts = next
+	return nil
 }
 
-// Remove clears a provider's explicit timeout (falls back to default).
+// Remove clears a provider's explicit timeout (falls back to default), with
+// the same persist-before-publish ordering as Set.
 func (tm *TimeoutManager) Remove(provider string) error {
 	tm.mu.Lock()
-	delete(tm.timeouts, provider)
-	tm.mu.Unlock()
-	return tm.persist()
+	defer tm.mu.Unlock()
+	next := cloneTimeouts(tm.timeouts)
+	delete(next, provider)
+	if err := tm.persistTimeouts(next); err != nil {
+		return err
+	}
+	tm.timeouts = next
+	return nil
 }
 
 // List returns all explicit timeouts as duration strings.
@@ -93,30 +136,30 @@ func (tm *TimeoutManager) List() map[string]string {
 	return out
 }
 
-func (tm *TimeoutManager) persist() error {
+// persistTimeouts writes one complete timeout state atomically through a
+// uniquely named temp file (see writeFileAtomic in catalog.go). Callers must
+// hold tm.mu so the state written is the state that gets published.
+func (tm *TimeoutManager) persistTimeouts(state map[string]time.Duration) error {
 	if tm.persistPath == "" {
 		return nil
 	}
-	tm.mu.RLock()
-	snapshot := make(map[string]string, len(tm.timeouts))
-	for p, d := range tm.timeouts {
+	snapshot := make(map[string]string, len(state))
+	for p, d := range state {
 		snapshot[p] = d.String()
 	}
-	tm.mu.RUnlock()
 	data, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
 		return err
 	}
-	if dir := filepath.Dir(tm.persistPath); dir != "" {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
+	return writeFileAtomic(tm.persistPath, data)
+}
+
+func cloneTimeouts(in map[string]time.Duration) map[string]time.Duration {
+	out := make(map[string]time.Duration, len(in)+1)
+	for k, v := range in {
+		out[k] = v
 	}
-	tmp := tm.persistPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, tm.persistPath)
+	return out
 }
 
 var errTimeoutInvalid = &timeoutError{"timeout must be provider name and positive duration"}

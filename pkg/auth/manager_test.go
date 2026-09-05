@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -188,5 +189,113 @@ func TestExpiredTokenRefreshFailure(t *testing.T) {
 	}
 	if !errors.Is(err, ErrExpired) {
 		t.Errorf("expected ErrExpired, got %v", err)
+	}
+}
+
+// breakStorage points the manager's storage dir at a regular file so
+// os.CreateTemp fails: a deterministic persist failure that works regardless of
+// the uid running the tests.
+func breakStorage(t *testing.T, m *Manager) {
+	t.Helper()
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	m.storageDir = blocker
+}
+
+func cachedCred(t *testing.T, m *Manager, key string) (Credential, bool) {
+	t.Helper()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	c, ok := m.cache[key]
+	return c, ok
+}
+
+// TestManager_StorePersistFailureDoesNotCacheToken (T022 AC4): when the durable
+// write fails, Store must return the error and must NOT leave the new token
+// live in the in-memory cache.
+func TestManager_StorePersistFailureDoesNotCacheToken(t *testing.T) {
+	tempDir := t.TempDir()
+	currTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	mgr, err := NewManager(tempDir, nil, WithNow(func() time.Time { return currTime }))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	good := Credential{Tenant: "t", Provider: "p", AccessToken: "good", ExpiresAt: currTime.Add(time.Hour), Generation: 1}
+	if err := mgr.Store(context.Background(), "k", good); err != nil {
+		t.Fatalf("store healthy credential: %v", err)
+	}
+	if c, ok := cachedCred(t, mgr, "k"); !ok || c.AccessToken != "good" {
+		t.Fatalf("healthy store did not populate the cache: %v %v", c, ok)
+	}
+
+	origDir := mgr.storageDir
+	breakStorage(t, mgr)
+
+	failing := Credential{Tenant: "t", Provider: "p", AccessToken: "never-persisted", ExpiresAt: currTime.Add(time.Hour), Generation: 2}
+	if err := mgr.Store(context.Background(), "k2", failing); err == nil {
+		t.Fatal("Store must fail when persistence fails")
+	}
+	if _, ok := cachedCred(t, mgr, "k2"); ok {
+		t.Error("new token left in the in-memory cache although persistence failed")
+	}
+	// The pre-existing credential is untouched and still the cached one.
+	if c, ok := cachedCred(t, mgr, "k"); !ok || c.AccessToken != "good" {
+		t.Errorf("existing cache entry disturbed by the failed store: %v %v", c, ok)
+	}
+
+	// Observable through the public surface too: nothing was persisted for k2,
+	// so reading the real storage dir must report not-found rather than hand
+	// out the token.
+	mgr.storageDir = origDir
+	mgr.mu.Lock()
+	delete(mgr.cache, "k2")
+	mgr.mu.Unlock()
+	if _, err := mgr.LoadFromDisk("k2"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("LoadFromDisk(k2) = %v; want ErrNotFound (token never reached disk)", err)
+	}
+}
+
+// TestManager_RefreshPersistFailureDoesNotCacheToken (T022 AC4): a successful
+// upstream refresh whose persistence fails must not publish the refreshed
+// token into the cache.
+func TestManager_RefreshPersistFailureDoesNotCacheToken(t *testing.T) {
+	tempDir := t.TempDir()
+	currTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	mgr, err := NewManager(tempDir, func(ctx context.Context, cred Credential) (Credential, error) {
+		return Credential{
+			Tenant:       cred.Tenant,
+			Provider:     cred.Provider,
+			AccessToken:  "refreshed-but-unpersisted",
+			RefreshToken: "rotated",
+			ExpiresAt:    currTime.Add(time.Hour),
+			Generation:   cred.Generation + 1,
+		}, nil
+	}, WithNow(func() time.Time { return currTime }))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	key := "t/p"
+	nearlyExpired := Credential{Tenant: "t", Provider: "p", AccessToken: "old", ExpiresAt: currTime.Add(2 * time.Minute), Generation: 1}
+	if err := mgr.Store(context.Background(), key, nearlyExpired); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	origDir := mgr.storageDir
+	breakStorage(t, mgr)
+	if _, err := mgr.Get(context.Background(), key); err == nil {
+		t.Fatal("Get must fail when the refreshed credential cannot be persisted")
+	}
+	mgr.storageDir = origDir // look at the real storage dir again
+	if c, ok := cachedCred(t, mgr, key); !ok {
+		t.Fatal("cache entry vanished entirely")
+	} else if c.AccessToken != "old" || c.Generation != 1 {
+		t.Errorf("refreshed token published to the cache despite persist failure: %+v", c)
+	}
+	if persisted, err := mgr.LoadFromDisk(key); err != nil || persisted.AccessToken != "old" {
+		t.Errorf("disk state = %+v (%v); want the original token preserved", persisted, err)
 	}
 }
