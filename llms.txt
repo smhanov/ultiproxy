@@ -171,12 +171,18 @@ curl -s http://localhost:9050/v1/messages \
 - **Streamable HTTP MCP**: `GET /mcp` and `POST /mcp`
 - **Legacy SSE MCP**: `GET /mcp/sse`
 - **Protocol**: JSON-RPC 2.0 over HTTP/SSE.
-- **Exposed Agent Tools**:
-  - `list_models`: Returns currently available models, context lengths, and operational states.
-  - `get_quota_status`: Returns remaining request allocations and seconds until quota reset for each provider. Lanes with no quota surface answer "has no quota mechanism"; a lane that is not logged in (e.g. codex) answers with a snapshot whose `detail` says to run `ultiproxy login codex`.
-  - `toggle_model`: Dynamically enables or disables specific upstream providers without restarting the proxy.
-  - `get_client_usage`: Fetches token accounting statistics for a specific client key.
-  - `initiate_oauth_login`: Triggers headless or browser OAuth authentication flows for providers like GitHub Copilot.
+- **Exposed Agent Tools** (each one carries a full self-describing docstring through `tools/list`):
+  - `list_models`: Client-visible model ids with their provider lane, enabled state, context limit, max output, pricing tag and benchmark scores.
+  - `get_quota_status`: Remaining allocations, units, and seconds until reset for one provider lane (antigravity, xai, copilot, codex, freebuff, zai, or a runtime lane). Monitoring only - the proxy never auto-reroutes on quota. Lanes with no quota surface answer "has no quota mechanism"; a lane that is not logged in (e.g. codex) answers with a snapshot whose `detail` says to run `ultiproxy login codex`.
+  - `toggle_model`: Enables or disables a model id at runtime without deleting its alias mapping.
+  - `get_client_usage`: Token accounting (prompt, completion, cached) plus request counts for one client key or overall, over a window such as `1h`, `24h`, `7d`.
+  - `initiate_oauth_login`: Starts a non-blocking OAuth login for subscription lanes; returns the sign-in URL and the device-flow `user_code`.
+  - `check_oauth_login`: Polls a pending device-flow login (e.g. xai) or completes a server-side token exchange.
+  - `submit_oauth_code`: Submits the authorization code from the redirect callback URL (e.g. antigravity).
+  - `list_model_aliases` / `set_model_alias` / `remove_model_alias`: The alias table (client-visible name -> provider lane + upstream id, with `context_limit`, `max_output`, `pricing_tag`, `input_cost`, `output_cost`); runtime changes persist in `data_dir/aliases.json`.
+  - `get_provider_timeouts` / `set_provider_timeout` / `remove_provider_timeout`: Per-lane timeouts as Go duration strings (`10m`, `3m30s`), persisted in `data_dir/timeouts.json`.
+  - `add_provider` / `remove_provider` / `list_providers`: Runtime lane registration (OpenAI-compatible lanes via name/base_url/api_key/quirks, plus the antigravity, anthropic, codex and freebuff custom-wire kinds), persisted in `data_dir/providers.json`; `list_providers` redacts secrets.
+  - `refresh_models`: Re-fetches `GET <base>/v1/models` and caches the ids so `<lane>/<model>` appears in `/v1/models`.
 
 ### 7. Discovery & Health
 - **Route**: `GET /llms.txt` — Machine-readable overview for LLMs.
@@ -188,7 +194,7 @@ curl -s http://localhost:9050/v1/messages \
 
 ### Fast Install (Linux & macOS)
 
-Install the precompiled binary to `~/.local/bin` and create default configurations:
+Install the precompiled binary to `~/.local/bin`; it is immediately runnable with zero configuration:
 
 ```bash
 curl -fsSL https://ultiproxy.dev/install.sh | bash
@@ -219,48 +225,19 @@ systemctl --user status ultiproxy
 
 ## Configuration Reference
 
-Ultiproxy reads configuration from `~/.config/ultiproxy/config.yaml`.
+Ultiproxy is zero-config on startup. `ultiproxy serve` (optionally `ULTIPROXY_ADDR=0.0.0.0:9050 ultiproxy serve` to bind a remote interface, or `--data-dir` to place persistent state) starts the daemon with no providers, no aliases and no timeouts defined; nothing has to exist before the first request. There is no config file to read or write.
 
-```yaml
-server:
-  listen: "127.0.0.1:9050"
-  api_keys:
-    - "sk-up-local-agent-key"
+ALL configuration is applied dynamically, at runtime, by agents or operators over MCP (`POST /mcp`, legacy SSE on `/mcp/sse`):
 
-routing:
-  strategy: "quota-priority" # Options: quota-priority, round-robin, lowest-latency
-  fallback_to_openrouter: true
+- `add_provider` / `remove_provider` / `list_providers` - provider lanes
+- `set_model_alias` / `remove_model_alias` / `list_model_aliases` - client-visible model names
+- `set_provider_timeout` / `remove_provider_timeout` / `get_provider_timeouts` - per-lane timeouts
+- `initiate_oauth_login` / `check_oauth_login` / `submit_oauth_code` - subscription logins
+- `list_models` / `toggle_model` / `get_quota_status` / `get_client_usage` / `refresh_models` - inspection and soft switches
 
-providers:
-  copilot:
-    enabled: true
-    # GitHub OAuth token or personal access token
-    token: "ghu_xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+Changes take effect immediately (no restart) and persist in the daemon's `data_dir`, which is restored on the next start: `providers.json` (registered lanes), `aliases.json` (model aliases), `timeouts.json` (per-lane timeouts), plus `credentials/` for OAuth token state and the SQLite telemetry database.
 
-  openai:
-    enabled: true
-    api_key: "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-
-  anthropic:
-    enabled: true
-    api_key: "sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-
-  google_antigravity:
-    enabled: true
-    service_account_path: "~/.config/gcloud/antigravity.json"
-
-  deepseek:
-    enabled: true
-    api_key: "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
-
-  vllm:
-    enabled: true
-    base_url: "http://127.0.0.1:8000/v1"
-
-accounting:
-  enabled: true
-  db_path: "~/.local/state/ultiproxy/accounting.db"
-```
+Client keys are optional: declaring them turns on Bearer authentication and per-key attribution; with none declared every request is accepted, which suits a localhost-only daemon. `ULTIPROXY_ADDR` is the only environment switch needed for a remote bind.
 
 ---
 
@@ -356,6 +333,6 @@ const response = await client.chat.completions.create({
 ## Security Model
 
 1. **Localhost Isolation**: By default, Ultiproxy binds strictly to `127.0.0.1:9050`.
-2. **Token Encapsulation**: Upstream subscription keys and OAuth refresh credentials remain inside `~/.config/ultiproxy/config.yaml` (chmod 600) and are never forwarded to downstream clients.
+2. **Token Encapsulation**: Upstream subscription keys and OAuth refresh tokens stay inside the daemon's `data_dir` credential store (never returned by any MCP tool, never forwarded to downstream clients).
 3. **Bearer Token Validation**: Inbound agent and developer connections require a configured client API key (`sk-up-...`).
 4. **Per-Key Rate Limits**: Granular accounting prevents runaway agent loops from consuming pooled upstream quotas.

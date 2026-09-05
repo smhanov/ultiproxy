@@ -13,156 +13,256 @@ import (
 
 var standardTools = []Tool{
 	{
-		Name:        "list_models",
-		Description: "List available models and their status",
+		Name: "list_models",
+		Description: `List the client-visible model ids Ultiproxy can route right now.
+
+Returns a JSON object mapping every model id to its metadata:
+- id: the exact string a client passes as "model" in POST /v1/chat/completions and POST /v1/messages
+- provider: the lane serving it (antigravity, xai, copilot, codex, freebuff, zai, or any lane added with add_provider)
+- enabled: whether the id is routable right now (flip it with toggle_model)
+- context_limit: context window in tokens; advisory metadata surfaced as context_length on GET /v1/models, never enforced against the prompt
+- max_output: hard cap on generated tokens; a request's max_tokens is clamped down to it
+- pricing_tag, benchmark_scores: pricing / quality labels carried by the alias
+
+These entries are the alias catalog (see set_model_alias). Two further routing shapes are not listed here but always work: any registered lane name on its own ("<lane>") prefix-routes any upstream model id, and lanes with model discovery accept "<lane>/<upstream_model>" - GET /v1/models returns that full list. Use list_providers for lane-level inventory/health and list_model_aliases for the raw alias table.`,
 		InputSchema: &InputSchema{
 			Type:       "object",
 			Properties: map[string]PropertyDef{},
 		},
 	},
 	{
-		Name:        "get_quota_status",
-		Description: "Get quota status for an upstream provider",
+		Name: "get_quota_status",
+		Description: `Fetch the live quota / credit state of ONE upstream provider lane.
+
+provider must be a lane name exactly as list_providers reports it, e.g. "antigravity", "xai", "copilot", "codex", "freebuff", "zai", or a lane registered with add_provider.
+
+Returns the lane's normalized quota snapshot as JSON:
+- observed_at: when the upstream was last asked
+- windows[]: one entry per quota pool with label, used_pct (0-100), remaining, limit, unit ("%", "credits", "requests"), reset_at and seconds_remaining (0 when the pool has no reset)
+- detail: human note, including why no pool could be read
+
+Typical shapes: antigravity and copilot report per-model-group percentage windows, codex reports 5-hour and weekly sliding windows, xai reports credit pools, freebuff reports a credits balance, zai reports the dominant coding-plan window. Lanes whose upstream exposes no quota endpoint answer "has no quota mechanism"; a lane that is not logged in (e.g. codex) answers with a detail telling you how to log in first.
+
+Monitoring only: Ultiproxy NEVER reroutes or fails over on its own because a quota is exhausted - routing decisions belong to the operator/agent. Read this tool (or GET /api/quota and /quota.txt), choose the model explicitly, then send the request.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"provider": {Type: "string", Description: "Provider name"},
+				"provider": {Type: "string", Description: "Provider lane name, e.g. antigravity, xai, copilot, codex, freebuff, zai (see list_providers)"},
 			},
 			Required: []string{"provider"},
 		},
 	},
 	{
-		Name:        "toggle_model",
-		Description: "Enable or disable a model",
+		Name: "toggle_model",
+		Description: `Enable or disable a client-visible model id at runtime WITHOUT deleting its mapping.
+
+- model_id: an existing alias id (see list_models / list_model_aliases)
+- enabled: true makes the id routable again; false makes requests for it fail with unknown_model while the alias, its provider lane and all its metadata stay intact
+
+Use it as a soft kill switch: a model that is misbehaving, an alias being drained before maintenance, temporarily hiding a lane's models from clients. Re-enabling is instant. The flag lives in memory only, so a restart re-enables every alias - remove_model_alias is the permanent operation.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"model_id": {Type: "string", Description: "Model ID"},
-				"enabled":  {Type: "boolean", Description: "Enable (true) or disable (false)"},
+				"model_id": {Type: "string", Description: "Model id (alias) to toggle, exactly as listed by list_models"},
+				"enabled":  {Type: "boolean", Description: "Enable (true) or disable (false) the model id; disabling keeps the alias mapping"},
 			},
 			Required: []string{"model_id", "enabled"},
 		},
 	},
 	{
-		Name:        "get_client_usage",
-		Description: "Get token and request usage for a client",
+		Name: "get_client_usage",
+		Description: `Read back the token and request accounting Ultiproxy records, for one client key or overall.
+
+- client_id: the client key identity to report on; leave it empty for the overall / aggregate view
+- window: lookback window such as "1h", "24h" or "7d"; leave it empty for the default window
+
+The report covers prompt (input) tokens, completion (output) tokens, cached prompt tokens, total tokens, request counts and the estimated USD cost derived from each model's pricing (set_model_alias input_cost / output_cost). Streaming and non-streaming requests are accounted the same way. When the running daemon has no usage source attached the totals come back as zero - use GET /api/stats/summary for the SQL-backed aggregate in that case.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"client_id": {Type: "string", Description: "Client ID or key hash"},
-				"window":    {Type: "string", Description: "Time window (e.g. 1h, 24h, 7d)"},
+				"client_id": {Type: "string", Description: "Client key name or key hash to report on; omit / empty for overall usage"},
+				"window":    {Type: "string", Description: "Lookback window, e.g. 1h, 24h, 7d; omit for the default window"},
 			},
 		},
 	},
 	{
-		Name:        "initiate_oauth_login",
-		Description: "Start the OAuth login flow for a provider. Returns the sign-in URL (and user code for device flows) WITHOUT blocking; then call check_oauth_login to poll device flows or submit_oauth_code to finish auth-code flows.",
+		Name: "initiate_oauth_login",
+		Description: `Start an OAuth login against a subscription provider lane WITHOUT blocking the call.
+
+provider is a lane with an interactive auth surface, e.g. "antigravity" (auth-code flow) or "xai" (device flow).
+
+Returns immediately with:
+- status "awaiting_user", the provider and the flow kind
+- url: the sign-in page to open in a browser (hand it to the human or open it yourself)
+- user_code: for device flows, the code the user must confirm on that page
+- expires_in_seconds: how long the flow stays valid
+
+Then finish it: for device flows poll check_oauth_login until it reports "completed"; for auth-code flows take the authorization code from the redirect/callback URL and pass it to submit_oauth_code. Lanes that only implement the legacy blocking flow run it inline and answer "initiated". Tokens are written to the daemon's credential store for that lane and are never returned to clients.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"provider": {Type: "string", Description: "Provider name"},
+				"provider": {Type: "string", Description: "Provider lane to log in to, e.g. antigravity (auth-code flow) or xai (device flow)"},
 			},
 			Required: []string{"provider"},
 		},
 	},
 	{
-		Name:        "check_oauth_login",
-		Description: "Poll a pending OAuth login (device flows: xai etc.) until the user approves; returns completed or pending. Also finalizes auth-code flows whose token exchange can complete server-side.",
+		Name: "check_oauth_login",
+		Description: `Poll a pending OAuth login (device flows, e.g. xai) until the user approves it, or complete a flow whose token exchange can finish server-side.
+
+provider: the lane whose login was started with initiate_oauth_login.
+
+One call waits at most ~90 seconds and answers either:
+- status "pending": nobody has approved yet - simply call again (device flows normally need a few polls while the human types the user_code)
+- status "completed": tokens are stored, the lane is usable
+
+Anything else is returned as an error. Auth-code flows whose token exchange happens server-side also finish here; flows that need the code copied out of the browser redirect must use submit_oauth_code instead.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"provider": {Type: "string", Description: "Provider name"},
+				"provider": {Type: "string", Description: "Provider lane with a pending login, e.g. xai"},
 			},
 			Required: []string{"provider"},
 		},
 	},
 	{
-		Name:        "submit_oauth_code",
-		Description: "Submit the authorization code from the browser (auth-code flows: antigravity) to finish OAuth login.",
+		Name: "submit_oauth_code",
+		Description: `Finish an auth-code OAuth flow by handing over the authorization code the browser ended up with.
+
+- provider: the lane whose login was started with initiate_oauth_login (e.g. antigravity)
+- code: the authorization code from the redirect callback URL (http://localhost:<port>/oauth-callback?code=...&state=... - copy only the code value) or from the provider's success page
+
+On success the code is exchanged for tokens server-side and the answer is status "completed". Codes are single-use and short-lived: if the exchange fails, start over with initiate_oauth_login. A browser running on the same machine as the daemon is captured automatically by the loopback listener, so this tool is the path for remote or headless browsers.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"provider": {Type: "string", Description: "Provider name"},
-				"code":     {Type: "string", Description: "Authorization code from the browser callback/success page"},
+				"provider": {Type: "string", Description: "Provider lane finishing an auth-code flow, e.g. antigravity"},
+				"code":     {Type: "string", Description: "Authorization code copied from the browser callback URL (the code= parameter)"},
 			},
 			Required: []string{"provider", "code"},
 		},
 	},
 	{
-		Name:        "list_model_aliases",
-		Description: "List all model aliases (client-visible name -> provider lane + upstream id)",
+		Name: "list_model_aliases",
+		Description: `List the alias table: client-visible model name -> provider lane + upstream model id, with limits and pricing.
+
+Returns a JSON object keyed by alias; every value carries provider, upstream, context_limit, max_output, pricing_tag, input_cost / output_cost (USD per 1M tokens) and benchmarks. This is the same data list_models reports per id, but complete and unfiltered. Every alias here is a valid "model" value for POST /v1/chat/completions and POST /v1/messages. Mutate the table with set_model_alias and remove_model_alias.`,
 		InputSchema: &InputSchema{Type: "object", Properties: map[string]PropertyDef{}},
 	},
 	{
-		Name:        "set_model_alias",
-		Description: "Set a model alias mapping a client-visible name to a provider lane and upstream model id. Persists across restarts.",
+		Name: "set_model_alias",
+		Description: `Create or update one model alias: a client-visible name mapped to a provider lane and an upstream model id. The mapping applies to new requests immediately and persists across restarts (data_dir/aliases.json).
+
+- alias (required): the name clients will send as "model", e.g. "qwenpoint-3.8" or "sonnet-big"
+- provider (required): a registered lane name, e.g. "vllm", "zai", "antigravity", "xai", "copilot", "codex", "freebuff" (see list_providers)
+- upstream (required): the model id that lane understands, e.g. "Qwen/Qwen3.8-Instruct-AWQ" or "claude-sonnet-4-5"
+- context_limit (optional): context window in tokens - advisory metadata surfaced as context_length on GET /v1/models, not enforced
+- max_output (optional): hard cap on completion tokens; a request's max_tokens is clamped to it
+- pricing_tag (optional): pricing label such as "flat-subscription" or "paid-api"
+- input_cost / output_cost (optional): USD per 1M prompt / completion tokens, used for cost accounting when the upstream does not price itself
+- benchmarks (optional): map of benchmark name -> score, informational
+
+Calling it again with the same alias replaces the whole entry. Clients ask for the alias alone - no lane prefix needed. Example: {"alias":"qwenpoint-3.8","provider":"vllm","upstream":"Qwen/Qwen3.8-Instruct-AWQ","context_limit":131072,"max_output":8192,"pricing_tag":"local-gpu"}.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"alias":         {Type: "string", Description: "Client-visible model name, e.g. qwenpoint-3.8"},
-				"provider":      {Type: "string", Description: "Provider lane name, e.g. vllm, zai"},
-				"upstream":      {Type: "string", Description: "Upstream model id, e.g. Qwen/Qwen3.8-Instruct-AWQ"},
-				"context_limit": {Type: "number", Description: "Optional context window size"},
-				"max_output":    {Type: "number", Description: "Optional max output tokens"},
-				"pricing_tag":   {Type: "string", Description: "Optional pricing label"},
+				"alias":         {Type: "string", Description: "Client-visible model name clients send as model, e.g. qwenpoint-3.8"},
+				"provider":      {Type: "string", Description: "Provider lane name the alias routes to, e.g. vllm, zai, antigravity, xai"},
+				"upstream":      {Type: "string", Description: "Upstream model id on that lane, e.g. Qwen/Qwen3.8-Instruct-AWQ"},
+				"context_limit": {Type: "number", Description: "Optional context window size in tokens (advisory, surfaced as context_length on /v1/models)"},
+				"max_output":    {Type: "number", Description: "Optional max output tokens; a request's max_tokens is clamped to it"},
+				"pricing_tag":   {Type: "string", Description: "Optional pricing label, e.g. flat-subscription"},
 				"input_cost":    {Type: "number", Description: "Optional input price in US dollars per 1M prompt tokens (drives cost accounting)"},
 				"output_cost":   {Type: "number", Description: "Optional output price in US dollars per 1M completion tokens (drives cost accounting)"},
+				"benchmarks":    {Type: "object", Description: "Optional map of benchmark name -> score, informational only"},
 			},
 			Required: []string{"alias", "provider", "upstream"},
 		},
 	},
 	{
-		Name:        "remove_model_alias",
-		Description: "Remove a model alias mapping",
+		Name: "remove_model_alias",
+		Description: `Delete one alias mapping by name.
+
+The client-visible id disappears from list_models and GET /v1/models immediately and stops routing (requests for it fail with unknown_model). Deletion is permanent across restarts because data_dir/aliases.json is rewritten. The provider lane itself is untouched, and re-creating the mapping is just another set_model_alias call. Use toggle_model instead when the mapping should survive but be temporarily unroutable.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"alias": {Type: "string", Description: "Alias to remove"},
+				"alias": {Type: "string", Description: "Alias to remove, exactly as listed by list_model_aliases"},
 			},
 			Required: []string{"alias"},
 		},
 	},
 	{
-		Name:        "get_provider_timeouts",
-		Description: "List per-provider request timeouts (Go duration strings)",
+		Name: "get_provider_timeouts",
+		Description: `List the per-provider request timeouts currently in force, as a JSON map of lane name -> Go duration string (e.g. {"vllm":"10m"}).
+
+Lanes absent from the map use the server default of 120s. A timeout bounds one upstream request, streaming included, so slow lanes (large local models, long reasoning chains) need a bigger value or long generations get cut off. Change an entry with set_provider_timeout and drop it back to the default with remove_provider_timeout.`,
 		InputSchema: &InputSchema{Type: "object", Properties: map[string]PropertyDef{}},
 	},
 	{
-		Name:        "set_provider_timeout",
-		Description: "Set a per-provider request timeout, e.g. {\"provider\":\"vllm\",\"timeout\":\"10m\"}. Persists across restarts.",
+		Name: "set_provider_timeout",
+		Description: `Configure the request timeout for one provider lane. It applies to new requests immediately and persists across restarts (data_dir/timeouts.json).
+
+- provider: a registered lane name, e.g. "vllm", "freebuff", "zai"
+- timeout: a Go duration string such as "10m", "3m30s", "45s" or "1h"
+
+Raise it to give slow lanes headroom (local vLLM models, long agentic generations), lower it to fail fast on a lane that hangs. Anything above the 120s default must be set explicitly. Invalid or non-positive durations are rejected. Reset to the default with remove_provider_timeout. Example: {"provider":"vllm","timeout":"10m"}.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
 				"provider": {Type: "string", Description: "Provider lane name, e.g. vllm, freebuff"},
-				"timeout":  {Type: "string", Description: "Duration string, e.g. 3m30s, 10m, 1h"},
+				"timeout":  {Type: "string", Description: "Go duration string, e.g. 3m30s, 10m, 1h"},
 			},
 			Required: []string{"provider", "timeout"},
 		},
 	},
 	{
-		Name:        "remove_provider_timeout",
-		Description: "Clear a provider's explicit timeout (falls back to default)",
+		Name: "remove_provider_timeout",
+		Description: `Reset a provider lane's timeout to the server default (120s) by dropping its explicit override.
+
+provider: the lane whose override should be removed. The change is immediate and persisted (data_dir/timeouts.json). Removing a timeout that was never set is not an error.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"provider": {Type: "string", Description: "Provider lane name"},
+				"provider": {Type: "string", Description: "Provider lane name to reset to the default timeout"},
 			},
 			Required: []string{"provider"},
 		},
 	},
 	{
-		Name:        "add_provider",
-		Description: "Register a provider lane at runtime (no config file): an OpenAI-compatible lane by default, or a custom-wire lane via kind (antigravity, anthropic, codex, freebuff). Persists across restarts in providers.json.",
+		Name: "add_provider",
+		Description: `Register a new upstream provider lane at runtime: no restart, nothing to hand-edit. The lane is built, validated and added to the live registry immediately, and persisted to data_dir/providers.json so it comes back on restart.
+
+Parameters:
+- name (required): lane name, lowercase [a-z0-9_-], e.g. "vllm", "zai", "deepseek", "openrouter". Its models are reachable as "<name>/<upstream_model>" and through aliases (set_model_alias).
+- kind: "" or "openaicompat" (default) for any OpenAI-compatible upstream; "antigravity", "anthropic", "codex" or "freebuff" for the custom-wire lanes.
+- base_url: upstream base URL, required for OpenAI-compatible lanes, e.g. "https://api.deepseek.com/v1". Custom-wire lanes ignore it - they know their endpoints.
+- api_key: static key. Required for kind=anthropic; optional elsewhere (public or local lanes work without one).
+- quirks (object, OpenAI-compatible lanes only): vendor behaviour switches
+  - coding_plan_path: route through a coding-plan path (zai-style coding subscriptions)
+  - max_tokens_by_model: map of upstream model id -> max_tokens that upstream accepts, e.g. {"glm-4.6":8192}
+  - echo_reasoning: repeat reasoning tokens as visible content (upstreams that hide them)
+  - model_list_passthrough: slurp GET <base>/v1/models so "<name>/<model>" ids show up on /v1/models
+  - auth_via_oauth_manager: authenticate with the lane's stored OAuth credential (xai-style) instead of a static key
+  - credits_quota_observer: upstream credits endpoint to poll so get_quota_status has something to report (e.g. the xai billing URL)
+  - auth_via_supabase_refresh: refresh credentials through a Supabase session
+  - freebuff_actor: mark the lane as a Codebuff/freebuff lane (serialized requests, session affinity, actor-backed quota); the real actor is rebuilt from the lane's api_key / stored state token
+  - freebuff_default_tool: force the default tool behaviour on freebuff chats
+  - default_model: upstream model id to use when a request carries no explicit model
+
+Examples: a local vLLM lane {"name":"vllm","base_url":"http://127.0.0.1:8000/v1","quirks":{"model_list_passthrough":true}} (then set_model_alias {"alias":"qwen-coder","provider":"vllm","upstream":"Qwen/Qwen2.5-Coder-32B-Instruct"}); a keyed API lane {"name":"deepseek","base_url":"https://api.deepseek.com/v1","api_key":"sk-..."}; custom lanes {"name":"my-claude","kind":"anthropic","api_key":"sk-ant-..."}, {"name":"antigravity","kind":"antigravity"} followed by initiate_oauth_login, {"name":"codex","kind":"codex"}, {"name":"freebuff","kind":"freebuff"}.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"name":     {Type: "string", Description: "Lane name, lowercase [a-z0-9_-], e.g. vllm, zai, openrouter"},
+				"name":     {Type: "string", Description: "Lane name, lowercase [a-z0-9_-], e.g. vllm, zai, openrouter; models route as <name>/<model>"},
 				"kind":     {Type: "string", Description: "Lane kind: empty or openaicompat for OpenAI-compatible lanes, antigravity, anthropic (requires api_key), codex or freebuff (Codebuff account lane; api_key optional, falls back to the ultiproxy-owned state token)"},
 				"base_url": {Type: "string", Description: "Upstream base URL, e.g. https://api.deepseek.com/v1 (required for OpenAI-compatible lanes)"},
 				"api_key":  {Type: "string", Description: "Static API key (required for kind=anthropic, optional otherwise)"},
 				"quirks": {
-					Type:        "object",
-					Description: "Vendor quirks: {coding_plan_path, max_tokens_by_model, echo_reasoning, model_list_passthrough, auth_via_oauth_manager, credits_quota_observer, auth_via_supabase_refresh, freebuff_actor, freebuff_default_tool, default_model} (OpenAI-compatible lanes only; freebuff_actor marks a Codebuff lane, the serialized-request actor is built from the api_key/state token)",
+					Type: "object",
+					Description: `Vendor quirks, OpenAI-compatible lanes only: {coding_plan_path, max_tokens_by_model, echo_reasoning, model_list_passthrough, auth_via_oauth_manager, credits_quota_observer, auth_via_supabase_refresh, freebuff_actor, freebuff_default_tool, default_model}.
+
+coding_plan_path (bool): route through a coding-plan path (zai-style coding subscriptions). max_tokens_by_model (object): upstream model id -> max_tokens cap the upstream accepts. echo_reasoning (bool): repeat reasoning tokens as visible content. model_list_passthrough (bool): discover GET <base>/v1/models so <lane>/<model> ids appear on /v1/models. auth_via_oauth_manager (bool): use the lane's stored OAuth credential instead of a static key. credits_quota_observer (string): upstream credits endpoint polled for quota. auth_via_supabase_refresh (bool): refresh credentials through a Supabase session. freebuff_actor (bool): mark a Codebuff/freebuff lane - serialized requests, session affinity, actor-backed quota rebuilt from the lane's api_key / state token. freebuff_default_tool (bool): force the default tool behaviour on freebuff chats. default_model (string): upstream model id used when a request carries no model.`,
 				},
 			},
 			// base_url is validated per kind by the tool itself: custom kinds
@@ -171,28 +271,39 @@ var standardTools = []Tool{
 		},
 	},
 	{
-		Name:        "remove_provider",
-		Description: "Unregister a provider lane: drops it from the live registry and from providers.json.",
+		Name: "remove_provider",
+		Description: `Unregister a provider lane: it is dropped from the live registry immediately (no request routes to it any more) and deleted from data_dir/providers.json, so it does not come back on restart.
+
+Aliases pointing at the lane are left in place but stop resolving - repoint them with set_model_alias or delete them with remove_model_alias. Compile-time lanes (registered from env/OAuth credentials rather than add_provider) can only be removed from the live registry; the result then reports persisted=false. name must match the lane exactly (see list_providers).`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"name": {Type: "string", Description: "Lane name to remove, e.g. vllm"},
+				"name": {Type: "string", Description: "Lane name to remove, e.g. vllm (see list_providers)"},
 			},
 			Required: []string{"name"},
 		},
 	},
 	{
-		Name:        "list_providers",
-		Description: "List runtime-registered provider lanes (base URL + quirks; secrets are redacted) and the live registry lanes.",
+		Name: "list_providers",
+		Description: `List every provider lane the proxy knows about, in two groups:
+
+- providers[]: lanes registered at runtime through add_provider, each with name, base_url, has_api_key (a boolean - the key itself is never returned), auth_via_oauth and the full quirks set
+- registry_lanes[]: every lane in the live registry, including compiled/in-memory lanes that live only in the process (env-credential or OAuth-credential lanes)
+
+Secrets are always redacted. Use this to discover valid provider names before calling add_provider / set_model_alias / get_quota_status / set_provider_timeout, and to confirm a lane you just added is actually live. Per-lane health and quota live in get_quota_status.`,
 		InputSchema: &InputSchema{Type: "object", Properties: map[string]PropertyDef{}},
 	},
 	{
-		Name:        "refresh_models",
-		Description: "Re-fetch a lane's upstream model list (GET <base>/v1/models) and cache it on the running lane, so <lane>/<model> ids show up in /v1/models. Needed for lanes registered before startup model discovery existed.",
+		Name: "refresh_models",
+		Description: `Re-fetch and cache a lane's upstream model list (GET <base_url>/v1/models) so those ids show up as "<lane>/<model>" on GET /v1/models and can be routed directly or aliased.
+
+name: the lane to refresh, e.g. "opencode", "vllm", "deepseek".
+
+Discovery runs once at startup for lanes added with model_list_passthrough; this tool re-runs it on demand (10s budget) to pick up models added upstream or to backfill a lane whose cache is empty - it then answers "N models cached for lane <name>". Lanes without model discovery (custom-wire lanes such as antigravity, codex, anthropic) answer "does not support model discovery", though prefix routing "<lane>/<model>" still works for them.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"name": {Type: "string", Description: "Provider lane name, e.g. opencode, vllm"},
+				"name": {Type: "string", Description: "Provider lane name to re-discover models for, e.g. opencode, vllm"},
 			},
 			Required: []string{"name"},
 		},
