@@ -210,7 +210,7 @@ func TestParseGrokCreditsResponse_PercentPath(t *testing.T) {
 	}
 }
 
-// TestGrokUsagePercent_Heuristic: the ai-quota-dashboard rule \u2014 candidates are
+// TestGrokUsagePercent_Heuristic: candidates are
 // fixed32 values in [0,100] whose path ends with field 1, pct is the smallest,
 // and values <= 1 are fractions.
 func TestGrokUsagePercent_Heuristic(t *testing.T) {

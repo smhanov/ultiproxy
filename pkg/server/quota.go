@@ -10,7 +10,7 @@ import (
 	"github.com/smhanov/ultiproxy/pkg/state"
 )
 
-// QuotaDashboardResponse matches quota.fjkl.cc JSON structure.
+// QuotaDashboardResponse matches quota dashboard JSON structure.
 type QuotaDashboardResponse struct {
 	Providers []ProviderSummary `json:"providers"`
 	Summary   DashboardSummary  `json:"summary"`

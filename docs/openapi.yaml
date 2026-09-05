@@ -114,8 +114,7 @@ paths:
     get:
       summary: Quota status dashboard API
       description: |
-        Returns the quota status across all pooled provider subscriptions.
-        Preserves 100% contract compatibility with legacy quota.fjkl.cc so monitoring probes
+        Returns the quota status across all pooled provider subscriptions so monitoring probes
         and dashboard web UIs work without modification.
       operationId: getQuotaStatus
       tags:
@@ -674,7 +673,7 @@ components:
               type: string
               enum: [ok, degraded, unavailable]
 
-    # --- Quota Dashboard Schemas (quota.fjkl.cc compatible) ---
+    # --- Quota Dashboard Schemas ---
     QuotaDashboardResponse:
       type: object
       required:

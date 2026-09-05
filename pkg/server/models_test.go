@@ -105,13 +105,13 @@ func TestHandleModels_IncludesRuntimeLanes(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.DataDir = dir
 	cfg.Server.Models = map[string]ModelAlias{
-		"qwenpoint-3.8": {Provider: "vllm-fjkl", Upstream: "Qwen/Qwen3.8-27B-Instruct"},
+		"qwenpoint-3.8": {Provider: "vllm-local", Upstream: "Qwen/Qwen3.8-27B-Instruct"},
 	}
 
 	store := NewRuntimeProviderStore(filepath.Join(dir, "providers.json"))
 	store.DefaultDataDir = dir
 	if err := store.Add(openaicompat.Config{
-		Name:    "vllm-fjkl",
+		Name:    "vllm-local",
 		BaseURL: upstream.srv.URL,
 		Quirks:  openaicompat.Quirks{ModelListPassthrough: true},
 	}); err != nil {
@@ -140,9 +140,9 @@ func TestHandleModels_IncludesRuntimeLanes(t *testing.T) {
 	ids := resp.ids()
 
 	for _, want := range []string{
-		"vllm-fjkl",                           // the lane itself (prefix-routable)
-		"vllm-fjkl/Qwen/Qwen3.8-27B-Instruct", // discovered upstream models
-		"vllm-fjkl/meta-llama/Llama-3-8B",
+		"vllm-local",                           // the lane itself (prefix-routable)
+		"vllm-local/Qwen/Qwen3.8-27B-Instruct", // discovered upstream models
+		"vllm-local/meta-llama/Llama-3-8B",
 		"anthropic",     // lane with no model discovery: static entry only
 		"qwenpoint-3.8", // catalog alias
 	} {
@@ -158,8 +158,8 @@ func TestHandleModels_IncludesRuntimeLanes(t *testing.T) {
 			t.Errorf("invented model id for a lane without model discovery: %q", id)
 		}
 	}
-	if _, ok := ids["vllm-fjkl/default"]; ok {
-		t.Errorf("invented placeholder model id for an empty passthrough cache: %q", "vllm-fjkl/default")
+	if _, ok := ids["vllm-local/default"]; ok {
+		t.Errorf("invented placeholder model id for an empty passthrough cache: %q", "vllm-local/default")
 	}
 
 	// Listing models must never fan out to the lane upstream.
@@ -181,7 +181,7 @@ func TestHandleModels_EmptyPassthroughCacheInventsNothing(t *testing.T) {
 	store := NewRuntimeProviderStore(filepath.Join(dir, "providers.json"))
 	store.DefaultDataDir = dir
 	if err := store.Add(openaicompat.Config{
-		Name:    "vllm-fjkl",
+		Name:    "vllm-local",
 		BaseURL: upstream.srv.URL,
 		Quirks:  openaicompat.Quirks{ModelListPassthrough: true},
 	}); err != nil {
@@ -194,7 +194,7 @@ func TestHandleModels_EmptyPassthroughCacheInventsNothing(t *testing.T) {
 	)
 
 	resp := getModels(t, srv)
-	if len(resp.Data) != 1 || resp.Data[0].ID != "vllm-fjkl" {
+	if len(resp.Data) != 1 || resp.Data[0].ID != "vllm-local" {
 		t.Fatalf("expected only the lane entry, got %+v", resp.Data)
 	}
 }

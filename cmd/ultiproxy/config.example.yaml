@@ -149,6 +149,6 @@ server:
     vllm: "10m"
 
 storage:
-  db_path: "/home/smhanov/.local/state/ultiproxy/ultiproxy.db"
+  db_path: "~/.local/state/ultiproxy/ultiproxy.db"
 
-data_dir: "/home/smhanov/.local/state/ultiproxy"
+data_dir: "~/.local/state/ultiproxy"

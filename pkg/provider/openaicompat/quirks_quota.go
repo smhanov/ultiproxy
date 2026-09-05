@@ -277,7 +277,7 @@ func UnframeGRPCWeb(data []byte) ([][]byte, error) {
 //	          nested {2: {1: start_secs}}, {3: {1: end_secs}}
 //	field 11, field 13 varint             — flags (1 == true)
 //	optional: a usage percent as a fixed32 float 0..100 nested under a field
-//	          whose last path element is 1 (the ai-quota-dashboard heuristic).
+//	          whose last path element is 1.
 const (
 	// Plausible unix-seconds range for a billing window timestamp: 2023-11
 	// through 2036. Anything outside is a flag, a counter or a state enum.
@@ -355,7 +355,7 @@ func grokWindowActive(fields []scannedField) bool {
 	return false
 }
 
-// grokUsagePercent implements the ai-quota-dashboard heuristic: candidates are
+// grokUsagePercent extracts the usage percent: candidates are
 // fixed32 values in [0,100] whose field path ends with field 1, and the usage
 // percent is the smallest of them.
 func grokUsagePercent(fields []scannedField) (float64, bool) {

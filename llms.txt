@@ -12,7 +12,7 @@ Ultiproxy is an ultra-fast, local-first proxy daemon that multiplexes multiple u
 - **Quota Monitoring**: Live per-provider quota windows and credit state via the MCP `get_quota_status` tool, `/api/quota`, and `quota.txt` — operators decide routing; the proxy never reroutes on quota by itself.
 - **Embedded MCP Server**: Streamable HTTP and SSE Model Context Protocol endpoints allow agents to introspect active models, check remaining quota, and toggle backends dynamically.
 - **Per-API-Key Accounting**: Granular tracking and attribution of prompt tokens, completion tokens, cached tokens, and request counts per client.
-- **Legacy Quota Dashboard Drop-in**: Serves the exact JSON shape expected by `quota.fjkl.cc` and `dashboard-quota-probe.py` at `/api/quota`.
+- **Quota Dashboard API**: Serves unified JSON subscription health, reset windows, and quota gauges at `/api/quota`.
 - **Reasoning & Tool Streaming**: Transparently preserves reasoning tokens (`reasoning_content` / thinking blocks), function/tool calls, and vision inputs.
 
 ---
@@ -102,7 +102,7 @@ curl -s http://localhost:9050/v1/messages \
 }
 ```
 
-### 4. Quota Dashboard API (Legacy quota.fjkl.cc Contract)
+### 4. Quota Dashboard API
 - **Route**: `GET /api/quota`
 - **Auth**: Public or Bearer token
 - **Description**: Returns live subscription health, reset windows, and quota gauges across all 12 providers.

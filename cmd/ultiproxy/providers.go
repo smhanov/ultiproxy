@@ -219,7 +219,7 @@ func registerProviders(registry *provider.Registry) {
 		}
 	}
 
-	// Local vLLM (megos-style) — ULTIPROXY_VLLM_BASE_URL, optional key.
+	// Local vLLM — ULTIPROXY_VLLM_BASE_URL, optional key.
 	if base := firstEnv("ULTIPROXY_VLLM_BASE_URL", "VLLM_BASE_URL"); base != "" {
 		key := firstEnv("ULTIPROXY_VLLM_API_KEY", "VLLM_API_KEY")
 		if p, err := openaicompat.New(openaicompat.Config{

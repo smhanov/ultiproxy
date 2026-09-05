@@ -11,7 +11,7 @@ Use the untracked `plans/todo.md` as the running list of future/outstanding task
 - llmhub's local `main` should stay in sync with `origin/main`; work on a PR branch so this `replace` keeps resolving.
 - Current integration notes:
   - `openaicompat.New()` passes `llmhub.WithRetryOnStatus(http.StatusTooManyRequests, false)` for honest-429 semantics (maintainer's API; the old `WithNoRetryOn429` name no longer exists).
-  - Migration plan: `plans/2026-09-03_212346-ultiproxy-llmhub-migration.md` (canonical twin under `~/.hermes/plans` / `/home/smhanov/workspace/.hermes/plans`).
+  - Migration plan: `plans/2026-09-03_212346-ultiproxy-llmhub-migration.md`.
 
 ## Architecture summary (post-migration)
 

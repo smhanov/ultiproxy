@@ -29,7 +29,7 @@ type HandlerConfig struct {
 	NowFn        func() time.Time
 }
 
-// WindowSummary represents one rate limit window in the quota.fjkl.cc contract.
+// WindowSummary represents one rate limit window in the quota contract.
 type WindowSummary struct {
 	Label            string  `json:"label"`
 	UsedPct          float64 `json:"used_pct"`
@@ -37,7 +37,7 @@ type WindowSummary struct {
 	SecondsRemaining int64   `json:"seconds_remaining"`
 }
 
-// BarSummary represents a usage bar in the quota.fjkl.cc contract.
+// BarSummary represents a usage bar in the quota contract.
 type BarSummary struct {
 	Label     string  `json:"label"`
 	Used      float64 `json:"used"`
@@ -47,7 +47,7 @@ type BarSummary struct {
 	Pct       float64 `json:"pct"`
 }
 
-// ProviderSummary represents one provider in the quota.fjkl.cc contract.
+// ProviderSummary represents one provider in the quota contract.
 type ProviderSummary struct {
 	ID       string                 `json:"id"`
 	Name     string                 `json:"name"`
@@ -68,7 +68,7 @@ type NextReset struct {
 	ResetAt  string `json:"reset_at"`
 }
 
-// DashboardSummary represents the top-level summary in the quota.fjkl.cc contract.
+// DashboardSummary represents the top-level summary in the quota contract.
 type DashboardSummary struct {
 	Total              int        `json:"total"`
 	Ok                 int        `json:"ok"`
@@ -84,7 +84,7 @@ type DashboardSummary struct {
 	LastRefreshError   *string    `json:"last_refresh_error"`
 }
 
-// DashboardResponse represents the complete quota.fjkl.cc schema.
+// DashboardResponse represents the complete quota schema.
 type DashboardResponse struct {
 	Providers []ProviderSummary `json:"providers"`
 	Summary   DashboardSummary  `json:"summary"`
