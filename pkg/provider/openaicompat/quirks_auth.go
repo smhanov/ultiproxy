@@ -29,6 +29,19 @@ const (
 	defaultXAIScope = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write"
 )
 
+// ExpiringTokenSource is the optional surface a token source implements when it
+// can report when its credential expires. The server's proactive refresher
+// probes it every tick to refresh a lane BEFORE its token dies, so an idle lane
+// (no inbound request at all) keeps working the next morning.
+//
+// ExpiresAt must never refresh anything: it is a read-only probe over the
+// credential in hand. The bool is false when the source holds no credential or
+// does not know its expiry (a static key, a non-expiring session).
+type ExpiringTokenSource interface {
+	Token(ctx context.Context) (*llmauth.Token, error)
+	ExpiresAt() (time.Time, bool)
+}
+
 // SupabaseTokenData represents stored Supabase OAuth tokens.
 type SupabaseTokenData struct {
 	AccessToken  string `json:"access_token"`
@@ -131,6 +144,18 @@ func (s *SupabaseTokenSource) saveToFile(td SupabaseTokenData) error {
 		return err
 	}
 	return os.Rename(tmpName, s.tokenFile)
+}
+
+// ExpiresAt implements ExpiringTokenSource: the expiry of the Supabase session
+// in hand, read from the token file at construction and kept current by every
+// refresh. Read-only - no network, no refresh.
+func (s *SupabaseTokenSource) ExpiresAt() (time.Time, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.expiresAt.IsZero() {
+		return time.Time{}, false
+	}
+	return s.expiresAt, true
 }
 
 // Token returns the current access token, refreshing if invalidated or expired.
@@ -268,6 +293,19 @@ func NewOAuthManagerTokenSource(mgr *auth.Manager, clientID string) *OAuthManage
 	}
 }
 
+// ExpiresAt implements ExpiringTokenSource by peeking at the stored credential.
+// Peek never refreshes, so probing an idle lane costs nothing and mints nothing.
+func (s *OAuthManagerTokenSource) ExpiresAt() (time.Time, bool) {
+	if s == nil || s.mgr == nil {
+		return time.Time{}, false
+	}
+	cred, ok := s.mgr.Peek(s.clientID)
+	if !ok || cred.ExpiresAt.IsZero() {
+		return time.Time{}, false
+	}
+	return cred.ExpiresAt, true
+}
+
 // Token returns a valid token from auth.Manager.
 func (s *OAuthManagerTokenSource) Token(ctx context.Context) (*llmauth.Token, error) {
 	if s.mgr == nil {
@@ -300,3 +338,8 @@ func (s *OAuthManagerTokenSource) Invalidate(accessToken string) {
 }
 
 var _ llmauth.InvalidatableTokenSource = (*OAuthManagerTokenSource)(nil)
+
+var (
+	_ ExpiringTokenSource = (*SupabaseTokenSource)(nil)
+	_ ExpiringTokenSource = (*OAuthManagerTokenSource)(nil)
+)

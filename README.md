@@ -143,6 +143,20 @@ For OAuth lanes, drive the flow instead of pasting keys:
 {"name":"check_oauth_login","arguments":{"provider":"xai"}}
 ```
 
+An OAuth lane must be **added with `auth_via_oauth_manager`** so its stored credential (refresh token included) actually drives the lane. Static `api_key` lanes never refresh, which is how a lane dies overnight:
+
+```bash
+curl -s http://localhost:9050/mcp -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":5,"method":"tools/call",
+  "params":{"name":"add_provider","arguments":{
+    "name":"xai","kind":"openaicompat","base_url":"https://api.x.ai","api_key":"",
+    "quirks":{"auth_via_oauth_manager":true}
+  }}}
+'
+```
+
+Re-adding a lane this way reuses the credential file already in the daemon's data dir (`<data_dir>/credentials/<lane>/`); only a dead refresh token needs another `initiate_oauth_login`.
+
 ### 4. Map client-visible model names
 
 ```bash
@@ -186,7 +200,7 @@ Everything below is available on `tools/list` at `http://localhost:9050/mcp`, wi
 | `get_provider_timeouts` | Per-lane timeout durations in force. |
 | `set_provider_timeout` | Configure a lane timeout (Go duration string: `10m`, `3m30s`, ...); persists in `timeouts.json`. |
 | `remove_provider_timeout` | Reset a lane to the server default timeout (120s). |
-| `add_provider` | Register a lane at runtime -- OpenAI-compatible (`name`, `base_url`, optional `api_key`, quirks) or custom-wire kinds (`antigravity`, `anthropic`, `codex`, `freebuff`); persists in `providers.json`. The reply reports how many upstream models the lane serves ("discovered N models") -- discovery already ran. |
+| `add_provider` | Register a lane at runtime -- OpenAI-compatible (`name`, `base_url`, optional `api_key`, quirks) or custom-wire kinds (`antigravity`, `anthropic`, `codex`, `freebuff`); persists in `providers.json`. OAuth lanes (e.g. `xai`) must be added with `quirks: {"auth_via_oauth_manager": true}` and an empty `api_key` so the stored credential drives the lane. The reply reports how many upstream models the lane serves ("discovered N models") -- discovery already ran. |
 | `remove_provider` | Unregister a lane from the registry and from `providers.json`. |
 | `list_providers` | Runtime-registered and compiled/in-memory lanes, secrets redacted. |
 | `refresh_models` | Re-fetch `GET <base>/v1/models` and cache it so `<lane>/<model>` ids appear in `/v1/models`. Manual override -- discovery also runs at registration, at startup for lanes whose cache is empty, and every 6h afterwards. |
@@ -327,6 +341,7 @@ Any other OpenAI-compatible upstream (OpenRouter-style gateways, llama.cpp, TGI,
 - **Per-API-Key Accounting**: track token usage by agent, workload or team member via `get_client_usage` and `GET /api/stats/summary`.
 - **State Belongs to the Daemon**: runtime changes made over MCP are persisted atomically under the data dir (`providers.json`, `aliases.json`, `timeouts.json`) and restored on the next start -- no restart ritual, no drift between what you asked for and what runs.
 - **System Hardening**: the systemd user service (`dist/ultiproxy.service`) enforces strict process boundaries (`ProtectSystem=strict`, `NoNewPrivileges=true`, isolated `StateDirectory=ultiproxy`).
+- **Automatic Token Refresh**: OAuth credentials never hard-expire. A background refresher walks every lane every 5 minutes and refreshes any credential with less than 10 minutes of life left -- no inbound request needed, so an idle lane still works the next morning. If the upstream rejects a credential anyway (401/403 `bad-credentials`), the lane invalidates it, mints a fresh one and retries exactly once, before the first byte of a response or stream; a second consecutive rejection is returned to the client honestly. Refresh log lines carry the lane name and the new expiry, never a token.
 - **Honest Routing**: an unknown model is a 404 `unknown_model`, never a silent detour to another vendor; tools against a lane without tool support is a 409 `model_does_not_support_tools`. Failover happens only before the first byte.
 
 ---

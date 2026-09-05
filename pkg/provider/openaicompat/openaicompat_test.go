@@ -1,18 +1,22 @@
 package openaicompat
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1524,5 +1528,458 @@ func TestOpenAICompat_VersionedBaseURLKeepsVersionSegment(t *testing.T) {
 					gotPath, tt.wantPath, tt.baseURL)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Reactive automatic token refresh (T029 AC2)
+// ---------------------------------------------------------------------------
+
+// scriptedAuthUpstream is a fake OpenAI-compatible upstream whose chat
+// endpoint answers from a script of status codes (consumed in order, the last
+// one repeating). It records the Authorization header of every chat request so
+// tests can prove both HOW MANY upstream requests a rejected credential costs
+// and WHICH credential each one carried.
+type scriptedAuthUpstream struct {
+	srv *httptest.Server
+
+	mu       sync.Mutex
+	statuses []int
+	calls    int
+	auths    []string
+}
+
+// xaiBadCredentialsBody is the live failure that motivated this task: xai
+// answers a dead OAuth access token with 403 + this body.
+const xaiBadCredentialsBody = `{"code":"unauthenticated:bad-credentials","error":"The OAuth2 access token could not be validated."}`
+
+func newScriptedAuthUpstream(t *testing.T, statuses ...int) *scriptedAuthUpstream {
+	t.Helper()
+	u := &scriptedAuthUpstream{statuses: statuses}
+	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.NotFound(w, r)
+			return
+		}
+		u.mu.Lock()
+		idx := u.calls
+		if idx >= len(u.statuses) {
+			idx = len(u.statuses) - 1
+		}
+		status := u.statuses[idx]
+		u.calls++
+		u.auths = append(u.auths, r.Header.Get("Authorization"))
+		u.mu.Unlock()
+
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(xaiBadCredentialsBody))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "cmpl-refresh-1",
+			"choices": []map[string]any{
+				{
+					"index":         0,
+					"message":       map[string]any{"role": "assistant", "content": "refreshed answer"},
+					"finish_reason": "stop",
+				},
+			},
+			"usage": map[string]any{"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+		})
+	}))
+	t.Cleanup(u.srv.Close)
+	return u
+}
+
+func (u *scriptedAuthUpstream) URL() string { return u.srv.URL }
+
+func (u *scriptedAuthUpstream) setStatuses(statuses ...int) {
+	u.mu.Lock()
+	u.statuses = statuses
+	u.mu.Unlock()
+}
+
+func (u *scriptedAuthUpstream) chatCalls() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.calls
+}
+
+func (u *scriptedAuthUpstream) authHeader(i int) string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if i < 0 || i >= len(u.auths) {
+		return ""
+	}
+	return u.auths[i]
+}
+
+// newRefreshTestProvider builds a lane whose credential lives in a real
+// auth.Manager over a temp dir, with a refresher that mints a distinct access
+// token per refresh, so a retry with a FRESH credential is distinguishable from
+// a retry that replayed the rejected one.
+func newRefreshTestProvider(t *testing.T, baseURL string, client *http.Client, refreshes *atomic.Int64) *Provider {
+	t.Helper()
+	base := time.Now().UTC()
+	mgr, err := auth.NewManager(t.TempDir(), func(ctx context.Context, cred auth.Credential) (auth.Credential, error) {
+		n := refreshes.Add(1)
+		return auth.Credential{
+			Provider:     "xai",
+			AccessToken:  fmt.Sprintf("token-%d", n),
+			RefreshToken: fmt.Sprintf("rt-%d", n),
+			ExpiresAt:    base.Add(time.Hour),
+			Generation:   cred.Generation + 1,
+			ClientID:     defaultXAIClientID,
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("auth.NewManager: %v", err)
+	}
+	if err := mgr.Store(context.Background(), defaultXAIClientID, auth.Credential{
+		Provider:    "xai",
+		AccessToken: "token-0",
+		ExpiresAt:   base.Add(time.Hour), // still valid: only a 401/403 may force a refresh
+		Generation:  1,
+		ClientID:    defaultXAIClientID,
+	}); err != nil {
+		t.Fatalf("seed credential: %v", err)
+	}
+
+	p, err := New(Config{
+		Name:        "xai",
+		BaseURL:     baseURL,
+		HTTPClient:  client,
+		DataDir:     t.TempDir(),
+		TokenSource: NewOAuthManagerTokenSource(mgr, defaultXAIClientID),
+		Quirks:      Quirks{AuthViaOAuthManager: true},
+	})
+	if err != nil {
+		t.Fatalf("openaicompat.New: %v", err)
+	}
+	return p
+}
+
+var refreshTestMsgs = []*ir.Message{
+	{Role: "user", Blocks: []ir.Block{ir.TextBlock{Text: "hello"}}},
+}
+
+// AC2 (happy half): ONE upstream 401 must cost exactly one Invalidate + one
+// Token + ONE retry. The client sees the successful response and the upstream
+// saw exactly 2 requests, the second carrying the refreshed credential.
+func TestOpenAICompat_ReactiveRefreshRetriesOnceOn401(t *testing.T) {
+	var refreshes atomic.Int64
+	up := newScriptedAuthUpstream(t, http.StatusUnauthorized, http.StatusOK)
+	p := newRefreshTestProvider(t, up.URL(), up.srv.Client(), &refreshes)
+
+	resp, err := p.Generate(context.Background(), refreshTestMsgs, provider.WithModel("grok-4.6"))
+	if err != nil {
+		t.Fatalf("Generate after a single 401: %v", err)
+	}
+	if got := blockText(t, resp); got != "refreshed answer" {
+		t.Errorf("Generate content = %q, want the retried response", got)
+	}
+	if got := up.chatCalls(); got != 2 {
+		t.Fatalf("upstream chat requests = %d, want exactly 2 (first rejected + one retry)", got)
+	}
+	if got, want := up.authHeader(0), "Bearer token-0"; got != want {
+		t.Errorf("first upstream Authorization = %q, want %q", got, want)
+	}
+	if got, want := up.authHeader(1), "Bearer token-1"; got != want {
+		t.Errorf("retry upstream Authorization = %q, want the refreshed %q", got, want)
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Errorf("credential refreshes = %d, want 1", got)
+	}
+}
+
+// AC2 (xai shape): the live failure is a 403 unauthenticated:bad-credentials,
+// so the retry must cover 403 exactly like 401.
+func TestOpenAICompat_ReactiveRefreshRetriesOnceOn403(t *testing.T) {
+	var refreshes atomic.Int64
+	up := newScriptedAuthUpstream(t, http.StatusForbidden, http.StatusOK)
+	p := newRefreshTestProvider(t, up.URL(), up.srv.Client(), &refreshes)
+
+	if _, err := p.Generate(context.Background(), refreshTestMsgs, provider.WithModel("grok-4.6")); err != nil {
+		t.Fatalf("Generate after a single 403: %v", err)
+	}
+	if got := up.chatCalls(); got != 2 {
+		t.Fatalf("upstream chat requests = %d, want exactly 2", got)
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Errorf("credential refreshes = %d, want 1", got)
+	}
+}
+
+// AC2 (honest failure): a SECOND consecutive auth rejection is returned to the
+// caller verbatim. No third upstream request, no retry loop.
+func TestOpenAICompat_ReactiveRefreshSecondFailureIsHonest(t *testing.T) {
+	var refreshes atomic.Int64
+	up := newScriptedAuthUpstream(t, http.StatusUnauthorized)
+	p := newRefreshTestProvider(t, up.URL(), up.srv.Client(), &refreshes)
+
+	_, err := p.Generate(context.Background(), refreshTestMsgs, provider.WithModel("grok-4.6"))
+	if err == nil {
+		t.Fatal("Generate with a persistently rejected credential returned nil error")
+	}
+	if !strings.Contains(err.Error(), "401") {
+		t.Errorf("error = %v, want the upstream 401 surfaced honestly", err)
+	}
+	if got := up.chatCalls(); got != 2 {
+		t.Fatalf("upstream chat requests = %d, want exactly 2 (initial + one retry), never a third", got)
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Errorf("credential refreshes = %d, want 1", got)
+	}
+}
+
+// AC2 (xai honest failure): the 403 twin of the honest-failure case - two
+// consecutive 403s cost exactly two upstream requests and the second one is
+// returned to the caller, never retried again.
+func TestOpenAICompat_ReactiveRefreshSecond403IsHonest(t *testing.T) {
+	var refreshes atomic.Int64
+	up := newScriptedAuthUpstream(t, http.StatusForbidden)
+	p := newRefreshTestProvider(t, up.URL(), up.srv.Client(), &refreshes)
+
+	_, err := p.Generate(context.Background(), refreshTestMsgs, provider.WithModel("grok-4.6"))
+	if err == nil {
+		t.Fatal("Generate with a persistently 403-ing credential returned nil error")
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("error = %v, want the upstream 403 surfaced honestly", err)
+	}
+	if got := up.chatCalls(); got != 2 {
+		t.Fatalf("upstream chat requests = %d, want exactly 2 (initial + one retry), never a third", got)
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Errorf("credential refreshes = %d, want 1", got)
+	}
+}
+
+// AC2 (stream): the retry also covers streaming, and it sits strictly before
+// the first byte - the client sees one clean stream, the upstream saw exactly
+// two chat requests.
+func TestOpenAICompat_ReactiveRefreshRetriesStreamBeforeFirstByte(t *testing.T) {
+	var refreshes atomic.Int64
+	up := newSSEAuthUpstream(t, http.StatusUnauthorized, http.StatusOK)
+	p := newRefreshTestProvider(t, up.URL(), up.srv.Client(), &refreshes)
+
+	ch, err := p.Stream(context.Background(), refreshTestMsgs, provider.WithModel("grok-4.6"))
+	if err != nil {
+		t.Fatalf("Stream after a single 401: %v", err)
+	}
+	var text strings.Builder
+	for ev := range ch {
+		if d, ok := ev.(ir.EventTextDelta); ok {
+			text.WriteString(d.Text)
+		}
+		if e, ok := ev.(ir.EventUpstreamError); ok {
+			t.Fatalf("stream surfaced an upstream error: %s", e.Message)
+		}
+	}
+	if text.String() != "streamed answer" {
+		t.Errorf("streamed text = %q, want %q", text.String(), "streamed answer")
+	}
+	if got := up.chatCalls(); got != 2 {
+		t.Fatalf("upstream chat requests = %d, want exactly 2", got)
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Errorf("credential refreshes = %d, want 1", got)
+	}
+}
+
+// AC2 (stream boundary): once a stream has produced its first byte there is no
+// retry at all - the failure is surfaced, and the upstream never sees a second
+// dial for that request.
+func TestOpenAICompat_ReactiveRefreshNeverAfterFirstStreamByte(t *testing.T) {
+	var refreshes atomic.Int64
+	up := newBrokenSSEUpstream(t)
+	p := newRefreshTestProvider(t, up.URL(), up.srv.Client(), &refreshes)
+
+	ch, err := p.Stream(context.Background(), refreshTestMsgs, provider.WithModel("grok-4.6"))
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	var (
+		sawDelta bool
+		sawError bool
+	)
+	for ev := range ch {
+		if _, ok := ev.(ir.EventTextDelta); ok {
+			sawDelta = true
+		}
+		if _, ok := ev.(ir.EventUpstreamError); ok {
+			sawError = true
+		}
+	}
+	if !sawDelta {
+		t.Error("expected at least one text delta before the stream broke")
+	}
+	if !sawError {
+		t.Error("expected the mid-stream failure to surface as an upstream error event")
+	}
+	if got := up.chatCalls(); got != 1 {
+		t.Fatalf("upstream chat requests = %d, want exactly 1: no retry after the first byte", got)
+	}
+	if got := refreshes.Load(); got != 0 {
+		t.Errorf("credential refreshes = %d, want 0: a mid-stream break is not an auth failure", got)
+	}
+}
+
+// sseAuthUpstream: the scripted-status fake, but a 200 answers with a complete
+// SSE chat-completion stream.
+type sseAuthUpstream struct {
+	srv *httptest.Server
+
+	mu       sync.Mutex
+	statuses []int
+	calls    int
+	auths    []string
+}
+
+func newSSEAuthUpstream(t *testing.T, statuses ...int) *sseAuthUpstream {
+	t.Helper()
+	u := &sseAuthUpstream{statuses: statuses}
+	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.NotFound(w, r)
+			return
+		}
+		u.mu.Lock()
+		idx := u.calls
+		if idx >= len(u.statuses) {
+			idx = len(u.statuses) - 1
+		}
+		status := u.statuses[idx]
+		u.calls++
+		u.auths = append(u.auths, r.Header.Get("Authorization"))
+		u.mu.Unlock()
+
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(xaiBadCredentialsBody))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"cmpl-sse-1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"streamed answer\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"cmpl-sse-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(u.srv.Close)
+	return u
+}
+
+func (u *sseAuthUpstream) URL() string { return u.srv.URL }
+
+func (u *sseAuthUpstream) chatCalls() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.calls
+}
+
+// newBrokenSSEUpstream answers 200, emits ONE text delta and then aborts the
+// connection: a failure that happens after the first byte of a stream.
+func newBrokenSSEUpstream(t *testing.T) *sseAuthUpstream {
+	t.Helper()
+	u := &sseAuthUpstream{statuses: []int{http.StatusOK}}
+	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.NotFound(w, r)
+			return
+		}
+		u.mu.Lock()
+		u.calls++
+		u.mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"cmpl-broken-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(u.srv.Close)
+	return u
+}
+
+func blockText(t *testing.T, resp *ir.Response) string {
+	t.Helper()
+	if resp == nil || resp.Message == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, b := range resp.Message.Blocks {
+		if tb, ok := b.(ir.TextBlock); ok {
+			sb.WriteString(tb.Text)
+		}
+	}
+	return sb.String()
+}
+
+// syncLogBuffer is a mutex-guarded log sink, so a test can read what was logged
+// while other goroutines may still be writing.
+type syncLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// AC3: the reactive refresh log line carries the lane and the new expiry only.
+// Everything logged while a rejected credential is refreshed is grepped for
+// token-shaped strings - the in-play secrets and generic secret shapes.
+func TestOpenAICompat_ReactiveRefreshLogsNoSecrets(t *testing.T) {
+	var refreshes atomic.Int64
+	up := newScriptedAuthUpstream(t, http.StatusUnauthorized, http.StatusOK)
+	p := newRefreshTestProvider(t, up.URL(), up.srv.Client(), &refreshes)
+
+	var buf syncLogBuffer
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(os.Stderr)
+		log.SetFlags(log.LstdFlags)
+	}()
+
+	if _, err := p.Generate(context.Background(), refreshTestMsgs, provider.WithModel("grok-4.6")); err != nil {
+		t.Fatalf("Generate after a single 401: %v", err)
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Fatalf("credential refreshes = %d, want 1", got)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "credential refreshed") {
+		t.Fatalf("no refresh log line was written; log was:\n%s", logged)
+	}
+	for _, line := range strings.Split(logged, "\n") {
+		if !strings.Contains(line, "refresh") {
+			continue
+		}
+		for _, secret := range []string{"token-0", "token-1", "rt-0", "rt-1"} {
+			if strings.Contains(line, secret) {
+				t.Errorf("reactive refresh leak: line %q contains the in-play secret %q", line, secret)
+			}
+		}
+		for _, shape := range []*regexp.Regexp{
+			regexp.MustCompile(`eyJ[A-Za-z0-9_-]{8,}`),
+			regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{8,}`),
+			regexp.MustCompile(`[0-9a-f]{32,}`),
+			regexp.MustCompile(`[A-Za-z0-9+/]{40,}={0,2}`),
+		} {
+			if shape.MatchString(line) {
+				t.Errorf("reactive refresh leak: line %q matches token shape %v", line, shape)
+			}
+		}
 	}
 }

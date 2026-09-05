@@ -5,16 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/smhanov/llmhub"
+	llmauth "github.com/smhanov/llmhub/auth"
 	hubopenai "github.com/smhanov/llmhub/providers/openai"
 	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/ir"
@@ -141,7 +145,16 @@ func New(cfg Config) (*Provider, error) {
 		hubOpts = append(hubOpts, llmhub.WithBaseURL(cfg.BaseURL))
 	}
 	if cfg.TokenSource != nil {
-		hubOpts = append(hubOpts, llmhub.WithTokenSource(cfg.TokenSource))
+		// The lane's token source is handed to llmhub WITHOUT its Invalidate
+		// method. llmhub's own OpenAI client retries a 401 by itself when the
+		// source implements auth.InvalidatableTokenSource, which would stack a
+		// second retry on top of the one this package owns below: a rejected
+		// credential would then cost up to four upstream requests and a
+		// persistent failure would be retried twice. Ultiproxy keeps the whole
+		// refresh-and-retry policy in this package (ONE retry, covering 401 AND
+		// 403, and never after the first byte of a stream), so the narrowing
+		// adapter below is deliberately NOT an invalidator.
+		hubOpts = append(hubOpts, llmhub.WithTokenSource(hubTokenSource{inner: cfg.TokenSource}))
 	}
 
 	// ALWAYS build the underlying llmhub provider using the openai client, NEVER vendor providers
@@ -594,6 +607,102 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 	return ctx, msgs, opts, nil
 }
 
+// hubTokenSource narrows a lane token source down to plain Token() for the
+// llmhub client (see the wiring comment in New). Refreshes still flow through
+// the very same source - Provider.Token, Provider.Refresh and the reactive
+// retry below all hold the original, invalidatable one.
+type hubTokenSource struct {
+	inner interface {
+		Token(ctx context.Context) (*llmauth.Token, error)
+	}
+}
+
+// Token implements llmhub's auth.TokenSource.
+func (h hubTokenSource) Token(ctx context.Context) (*llmauth.Token, error) {
+	return h.inner.Token(ctx)
+}
+
+// upstreamStatusRe matches the status-bearing errors llmhub's OpenAI-compatible
+// client returns ("<provider>: http <code>: <body>"). The status is the FIRST
+// such segment, so a request body that happens to quote another status cannot
+// be mistaken for the response status.
+var upstreamStatusRe = regexp.MustCompile(`: http (\d{3}):`)
+
+// upstreamStatus extracts the upstream HTTP status code from an llmhub request
+// error, or 0 when the error is not a status error.
+func upstreamStatus(err error) int {
+	if err == nil {
+		return 0
+	}
+	m := upstreamStatusRe.FindStringSubmatch(err.Error())
+	if m == nil {
+		return 0
+	}
+	code, convErr := strconv.Atoi(m[1])
+	if convErr != nil {
+		return 0
+	}
+	return code
+}
+
+// isCredentialRejection reports whether err is an upstream "your credential is
+// bad" answer: 401 always, and 403 with it because that is exactly how xai
+// reports a dead OAuth access token (403 unauthenticated:bad-credentials).
+// A non-credential 403 (model access, quota) costs at most one extra attempt
+// before the error is returned honestly, so the classification stays simple.
+func isCredentialRejection(err error) bool {
+	switch upstreamStatus(err) {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return true
+	default:
+		return false
+	}
+}
+
+// retryWithFreshCredential implements the reactive half of automatic token
+// refresh: Invalidate the credential the upstream just rejected, mint a fresh
+// one, and report whether the caller should send the request again.
+//
+// It is called strictly BEFORE the first byte of a response or stream reaches
+// the client, the same boundary hublane failover honours. A lane without a
+// token source (static api_key) has nothing to refresh and never retries; a
+// refresh that fails leaves the original error for the caller.
+func (p *Provider) retryWithFreshCredential(ctx context.Context, err error) bool {
+	if p.cfg.TokenSource == nil || !isCredentialRejection(err) {
+		return false
+	}
+
+	if inv, ok := p.cfg.TokenSource.(interface{ Invalidate(string) }); ok {
+		inv.Invalidate("")
+	}
+	if _, refreshErr := p.cfg.TokenSource.Token(ctx); refreshErr != nil {
+		log.Printf("[auth] reactive credential refresh failed lane=%s: %v", p.name, refreshErr)
+		return false
+	}
+	if exp, ok := p.TokenExpiresAt(); ok {
+		// Lane + new expiry only: never the token itself.
+		log.Printf("[auth] credential refreshed lane=%s reason=upstream_rejection new_expiry=%s", p.name, exp.UTC().Format(time.RFC3339))
+		return true
+	}
+	log.Printf("[auth] credential refreshed lane=%s reason=upstream_rejection", p.name)
+	return true
+}
+
+// TokenExpiresAt reports when this lane's credential expires, so the server's
+// proactive refresher can refresh it before it dies. The bool is false for
+// lanes that hold no expiring credential (a static api_key, or a token source
+// without an expiry surface).
+func (p *Provider) TokenExpiresAt() (time.Time, bool) {
+	if p == nil || p.cfg.TokenSource == nil {
+		return time.Time{}, false
+	}
+	expiring, ok := p.cfg.TokenSource.(ExpiringTokenSource)
+	if !ok {
+		return time.Time{}, false
+	}
+	return expiring.ExpiresAt()
+}
+
 // Generate implements provider.InferenceProvider.
 func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (*ir.Response, error) {
 	if actor := p.freebuffActor(); actor != nil {
@@ -611,7 +720,15 @@ func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...pro
 
 	resp, err := p.adapter.Generate(ctx, msgs, opts...)
 	if err != nil {
-		return nil, err
+		// Reactive refresh: one retry with a fresh credential when the
+		// upstream rejected the one this request carried. A second consecutive
+		// rejection falls through and is returned to the caller honestly.
+		if p.retryWithFreshCredential(ctx, err) {
+			resp, err = p.adapter.Generate(ctx, msgs, opts...)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return filterReasoningResponse(resp, p.cfg.Quirks.EchoReasoning), nil
@@ -637,10 +754,18 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 
 	inCh, err := p.adapter.Stream(ctx, msgs, opts...)
 	if err != nil {
-		if actor != nil {
-			actor.Release()
+		// Reactive refresh at the same pre-first-byte boundary as Generate.
+		// Once a stream has produced its first byte there is no retry at all:
+		// the failure surfaces as an event on the channel instead.
+		if p.retryWithFreshCredential(ctx, err) {
+			inCh, err = p.adapter.Stream(ctx, msgs, opts...)
 		}
-		return nil, err
+		if err != nil {
+			if actor != nil {
+				actor.Release()
+			}
+			return nil, err
+		}
 	}
 
 	ch := inCh

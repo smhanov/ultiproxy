@@ -220,6 +220,36 @@ func (m *Manager) revokedKey(key string) bool {
 	return ok
 }
 
+// Peek returns the credential currently held for key WITHOUT refreshing it.
+//
+// It is the read the proactive refresher uses to decide whether a lane is about
+// to expire: probing must never mint a token on its own (that is Get's job, and
+// Get's alone), so a lane nobody is calling stays untouched until the refresher
+// decides to act. The cached copy is preferred; a cold manager loads the
+// persisted file, exactly like Get's first read. The second return is false
+// when no credential is stored for key at all.
+func (m *Manager) Peek(key string) (Credential, bool) {
+	if m == nil {
+		return Credential{}, false
+	}
+
+	m.mu.RLock()
+	cred, ok := m.cache[key]
+	m.mu.RUnlock()
+	if ok {
+		return cred, true
+	}
+
+	cred, err := m.LoadFromDisk(key)
+	if err != nil {
+		return Credential{}, false
+	}
+	m.mu.Lock()
+	m.cache[key] = cred
+	m.mu.Unlock()
+	return cred, true
+}
+
 // Get returns a valid token, refreshing if within 5 minutes of expiry.
 // A credential invalidated through Invalidate is refreshed on the next Get even
 // when it is still well within its expiry window.

@@ -54,6 +54,21 @@ type Server struct {
 	newModelTicker func(d time.Duration) modelTicker
 	// discoveryCancel stops the background model-discovery loop (Shutdown).
 	discoveryCancel context.CancelFunc
+	// credentialRefreshInterval is the proactive credential-refresher cadence.
+	// -1 (NewServer's default) means DefaultCredentialRefreshInterval; 0
+	// disables the schedule (credentials are then refreshed lazily on request
+	// and reactively after an upstream 401/403).
+	credentialRefreshInterval time.Duration
+	// newCredentialTicker builds the credential-refresh ticker. It is nil in
+	// production (a real *time.Ticker) and replaced by the test hook so the
+	// schedule can be driven with a fake clock.
+	newCredentialTicker func(d time.Duration) modelTicker
+	// credentialNow is the clock the refresh lead window is measured on. nil in
+	// production (time.Now), replaced by the test hook.
+	credentialNow func() time.Time
+	// credentialRefreshCancel stops the background credential refresher
+	// (Shutdown).
+	credentialRefreshCancel context.CancelFunc
 	// requestIDSeq allocates the request ids that tie the request, attempt and
 	// usage telemetry rows of one dispatch together. See nextRequestID.
 	requestIDSeq atomic.Int64
@@ -138,6 +153,8 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		// -1 means "no explicit interval": startModelDiscovery then uses
 		// DefaultModelRefreshInterval. (0 is a valid, explicit "disabled".)
 		modelRefreshInterval: -1,
+		// Same convention for the credential refresher.
+		credentialRefreshInterval: -1,
 	}
 	s.requestIDSeq.Store(time.Now().UnixNano())
 
@@ -220,6 +237,11 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 	// Auth middleware
 	s.auth = NewAuthMiddleware(cfg.Server.APIKey, cfg.Server.ClientKeys)
 
+	// Proactive credential refresh: keep OAuth lanes alive while they sit idle.
+	// Started before the discovery loop so lane credentials are healthy before
+	// anything dials an upstream to enumerate models.
+	s.startCredentialRefresh()
+
 	// Background model discovery: backfill lanes whose cache is still empty
 	// after Restore, then refresh every discovery lane on a schedule. Never
 	// blocks startup and never touches the request path (/v1/models keeps
@@ -270,12 +292,16 @@ func (s *Server) Start() error {
 	return s.httpServer.ListenAndServe()
 }
 
-// Shutdown gracefully stops the HTTP server and the background model-discovery
-// loop. In-flight discovery calls are cancelled through their per-call budget
-// context; the loop is not waited on, so a slow upstream cannot delay shutdown.
+// Shutdown gracefully stops the HTTP server, the background model-discovery
+// loop and the proactive credential refresher. In-flight discovery and refresh
+// calls are cancelled through their per-call budget contexts; the loops are not
+// waited on, so a slow upstream cannot delay shutdown.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.discoveryCancel != nil {
 		s.discoveryCancel()
+	}
+	if s.credentialRefreshCancel != nil {
+		s.credentialRefreshCancel()
 	}
 	if s.httpServer != nil {
 		return s.httpServer.Shutdown(ctx)

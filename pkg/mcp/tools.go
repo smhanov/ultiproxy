@@ -103,7 +103,9 @@ Returns immediately with:
 - user_code: for device flows, the code the user must confirm on that page
 - expires_in_seconds: how long the flow stays valid
 
-Then finish it: for device flows poll check_oauth_login until it reports "completed"; for auth-code flows take the authorization code from the redirect/callback URL and pass it to submit_oauth_code. Lanes that only implement the legacy blocking flow run it inline and answer "initiated". Tokens are written to the daemon's credential store for that lane and are never returned to clients.`,
+Then finish it: for device flows poll check_oauth_login until it reports "completed"; for auth-code flows take the authorization code from the redirect/callback URL and pass it to submit_oauth_code. Lanes that only implement the legacy blocking flow run it inline and answer "initiated". Tokens are written to the daemon's credential store for that lane and are never returned to clients.
+
+Stored credentials refresh themselves afterwards: a background refresher renews any lane credential with under 10 minutes of life left every 5 minutes (no request needed), and an upstream 401/403 triggers one invalidate-refresh-retry before the first byte of a response or stream. OpenAI-compatible OAuth lanes must be added with quirks.auth_via_oauth_manager for any of that to apply.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
@@ -250,7 +252,7 @@ Parameters:
   - max_tokens_by_model: map of upstream model id -> max_tokens that upstream accepts, e.g. {"glm-4.6":8192}
   - echo_reasoning: repeat reasoning tokens as visible content (upstreams that hide them)
   - model_list_passthrough: model discovery (GET <base>/v1/models so "<name>/<model>" ids show up on /v1/models). ON by default for OpenAI-compatible lanes; set it to false to opt out. Discovery runs when the lane is registered, again at daemon startup when a lane cache is still empty, and every 6h afterwards
-  - auth_via_oauth_manager: authenticate with the lane's stored OAuth credential (xai-style) instead of a static key
+  - auth_via_oauth_manager: authenticate with the lane's stored OAuth credential (xai-style) instead of a static key. REQUIRED for OAuth subscription lanes: add the lane with an empty api_key and this quirk, otherwise it carries a static key and nothing can refresh it. Lanes added this way are refreshed automatically - proactively every 5 minutes when the credential has under 10 minutes of life left, and reactively (one retry) when the upstream answers 401/403 bad-credentials
   - credits_quota_observer: upstream credits endpoint to poll so get_quota_status has something to report (e.g. the xai billing URL)
   - auth_via_supabase_refresh: refresh credentials through a Supabase session
   - freebuff_actor: mark the lane as a Codebuff/freebuff lane (serialized requests, session affinity, actor-backed quota); the real actor is rebuilt from the lane's api_key / stored state token
@@ -269,7 +271,7 @@ Examples: a local vLLM lane {"name":"vllm","base_url":"http://127.0.0.1:8000/v1"
 					Type: "object",
 					Description: `Vendor quirks, OpenAI-compatible lanes only: {coding_plan_path, max_tokens_by_model, echo_reasoning, model_list_passthrough, auth_via_oauth_manager, credits_quota_observer, auth_via_supabase_refresh, freebuff_actor, freebuff_default_tool, default_model}.
 
-coding_plan_path (bool): route through a coding-plan path (zai-style coding subscriptions). max_tokens_by_model (object): upstream model id -> max_tokens cap the upstream accepts. echo_reasoning (bool): repeat reasoning tokens as visible content. model_list_passthrough (bool): discover GET <base>/v1/models so <lane>/<model> ids appear on /v1/models. auth_via_oauth_manager (bool): use the lane's stored OAuth credential instead of a static key. credits_quota_observer (string): upstream credits endpoint polled for quota. auth_via_supabase_refresh (bool): refresh credentials through a Supabase session. freebuff_actor (bool): mark a Codebuff/freebuff lane - serialized requests, session affinity, actor-backed quota rebuilt from the lane's api_key / state token. freebuff_default_tool (bool): force the default tool behaviour on freebuff chats. default_model (string): upstream model id used when a request carries no model.`,
+coding_plan_path (bool): route through a coding-plan path (zai-style coding subscriptions). max_tokens_by_model (object): upstream model id -> max_tokens cap the upstream accepts. echo_reasoning (bool): repeat reasoning tokens as visible content. model_list_passthrough (bool): discover GET <base>/v1/models so <lane>/<model> ids appear on /v1/models. auth_via_oauth_manager (bool): use the lane's stored OAuth credential instead of a static key; required for OAuth lanes (empty api_key) and the switch that turns automatic refresh on - proactive every 5 minutes under 10 minutes of remaining life, plus one retry after an upstream 401/403. credits_quota_observer (string): upstream credits endpoint polled for quota. auth_via_supabase_refresh (bool): refresh credentials through a Supabase session. freebuff_actor (bool): mark a Codebuff/freebuff lane - serialized requests, session affinity, actor-backed quota rebuilt from the lane's api_key / state token. freebuff_default_tool (bool): force the default tool behaviour on freebuff chats. default_model (string): upstream model id used when a request carries no model.`,
 				},
 			},
 			// base_url is validated per kind by the tool itself: custom kinds

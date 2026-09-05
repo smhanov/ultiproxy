@@ -2,7 +2,10 @@ package openaicompat
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -154,5 +157,123 @@ func TestOAuthManagerTokenSource_InvalidateStaleTokenKeepsCurrent(t *testing.T) 
 	}
 	if got := refreshes.Load(); got != 0 {
 		t.Errorf("refresher calls = %d, want 0", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Proactive refresh probe (T029 AC1)
+// ---------------------------------------------------------------------------
+
+// AC1 support: a token source that can report its expiry lets the server's
+// background refresher decide WITHOUT a request whether a lane is about to
+// die. The probe must not itself refresh anything.
+func TestOAuthManagerTokenSource_ExpiresAt(t *testing.T) {
+	var refreshes atomic.Int64
+	mgr := newCountingRefresherManager(t, &refreshes)
+
+	expiry := time.Now().UTC().Add(time.Minute).Truncate(time.Second)
+	if err := mgr.Store(context.Background(), defaultXAIClientID, auth.Credential{
+		Provider:    "xai",
+		AccessToken: "token-0",
+		ExpiresAt:   expiry,
+		Generation:  1,
+		ClientID:    defaultXAIClientID,
+	}); err != nil {
+		t.Fatalf("store seed credential: %v", err)
+	}
+
+	src := NewOAuthManagerTokenSource(mgr, defaultXAIClientID)
+	got, ok := src.ExpiresAt()
+	if !ok {
+		t.Fatal("ExpiresAt() ok = false, want true for a stored credential")
+	}
+	if !got.Equal(expiry) {
+		t.Errorf("ExpiresAt() = %v, want the stored %v", got, expiry)
+	}
+	if got := refreshes.Load(); got != 0 {
+		t.Errorf("refresher calls after ExpiresAt = %d, want 0: the probe must not refresh", got)
+	}
+}
+
+// A lane with no stored credential has nothing to refresh proactively.
+func TestOAuthManagerTokenSource_ExpiresAtNoCredential(t *testing.T) {
+	var refreshes atomic.Int64
+	mgr := newCountingRefresherManager(t, &refreshes)
+	src := NewOAuthManagerTokenSource(mgr, defaultXAIClientID)
+
+	if _, ok := src.ExpiresAt(); ok {
+		t.Error("ExpiresAt() ok = true for a lane with no stored credential, want false")
+	}
+}
+
+// Provider.TokenExpiresAt delegates to the lane's token source and reports
+// "unknown" for lanes that authenticate with a static key.
+func TestProvider_TokenExpiresAt(t *testing.T) {
+	var refreshes atomic.Int64
+	mgr := newCountingRefresherManager(t, &refreshes)
+	expiry := time.Now().UTC().Add(7 * time.Minute).Truncate(time.Second)
+	if err := mgr.Store(context.Background(), defaultXAIClientID, auth.Credential{
+		Provider:    "xai",
+		AccessToken: "token-0",
+		ExpiresAt:   expiry,
+		Generation:  1,
+		ClientID:    defaultXAIClientID,
+	}); err != nil {
+		t.Fatalf("store seed credential: %v", err)
+	}
+
+	p, err := New(Config{
+		Name:                       "xai",
+		BaseURL:                    "http://127.0.0.1:1",
+		TokenSource:                NewOAuthManagerTokenSource(mgr, defaultXAIClientID),
+		OptOutModelListPassthrough: true,
+		Quirks:                     Quirks{AuthViaOAuthManager: true},
+	})
+	if err != nil {
+		t.Fatalf("openaicompat.New: %v", err)
+	}
+	got, ok := p.TokenExpiresAt()
+	if !ok {
+		t.Fatal("TokenExpiresAt() ok = false, want true for an OAuth lane")
+	}
+	if !got.Equal(expiry) {
+		t.Errorf("TokenExpiresAt() = %v, want %v", got, expiry)
+	}
+
+	static, err := New(Config{Name: "plain", BaseURL: "http://127.0.0.1:1", APIKey: "sk-x", OptOutModelListPassthrough: true})
+	if err != nil {
+		t.Fatalf("openaicompat.New(static): %v", err)
+	}
+	if _, ok := static.TokenExpiresAt(); ok {
+		t.Error("TokenExpiresAt() ok = true for a static-key lane, want false")
+	}
+}
+
+// SupabaseTokenSource reports the expiry loaded from its token file.
+func TestSupabaseTokenSource_ExpiresAt(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "augure-auth.json")
+	expiry := time.Now().UTC().Add(2 * time.Minute).Truncate(time.Second)
+	data, _ := json.Marshal(SupabaseTokenData{
+		AccessToken:  "supabase-access",
+		RefreshToken: "supabase-refresh",
+		ExpiresAt:    expiry.Unix(),
+	})
+	if err := os.WriteFile(tokenFile, data, 0600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	src := NewSupabaseTokenSource(nil, "http://127.0.0.1:1/auth/v1/token", tokenFile, "", "")
+	got, ok := src.ExpiresAt()
+	if !ok {
+		t.Fatal("ExpiresAt() ok = false, want true for a stored Supabase token")
+	}
+	if got.Unix() != expiry.Unix() {
+		t.Errorf("ExpiresAt() = %v, want the stored %v", got, expiry)
+	}
+
+	empty := NewSupabaseTokenSource(nil, "http://127.0.0.1:1/auth/v1/token", "", "", "")
+	if _, ok := empty.ExpiresAt(); ok {
+		t.Error("ExpiresAt() ok = true with no token file, want false")
 	}
 }
