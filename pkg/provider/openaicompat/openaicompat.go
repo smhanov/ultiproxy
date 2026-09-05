@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -223,28 +224,72 @@ func (p *Provider) resolveModel(requested string) string {
 	return ""
 }
 
+// resolveMaxTokens returns the max_tokens value to send upstream.
+//
+// max_tokens_by_model is a CEILING the upstream accepts, not a default: a
+// client value above the matched limit is clamped down to it, a client value
+// at or below the limit passes through untouched, and an omitted value falls
+// back to the limit itself.
+//
+// Pattern matching is deterministic and never depends on Go map iteration
+// order:
+//
+//  1. an exact model id match wins;
+//  2. otherwise the longest pattern the model id contains wins (so "glm-5.3"
+//     beats "glm" for "glm-5.3-flash");
+//  3. equal-length patterns are broken lexicographically (ascending).
 func (p *Provider) resolveMaxTokens(model string, requested int) int {
-	if requested > 0 {
-		return requested
+	if ceiling := p.matchMaxTokensPattern(model); ceiling > 0 {
+		return clampMaxTokens(requested, ceiling)
 	}
-	if p.cfg.Quirks.CodingPlanPath || len(p.cfg.Quirks.MaxTokensByModel) > 0 {
-		if len(p.cfg.Quirks.MaxTokensByModel) > 0 {
-			for pattern, maxTok := range p.cfg.Quirks.MaxTokensByModel {
-				if strings.Contains(model, pattern) || model == pattern {
-					return maxTok
-				}
-			}
-			if p.cfg.Quirks.CodingPlanPath {
-				return 131072
-			}
-		} else if p.cfg.Quirks.CodingPlanPath {
-			if strings.Contains(model, "4.5-air") {
-				return 98304
-			}
-			return 131072
+	if p.cfg.Quirks.CodingPlanPath {
+		// Legacy zai coding-plan defaults when no pattern table is set.
+		if len(p.cfg.Quirks.MaxTokensByModel) == 0 && strings.Contains(model, "4.5-air") {
+			return clampMaxTokens(requested, 98304)
+		}
+		return clampMaxTokens(requested, 131072)
+	}
+	return requested
+}
+
+// clampMaxTokens applies ceiling as an upper bound: values above it (or unset)
+// become the ceiling, values below it pass through.
+func clampMaxTokens(requested, ceiling int) int {
+	if requested > ceiling {
+		return ceiling
+	}
+	if requested <= 0 {
+		return ceiling
+	}
+	return requested
+}
+
+// matchMaxTokensPattern returns the max_tokens limit configured for model, or
+// 0 when no pattern matches. Candidates are sorted, never read in map order.
+func (p *Provider) matchMaxTokensPattern(model string) int {
+	if len(p.cfg.Quirks.MaxTokensByModel) == 0 || model == "" {
+		return 0
+	}
+	// Exact match first: nothing can outrank the model's own id.
+	if limit, ok := p.cfg.Quirks.MaxTokensByModel[model]; ok {
+		return limit
+	}
+	patterns := make([]string, 0, len(p.cfg.Quirks.MaxTokensByModel))
+	for pattern := range p.cfg.Quirks.MaxTokensByModel {
+		if pattern != "" && strings.Contains(model, pattern) {
+			patterns = append(patterns, pattern)
 		}
 	}
-	return 0
+	if len(patterns) == 0 {
+		return 0
+	}
+	sort.Slice(patterns, func(i, j int) bool {
+		if len(patterns[i]) != len(patterns[j]) {
+			return len(patterns[i]) > len(patterns[j]) // longest first
+		}
+		return patterns[i] < patterns[j] // then lexicographic
+	})
+	return p.cfg.Quirks.MaxTokensByModel[patterns[0]]
 }
 
 // freebuffStatusWaitingRoom is the HTTP status upstream returns when the
@@ -582,7 +627,15 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 					if !ok {
 						return
 					}
-					actorCh <- ev
+					// The send must stay cancellable: a caller that stops
+					// draining the stream (client disconnect, failover) would
+					// otherwise park this goroutine on the channel send and
+					// hold the actor's single-slot lock forever.
+					select {
+					case <-ctx.Done():
+						return
+					case actorCh <- ev:
+					}
 				}
 			}
 		}()

@@ -533,6 +533,27 @@ type cloudCodePart struct {
 	ThoughtSignature string                 `json:"thoughtSignature,omitempty"`
 	FunctionCall     *cloudCodeFunctionCall `json:"functionCall,omitempty"`
 	FunctionResponse *cloudCodeFuncResponse `json:"functionResponse,omitempty"`
+	// Multimodal input: base64 payloads ride inlineData, remote URLs fileData
+	// (Gemini generateContent shapes).
+	InlineData *cloudCodeInlineData `json:"inlineData,omitempty"`
+	FileData   *cloudCodeFileData   `json:"fileData,omitempty"`
+}
+
+type cloudCodeInlineData struct {
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data"`
+}
+
+type cloudCodeFileData struct {
+	MimeType string `json:"mimeType,omitempty"`
+	FileURI  string `json:"fileUri"`
+}
+
+// cloudCodeSystemInstruction carries the system prompt in the protocol's
+// system-instruction field instead of rewriting it as a user turn.
+type cloudCodeSystemInstruction struct {
+	Role  string          `json:"role,omitempty"`
+	Parts []cloudCodePart `json:"parts"`
 }
 
 type cloudCodeFunctionCall struct {
@@ -563,10 +584,11 @@ type cloudCodeTool struct {
 }
 
 type cloudCodeInnerRequest struct {
-	SessionID        string             `json:"sessionId,omitempty"`
-	Contents         []cloudCodeContent `json:"contents"`
-	Tools            []cloudCodeTool    `json:"tools,omitempty"`
-	GenerationConfig map[string]any     `json:"generationConfig,omitempty"`
+	SessionID         string                      `json:"sessionId,omitempty"`
+	Contents          []cloudCodeContent          `json:"contents"`
+	SystemInstruction *cloudCodeSystemInstruction `json:"systemInstruction,omitempty"`
+	Tools             []cloudCodeTool             `json:"tools,omitempty"`
+	GenerationConfig  map[string]any              `json:"generationConfig,omitempty"`
 }
 
 type cloudCodeRequest struct {
@@ -648,6 +670,106 @@ func (p *Provider) getToken(ctx context.Context) (string, error) {
 	return "", errors.New("antigravity: no access token available")
 }
 
+// cloudCodeParts converts the blocks of one IR message into CloudCode parts.
+// Image blocks become inlineData (data URLs) or fileData (remote URLs) parts so
+// multimodal prompts survive the trip upstream.
+func cloudCodeParts(m *ir.Message, toolCallNames map[string]string) []cloudCodePart {
+	if m == nil {
+		return nil
+	}
+	var parts []cloudCodePart
+	for _, blk := range m.Blocks {
+		if blk == nil {
+			continue
+		}
+		switch b := blk.(type) {
+		case ir.TextBlock:
+			parts = append(parts, cloudCodePart{Text: b.Text})
+		case *ir.TextBlock:
+			parts = append(parts, cloudCodePart{Text: b.Text})
+		case ir.ImageBlock:
+			if img := imagePartFromURL(b.URL); img != nil {
+				parts = append(parts, *img)
+			}
+		case *ir.ImageBlock:
+			if img := imagePartFromURL(b.URL); img != nil {
+				parts = append(parts, *img)
+			}
+		case ir.ReasoningBlock:
+			parts = append(parts, cloudCodePart{Text: b.Text, Thought: true})
+		case *ir.ReasoningBlock:
+			parts = append(parts, cloudCodePart{Text: b.Text, Thought: true})
+		case ir.ToolCallBlock:
+			parts = append(parts, toolCallPart(b.ID, b.Name, b.Arguments))
+		case *ir.ToolCallBlock:
+			parts = append(parts, toolCallPart(b.ID, b.Name, b.Arguments))
+		case ir.ToolResultBlock:
+			parts = append(parts, toolResultPart(b.Name, b.ToolCallID, b.Content, toolCallNames))
+		case *ir.ToolResultBlock:
+			parts = append(parts, toolResultPart(b.Name, b.ToolCallID, b.Content, toolCallNames))
+		}
+	}
+	return parts
+}
+
+// imagePartFromURL maps an image URL onto a CloudCode multimodal part:
+// "data:<mime>;base64,<payload>" becomes inlineData, anything else fileData.
+func imagePartFromURL(url string) *cloudCodePart {
+	if url == "" {
+		return nil
+	}
+	if mediaType, data, ok := splitDataURL(url); ok {
+		return &cloudCodePart{InlineData: &cloudCodeInlineData{MimeType: mediaType, Data: data}}
+	}
+	return &cloudCodePart{FileData: &cloudCodeFileData{FileURI: url}}
+}
+
+// splitDataURL parses a data: URL into its media type and payload.
+func splitDataURL(url string) (mediaType, data string, ok bool) {
+	if !strings.HasPrefix(url, "data:") {
+		return "", "", false
+	}
+	payload := strings.TrimPrefix(url, "data:")
+	meta, rest, found := strings.Cut(payload, ",")
+	if !found {
+		return "", "", false
+	}
+	mediaType = strings.TrimSpace(strings.Split(meta, ";")[0])
+	if mediaType == "" {
+		mediaType = "application/octet-stream"
+	}
+	return mediaType, rest, true
+}
+
+func toolCallPart(id, name, arguments string) cloudCodePart {
+	var args map[string]any
+	_ = json.Unmarshal([]byte(arguments), &args)
+	return cloudCodePart{
+		ThoughtSignature: "skip_thought_signature_validator",
+		FunctionCall: &cloudCodeFunctionCall{
+			Name: name,
+			ID:   id,
+			Args: args,
+		},
+	}
+}
+
+func toolResultPart(name, toolCallID, content string, toolCallNames map[string]string) cloudCodePart {
+	if name == "" && toolCallID != "" {
+		name = toolCallNames[toolCallID]
+	}
+	if name == "" {
+		name = "tool_result"
+	}
+	return cloudCodePart{
+		FunctionResponse: &cloudCodeFuncResponse{
+			Name:     name,
+			ID:       toolCallID,
+			Response: map[string]any{"result": content},
+		},
+	}
+}
+
 func (p *Provider) buildRequest(msgs []*ir.Message, cfg *provider.RequestConfig) (*cloudCodeRequest, error) {
 	project := p.projectID
 	if project == "" {
@@ -669,88 +791,40 @@ func (p *Provider) buildRequest(msgs []*ir.Message, cfg *provider.RequestConfig)
 	}
 
 	var contents []cloudCodeContent
+	var systemParts []cloudCodePart
+	var systemInstruction *cloudCodeSystemInstruction
 	for _, m := range msgs {
 		if m == nil {
 			continue
 		}
+
+		// System prompts belong in the protocol's system-instruction field.
+		// Rewriting them as user turns corrupts the prompt shape upstream.
+		// Only plain text is valid there, so thought/tool/image parts are
+		// dropped rather than smuggled in.
+		if m.Role == "system" {
+			for _, part := range cloudCodeParts(m, toolCallNames) {
+				if part.Text != "" && !part.Thought {
+					systemParts = append(systemParts, cloudCodePart{Text: part.Text})
+				}
+			}
+			continue
+		}
+
 		role := "user"
 		if m.Role == "assistant" || m.Role == "model" {
 			role = "model"
 		}
 
-		var parts []cloudCodePart
-		for _, blk := range m.Blocks {
-			if blk == nil {
-				continue
-			}
-			switch b := blk.(type) {
-			case ir.TextBlock:
-				parts = append(parts, cloudCodePart{Text: b.Text})
-			case *ir.TextBlock:
-				parts = append(parts, cloudCodePart{Text: b.Text})
-			case ir.ReasoningBlock:
-				parts = append(parts, cloudCodePart{Text: b.Text, Thought: true})
-			case *ir.ReasoningBlock:
-				parts = append(parts, cloudCodePart{Text: b.Text, Thought: true})
-			case ir.ToolCallBlock:
-				var args map[string]any
-				_ = json.Unmarshal([]byte(b.Arguments), &args)
-				parts = append(parts, cloudCodePart{
-					ThoughtSignature: "skip_thought_signature_validator",
-					FunctionCall: &cloudCodeFunctionCall{
-						Name: b.Name,
-						ID:   b.ID,
-						Args: args,
-					},
-				})
-			case *ir.ToolCallBlock:
-				var args map[string]any
-				_ = json.Unmarshal([]byte(b.Arguments), &args)
-				parts = append(parts, cloudCodePart{
-					ThoughtSignature: "skip_thought_signature_validator",
-					FunctionCall: &cloudCodeFunctionCall{
-						Name: b.Name,
-						ID:   b.ID,
-						Args: args,
-					},
-				})
-			case ir.ToolResultBlock:
-				name := b.Name
-				if name == "" && b.ToolCallID != "" {
-					name = toolCallNames[b.ToolCallID]
-				}
-				if name == "" {
-					name = "tool_result"
-				}
-				parts = append(parts, cloudCodePart{
-					FunctionResponse: &cloudCodeFuncResponse{
-						Name:     name,
-						ID:       b.ToolCallID,
-						Response: map[string]any{"result": b.Content},
-					},
-				})
-			case *ir.ToolResultBlock:
-				name := b.Name
-				if name == "" && b.ToolCallID != "" {
-					name = toolCallNames[b.ToolCallID]
-				}
-				if name == "" {
-					name = "tool_result"
-				}
-				parts = append(parts, cloudCodePart{
-					FunctionResponse: &cloudCodeFuncResponse{
-						Name:     name,
-						ID:       b.ToolCallID,
-						Response: map[string]any{"result": b.Content},
-					},
-				})
-			}
-		}
-
+		parts := cloudCodeParts(m, toolCallNames)
 		contents = append(contents, cloudCodeContent{
 			Role:  role,
 			Parts: parts,
 		})
+	}
+
+	if len(systemParts) > 0 {
+		systemInstruction = &cloudCodeSystemInstruction{Parts: systemParts}
 	}
 
 	var tools []cloudCodeTool
@@ -845,10 +919,11 @@ func (p *Provider) buildRequest(msgs []*ir.Message, cfg *provider.RequestConfig)
 		RequestType: "agent",
 		RequestID:   reqID,
 		Request: cloudCodeInnerRequest{
-			SessionID:        sessionID,
-			Contents:         contents,
-			Tools:            tools,
-			GenerationConfig: genCfg,
+			SessionID:         sessionID,
+			Contents:          contents,
+			SystemInstruction: systemInstruction,
+			Tools:             tools,
+			GenerationConfig:  genCfg,
 		},
 	}, nil
 }

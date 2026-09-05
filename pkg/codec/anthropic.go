@@ -108,11 +108,15 @@ func DecodeMessagesRequest(body []byte) (*MessagesDecoded, error) {
 				if !ok {
 					continue
 				}
-				if m["type"] == "text" {
-					if txt, ok := m["text"].(string); ok {
-						sysBlocks = append(sysBlocks, ir.TextBlock{Text: txt})
-					}
+				blockType, _ := m["type"].(string)
+				if blockType != "text" {
+					// Only text blocks are valid system content; anything else
+					// (including an unknown type) cannot carry a breakpoint we
+					// could re-attach.
+					continue
 				}
+				txt, _ := m["text"].(string)
+				sysBlocks = append(sysBlocks, ir.TextBlock{Text: txt})
 				if m["cache_control"] != nil {
 					sysBlocks = append(sysBlocks, ir.CacheControl{Breakpoint: true})
 				}
@@ -140,13 +144,11 @@ func DecodeMessagesRequest(body []byte) (*MessagesDecoded, error) {
 					continue
 				}
 				blockType, _ := bMap["type"].(string)
+				recognized := true
 				switch blockType {
 				case "text":
 					txt, _ := bMap["text"].(string)
 					blocks = append(blocks, ir.TextBlock{Text: txt})
-					if bMap["cache_control"] != nil {
-						blocks = append(blocks, ir.CacheControl{Breakpoint: true})
-					}
 
 				case "image":
 					var url string
@@ -210,6 +212,18 @@ func DecodeMessagesRequest(body []byte) (*MessagesDecoded, error) {
 						ToolCallID: toolUseID,
 						Content:    contentStr,
 					})
+				default:
+					// Unknown block type: nothing was decoded, so there is no
+					// block to attach a cache_control marker to.
+					recognized = false
+				}
+
+				// Anthropic accepts cache_control on any content block. Keep
+				// the breakpoint in the IR as a marker placed directly after
+				// the block it annotates so the prompt-caching boundary
+				// survives the IR round trip.
+				if recognized && bMap["cache_control"] != nil {
+					blocks = append(blocks, ir.CacheControl{Breakpoint: true})
 				}
 			}
 		}

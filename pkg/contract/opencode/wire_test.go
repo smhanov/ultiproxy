@@ -470,3 +470,46 @@ func TestWire_ImageInputPassthrough(t *testing.T) {
 	}
 }
 
+// TestWire_MaxTokensByModelIsACeiling proves on the wire that
+// max_tokens_by_model is an upper bound, not a fill-in default: a client that
+// asks for more than the lane accepts is clamped down to the matched limit.
+func TestWire_MaxTokensByModelIsACeiling(t *testing.T) {
+	quirk := func(c *openaicompat.Config) {
+		c.Quirks.MaxTokensByModel = map[string]int{"glm": 8192}
+	}
+
+	t.Run("client above the ceiling is clamped", func(t *testing.T) {
+		h, _ := newWireHarness(t, "ceiling", quirk)
+
+		rec := postChatAndRecord(t, h, map[string]any{
+			"model":      "ceiling/glm",
+			"max_tokens": 100000,
+			"messages": []map[string]any{
+				{"role": "user", "content": "Write quicksort"},
+			},
+		})
+
+		if rec.MaxTokens != 8192 {
+			t.Errorf("expected max_tokens 8192 on the upstream body, got %d", rec.MaxTokens)
+		}
+		if raw, ok := rec.JSON["max_tokens"].(float64); !ok || int(raw) != 8192 {
+			t.Errorf("expected max_tokens 8192 in upstream JSON, got %v", rec.JSON["max_tokens"])
+		}
+	})
+
+	t.Run("client below the ceiling passes through", func(t *testing.T) {
+		h, _ := newWireHarness(t, "ceiling", quirk)
+
+		rec := postChatAndRecord(t, h, map[string]any{
+			"model":      "ceiling/glm",
+			"max_tokens": 512,
+			"messages": []map[string]any{
+				{"role": "user", "content": "Write quicksort"},
+			},
+		})
+
+		if rec.MaxTokens != 512 {
+			t.Errorf("expected max_tokens 512 on the upstream body, got %d", rec.MaxTokens)
+		}
+	})
+}

@@ -251,6 +251,7 @@ func BuildPayload(msgs []*ir.Message, cfg *provider.RequestConfig, stream bool) 
 			continue
 		}
 		var textParts []string
+		var imageParts []map[string]any
 		var toolCalls []map[string]any
 		var toolCallID string
 
@@ -263,6 +264,10 @@ func BuildPayload(msgs []*ir.Message, cfg *provider.RequestConfig, stream bool) 
 				textParts = append(textParts, b.Text)
 			case *ir.TextBlock:
 				textParts = append(textParts, b.Text)
+			case ir.ImageBlock:
+				imageParts = append(imageParts, imagePart(b.URL, b.Detail))
+			case *ir.ImageBlock:
+				imageParts = append(imageParts, imagePart(b.URL, b.Detail))
 			case ir.ToolCallBlock:
 				toolCalls = append(toolCalls, map[string]any{
 					"id":   b.ID,
@@ -291,8 +296,23 @@ func BuildPayload(msgs []*ir.Message, cfg *provider.RequestConfig, stream bool) 
 		}
 
 		entry := map[string]any{
-			"role":    m.Role,
-			"content": strings.Join(textParts, "\n"),
+			"role": m.Role,
+		}
+		// Multimodal messages must carry an array of typed content parts;
+		// text-only messages keep the legacy plain-string content so existing
+		// upstreams see no wire diff. Tool results stay a string (the tool
+		// role only accepts text).
+		if len(imageParts) > 0 && toolCallID == "" {
+			content := make([]any, 0, len(textParts)+len(imageParts))
+			if txt := strings.Join(textParts, "\n"); txt != "" {
+				content = append(content, map[string]any{"type": "text", "text": txt})
+			}
+			for _, img := range imageParts {
+				content = append(content, img)
+			}
+			entry["content"] = content
+		} else {
+			entry["content"] = strings.Join(textParts, "\n")
 		}
 		if len(toolCalls) > 0 {
 			entry["tool_calls"] = toolCalls
@@ -311,6 +331,16 @@ func BuildPayload(msgs []*ir.Message, cfg *provider.RequestConfig, stream bool) 
 	}
 
 	return payload, nil
+}
+
+// imagePart builds an OpenAI-shaped image_url content part. Data URLs and
+// remote URLs are forwarded verbatim; the optional detail level is kept.
+func imagePart(url, detail string) map[string]any {
+	imageURL := map[string]any{"url": url}
+	if detail != "" {
+		imageURL["detail"] = detail
+	}
+	return map[string]any{"type": "image_url", "image_url": imageURL}
 }
 
 // Generate implements provider.InferenceProvider.
@@ -421,6 +451,18 @@ func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...pro
 	return irResp, nil
 }
 
+// codexToolDelta is the delta.tool_calls[] shape of the Codex completions
+// stream.
+type codexToolDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function"`
+}
+
 // Stream implements provider.InferenceProvider.
 func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (<-chan ir.Event, error) {
 	cfg := provider.NewRequestConfig(opts...)
@@ -476,8 +518,9 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 			Choices []struct {
 				Index int `json:"index"`
 				Delta struct {
-					Content          string `json:"content,omitempty"`
-					ReasoningContent string `json:"reasoning_content,omitempty"`
+					Content          string           `json:"content,omitempty"`
+					ReasoningContent string           `json:"reasoning_content,omitempty"`
+					ToolCalls        []codexToolDelta `json:"tool_calls,omitempty"`
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
@@ -523,6 +566,25 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 				}
 				if c.Delta.Content != "" {
 					outCh <- ir.EventTextDelta{Index: c.Index, Text: c.Delta.Content}
+				}
+				for _, tc := range c.Delta.ToolCalls {
+					// OpenAI streams a tool call as an opening chunk (id +
+					// name) followed by argument fragments. Mirrors the
+					// hublane bridge: start, argument deltas, stop.
+					if tc.ID != "" || tc.Function.Name != "" {
+						outCh <- ir.EventToolCallStart{
+							Index: tc.Index,
+							ID:    tc.ID,
+							Name:  tc.Function.Name,
+						}
+					}
+					if tc.Function.Arguments != "" {
+						outCh <- ir.EventToolArgumentsDelta{
+							Index:     tc.Index,
+							Arguments: tc.Function.Arguments,
+						}
+					}
+					outCh <- ir.EventToolCallStop{Index: tc.Index}
 				}
 				if c.FinishReason != nil && *c.FinishReason != "" {
 					outCh <- ir.EventMessageStop{FinishReason: *c.FinishReason, UpstreamID: responseID}
