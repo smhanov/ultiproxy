@@ -238,11 +238,12 @@ Parameters:
 - kind: "" or "openaicompat" (default) for any OpenAI-compatible upstream; "antigravity", "anthropic", "codex" or "freebuff" for the custom-wire lanes.
 - base_url: upstream base URL, required for OpenAI-compatible lanes, e.g. "https://api.deepseek.com/v1". Custom-wire lanes ignore it - they know their endpoints.
 - api_key: static key. Required for kind=anthropic; optional elsewhere (public or local lanes work without one).
+- the reply reports how many upstream models the new lane serves ("discovered N models"); discovery runs automatically, so no follow-up call is needed
 - quirks (object, OpenAI-compatible lanes only): vendor behaviour switches
   - coding_plan_path: route through a coding-plan path (zai-style coding subscriptions)
   - max_tokens_by_model: map of upstream model id -> max_tokens that upstream accepts, e.g. {"glm-4.6":8192}
   - echo_reasoning: repeat reasoning tokens as visible content (upstreams that hide them)
-  - model_list_passthrough: slurp GET <base>/v1/models so "<name>/<model>" ids show up on /v1/models
+  - model_list_passthrough: model discovery (GET <base>/v1/models so "<name>/<model>" ids show up on /v1/models). ON by default for OpenAI-compatible lanes; set it to false to opt out. Discovery runs when the lane is registered, again at daemon startup when a lane cache is still empty, and every 6h afterwards
   - auth_via_oauth_manager: authenticate with the lane's stored OAuth credential (xai-style) instead of a static key
   - credits_quota_observer: upstream credits endpoint to poll so get_quota_status has something to report (e.g. the xai billing URL)
   - auth_via_supabase_refresh: refresh credentials through a Supabase session
@@ -299,7 +300,7 @@ Secrets are always redacted. Use this to discover valid provider names before ca
 
 name: the lane to refresh, e.g. "opencode", "vllm", "deepseek".
 
-Discovery runs once at startup for lanes added with model_list_passthrough; this tool re-runs it on demand (10s budget) to pick up models added upstream or to backfill a lane whose cache is empty - it then answers "N models cached for lane <name>". Lanes without model discovery (custom-wire lanes such as antigravity, codex, anthropic) answer "does not support model discovery", though prefix routing "<lane>/<model>" still works for them.`,
+Discovery is automatic: every OpenAI-compatible lane discovers when it is registered (add_provider reports the count), lanes whose cache is still empty are re-discovered at daemon startup, and every discovery lane is refreshed every 6h (model_list_passthrough:false opts a lane out of all of it). This tool is the manual override on top of that schedule (10s budget): use it to pick up an upstream change right now instead of waiting for the next tick. It answers "N models cached for lane <name>". Lanes without model discovery (custom-wire lanes such as antigravity, codex, anthropic) answer "does not support model discovery", though prefix routing "<lane>/<model>" still works for them.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{

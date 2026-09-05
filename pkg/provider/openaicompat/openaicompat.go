@@ -31,6 +31,25 @@ type xaiPendingFlow struct {
 	interval   int
 }
 
+// modelDiscoveryBudget bounds the construction-time model discovery call (and
+// the on-demand Models() fallback). It matches the budget the server's
+// registration/startup/scheduled discovery passes use.
+const modelDiscoveryBudget = 5 * time.Second
+
+// ModelListPassthroughEnabled resolves whether a lane config participates in
+// upstream model discovery. Discovery is the DEFAULT for OpenAI-compatible
+// lanes - a single GET <base>/models, cached afterwards - so an upstream that
+// has no such endpoint simply caches nothing. Two things opt out:
+//   - OptOutModelListPassthrough (MCP quirks.model_list_passthrough:false, or
+//     the same field persisted in providers.json);
+//   - freebuff lanes: their wire is not an OpenAI model list, and their model
+//     set is subscription knowledge, so nothing is discovered or invented.
+func ModelListPassthroughEnabled(cfg Config) bool {
+	return !cfg.OptOutModelListPassthrough &&
+		cfg.Quirks.FreebuffActor == nil &&
+		!cfg.Quirks.FreebuffDefaultTool
+}
+
 // Provider implements provider.InferenceProvider and optionally provider.QuotaProvider and provider.AuthProvider.
 type Provider struct {
 	adapter    *hublane.Adapter
@@ -97,6 +116,14 @@ func New(cfg Config) (*Provider, error) {
 		}
 	}
 
+	// Model discovery is on by default for OpenAI-compatible lanes (see
+	// ModelListPassthroughEnabled) and opted out with
+	// quirks.model_list_passthrough:false. Resolving the effective flag BEFORE
+	// the provider struct is built means p.cfg, Models(), resolveModel(), the
+	// runtime provider store and the MCP surface all agree on the same value
+	// for the life of the lane.
+	cfg.Quirks.ModelListPassthrough = ModelListPassthroughEnabled(cfg)
+
 	hubKey := cfg.APIKey
 	if hubKey == "" {
 		hubKey = "openaicompat"
@@ -130,9 +157,11 @@ func New(cfg Config) (*Provider, error) {
 		name:       name,
 	}
 
-	// Quirk: ModelListPassthrough startup model discovery
+	// Model discovery for this lane. The flag was already resolved above, so
+	// p.cfg carries the same decision Models(), resolveModel() and the
+	// server-side discovery loop see.
 	if cfg.Quirks.ModelListPassthrough {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), modelDiscoveryBudget)
 		defer cancel()
 		_, _ = p.FetchModels(ctx)
 	}
@@ -724,7 +753,7 @@ func (p *Provider) Models() []string {
 	p.mu.RUnlock()
 
 	if p.cfg.Quirks.ModelListPassthrough {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), modelDiscoveryBudget)
 		defer cancel()
 		models, err := p.FetchModels(ctx)
 		if err == nil {
@@ -995,6 +1024,13 @@ var (
 	_ provider.QuotaProvider     = (*Provider)(nil)
 	_ provider.AuthProvider      = (*Provider)(nil)
 )
+
+// ModelDiscoveryEnabled reports whether this lane participates in automatic
+// model discovery (the resolved quirks.model_list_passthrough flag). The
+// server's discovery loop uses it to leave opted-out lanes alone.
+func (p *Provider) ModelDiscoveryEnabled() bool {
+	return p.cfg.Quirks.ModelListPassthrough
+}
 
 // CachedModels returns the upstream model ids discovered so far (startup
 // discovery for ModelListPassthrough lanes, or the last successful

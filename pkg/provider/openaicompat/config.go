@@ -20,6 +20,15 @@ type Config struct {
 	DataDir string // for xai OAuth cred dir, augure token file
 	Quirks  Quirks
 
+	// OptOutModelListPassthrough explicitly disables upstream model discovery
+	// for this lane. Discovery is ON by default for OpenAI-compatible lanes
+	// (see ModelListPassthroughEnabled): one GET <base>/models, cached
+	// afterwards, is what makes /v1/models honest instead of a stub. The MCP
+	// quirks.model_list_passthrough:false switch and the persisted
+	// quirks.model_list_passthrough=false both map here, so an explicit opt-out
+	// survives a restart while an absent field keeps the default.
+	OptOutModelListPassthrough bool
+
 	// Optional quirk-specific overrides
 	RefreshURL    string // for AuthViaSupabaseRefresh (augure)
 	TokenFile     string // for AuthViaSupabaseRefresh (augure)
@@ -32,7 +41,7 @@ type Quirks struct {
 	CodingPlanPath         bool           // zai: base URL contains "coding" -> coding-plan variant + max-tokens defaults
 	MaxTokensByModel       map[string]int // zai: glm-4.5-air -> 98304, else 131072 (resolveMaxTokens)
 	EchoReasoning          bool           // deepseek: re-emit reasoning_content on input + parse on output
-	ModelListPassthrough   bool           // vllm: /v1/models from upstream, no auth required
+	ModelListPassthrough   bool           // discovery: slurp GET <base>/v1/models (default ON, see ModelListPassthroughEnabled)
 	AuthViaOAuthManager    bool           // xai: auth.Manager creds + refresh
 	CreditsQuotaObserver   string         // xai: credits endpoint id for the quota observer ("" = none)
 	AuthViaSupabaseRefresh bool           // augure: token file + Supabase refresh

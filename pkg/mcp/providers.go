@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 )
 
@@ -37,16 +39,19 @@ type ProviderStore interface {
 // quirks.freebuff_actor=true and rebuilds the real actor from the lane's
 // api_key / state token (see RuntimeProviderStore.Add and Restore).
 type providerQuirksArgs struct {
-	CodingPlanPath         bool           `json:"coding_plan_path"`
-	MaxTokensByModel       map[string]int `json:"max_tokens_by_model"`
-	EchoReasoning          bool           `json:"echo_reasoning"`
-	ModelListPassthrough   bool           `json:"model_list_passthrough"`
-	AuthViaOAuthManager    bool           `json:"auth_via_oauth_manager"`
-	CreditsQuotaObserver   string         `json:"credits_quota_observer"`
-	AuthViaSupabaseRefresh bool           `json:"auth_via_supabase_refresh"`
-	FreebuffActor          bool           `json:"freebuff_actor"`
-	FreebuffDefaultTool    bool           `json:"freebuff_default_tool"`
-	DefaultModel           string         `json:"default_model"`
+	CodingPlanPath   bool           `json:"coding_plan_path"`
+	MaxTokensByModel map[string]int `json:"max_tokens_by_model"`
+	EchoReasoning    bool           `json:"echo_reasoning"`
+	// ModelListPassthrough is a pointer so "not specified" (discovery is the
+	// default for OpenAI-compatible lanes) stays distinguishable from an
+	// explicit false opt-out.
+	ModelListPassthrough   *bool  `json:"model_list_passthrough"`
+	AuthViaOAuthManager    bool   `json:"auth_via_oauth_manager"`
+	CreditsQuotaObserver   string `json:"credits_quota_observer"`
+	AuthViaSupabaseRefresh bool   `json:"auth_via_supabase_refresh"`
+	FreebuffActor          bool   `json:"freebuff_actor"`
+	FreebuffDefaultTool    bool   `json:"freebuff_default_tool"`
+	DefaultModel           string `json:"default_model"`
 }
 
 type addProviderArgs struct {
@@ -66,13 +71,18 @@ func (a addProviderArgs) config() openaicompat.Config {
 			CodingPlanPath:         a.Quirks.CodingPlanPath,
 			MaxTokensByModel:       a.Quirks.MaxTokensByModel,
 			EchoReasoning:          a.Quirks.EchoReasoning,
-			ModelListPassthrough:   a.Quirks.ModelListPassthrough,
 			AuthViaOAuthManager:    a.Quirks.AuthViaOAuthManager,
 			CreditsQuotaObserver:   a.Quirks.CreditsQuotaObserver,
 			AuthViaSupabaseRefresh: a.Quirks.AuthViaSupabaseRefresh,
 			FreebuffDefaultTool:    a.Quirks.FreebuffDefaultTool,
 			DefaultModel:           a.Quirks.DefaultModel,
 		},
+	}
+	if a.Quirks.ModelListPassthrough != nil && !*a.Quirks.ModelListPassthrough {
+		// quirks.model_list_passthrough is the opt-OUT: absent keeps the
+		// default (discovery ON), false disables it. The effective flag is
+		// resolved by openaicompat.New and the provider store, never here.
+		cfg.OptOutModelListPassthrough = true
 	}
 	if a.Quirks.FreebuffActor {
 		// Non-nil placeholder: it marks the lane as a freebuff lane (serialized
@@ -83,6 +93,48 @@ func (a addProviderArgs) config() openaicompat.Config {
 		cfg.Quirks.FreebuffActor = struct{}{}
 	}
 	return cfg
+}
+
+// modelDiscoveryBudget bounds the synchronous model discovery add_provider runs
+// before replying. It matches the budget the server registration, startup and
+// scheduled discovery passes use, so a slow upstream cannot hang the tool call.
+const modelDiscoveryBudget = 5 * time.Second
+
+// modelsCacher is the cache side of a lane discovery capability: the ids the
+// lane already holds without contacting the upstream.
+type modelsCacher interface {
+	CachedModels() []string
+}
+
+// discoverModelsForReply runs (or reuses) one lane model discovery and returns
+// the count plus an explanatory note for the add_provider reply.
+// openaicompat.New already discovers while validating the lane, so a lane whose
+// construction discovery succeeded reports that result instead of dialling the
+// upstream a second time; an empty cache (construction discovery failed) is
+// retried here so the reply never understates a lane that just came up.
+func discoverModelsForReply(ctx context.Context, name string, bundle provider.Provider) (int, string) {
+	if bundle.Inference == nil {
+		return 0, "lane has no inference surface"
+	}
+	if opt, ok := bundle.Inference.(interface{ ModelDiscoveryEnabled() bool }); ok && !opt.ModelDiscoveryEnabled() {
+		return 0, "model discovery disabled for this lane (quirks.model_list_passthrough=false)"
+	}
+	fetcher, ok := bundle.Inference.(modelsFetcher)
+	if !ok {
+		return 0, "lane does not support model discovery, its models are addressed as <lane>/<model>"
+	}
+	if cacher, ok := bundle.Inference.(modelsCacher); ok {
+		if cached := cacher.CachedModels(); len(cached) > 0 {
+			return len(cached), ""
+		}
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, modelDiscoveryBudget)
+	defer cancel()
+	models, err := fetcher.FetchModels(fetchCtx)
+	if err != nil {
+		return 0, fmt.Sprintf("model discovery failed: %v", err)
+	}
+	return len(models), ""
 }
 
 func toolError(format string, args ...any) *CallToolResult {
@@ -149,10 +201,20 @@ func (s *Server) toolAddProvider(ctx context.Context, argsRaw json.RawMessage) (
 		s.registry.Register(p.Provider())
 	}
 
+	// Synchronous model discovery, BEFORE replying: the reply then states what
+	// the lane serves (its "<lane>/<model>" ids are already routable and
+	// already on /v1/models) and the caller needs no refresh_models follow-up.
+	discovered, note := discoverModelsForReply(ctx, cfg.Name, p.Provider())
+	summary := fmt.Sprintf("discovered %d models", discovered)
+	if note != "" {
+		summary += " (" + note + ")"
+	}
 	return toolJSON(map[string]any{
-		"registered": true,
-		"name":       cfg.Name,
-		"lane":       cfg.Name,
+		"registered":        true,
+		"name":              cfg.Name,
+		"lane":              cfg.Name,
+		"discovered_models": discovered,
+		"summary":           summary,
 	}), nil
 }
 
@@ -197,11 +259,15 @@ func (s *Server) toolAddCustomProvider(ctx context.Context, args addProviderArgs
 	if s.registry != nil {
 		s.registry.Register(bundle)
 	}
+	// Custom-wire lanes have no model discovery: their model set is addressed
+	// as <lane>/<model> and expressed through aliases, never invented here.
 	return toolJSON(map[string]any{
-		"registered": true,
-		"name":       args.Name,
-		"lane":       args.Name,
-		"kind":       args.Kind,
+		"registered":        true,
+		"name":              args.Name,
+		"lane":              args.Name,
+		"kind":              args.Kind,
+		"discovered_models": 0,
+		"summary":           "discovered 0 models (custom-wire lane: no model discovery, address models as <lane>/<model> or set_model_alias)",
 	}), nil
 }
 

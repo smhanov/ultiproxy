@@ -186,10 +186,10 @@ Everything below is available on `tools/list` at `http://localhost:9050/mcp`, wi
 | `get_provider_timeouts` | Per-lane timeout durations in force. |
 | `set_provider_timeout` | Configure a lane timeout (Go duration string: `10m`, `3m30s`, ...); persists in `timeouts.json`. |
 | `remove_provider_timeout` | Reset a lane to the server default timeout (120s). |
-| `add_provider` | Register a lane at runtime -- OpenAI-compatible (`name`, `base_url`, optional `api_key`, quirks) or custom-wire kinds (`antigravity`, `anthropic`, `codex`, `freebuff`); persists in `providers.json`. |
+| `add_provider` | Register a lane at runtime -- OpenAI-compatible (`name`, `base_url`, optional `api_key`, quirks) or custom-wire kinds (`antigravity`, `anthropic`, `codex`, `freebuff`); persists in `providers.json`. The reply reports how many upstream models the lane serves ("discovered N models") -- discovery already ran. |
 | `remove_provider` | Unregister a lane from the registry and from `providers.json`. |
 | `list_providers` | Runtime-registered and compiled/in-memory lanes, secrets redacted. |
-| `refresh_models` | Re-fetch `GET <base>/v1/models` and cache it so `<lane>/<model>` ids appear in `/v1/models`. |
+| `refresh_models` | Re-fetch `GET <base>/v1/models` and cache it so `<lane>/<model>` ids appear in `/v1/models`. Manual override -- discovery also runs at registration, at startup for lanes whose cache is empty, and every 6h afterwards. |
 
 ---
 
@@ -287,7 +287,7 @@ curl -s http://localhost:9050/v1/chat/completions \
 | :--- | :--- |
 | `POST /v1/chat/completions` | OpenAI chat completions (text, tools, images, SSE streaming). |
 | `POST /v1/messages` | Anthropic Messages API (Claude Code and friends). |
-| `GET /v1/models` | Everything routable: aliases (with `context_length` / `max_output_tokens`), one `<lane>` entry per lane, and `<lane>/<model>` per discovered upstream model. |
+| `GET /v1/models` | Everything routable: aliases (with `context_length` / `max_output_tokens`), one `<lane>` entry per lane, and `<lane>/<model>` per discovered upstream model. Served from the discovery cache only -- listing never fans out to an upstream. |
 | `POST /mcp`, `GET /mcp` | Streamable HTTP MCP server (JSON-RPC 2.0). |
 | `GET /mcp/sse` | Legacy SSE MCP transport. |
 | `GET /api/quota`, `/quota.txt`, `/quota.md` | Live quota dashboard, plain-text and Markdown views. |

@@ -102,6 +102,19 @@ func (f *FakeProvider) Bundle() provider.Provider {
 	return f.Provider()
 }
 
+// optOutOfModelDiscovery keeps a harness lane on the explicit opt-in model
+// discovery semantics: FakeUpstream serves the chat wire only and has no
+// /v1/models catalog, while discovery now defaults to ON for OpenAI-compatible
+// lanes - without this, every wire test would also record a model probe next to
+// its chat request. Tests that DO want discovery set
+// quirks.model_list_passthrough explicitly (see TestWire_ModelListPassthrough);
+// the default itself is covered by pkg/provider/openaicompat and pkg/server.
+func optOutOfModelDiscovery(cfg *openaicompat.Config) {
+	if !cfg.Quirks.ModelListPassthrough {
+		cfg.OptOutModelListPassthrough = true
+	}
+}
+
 // NewFakeProvider constructs a FakeProvider with the given name pointing to the fake upstream.
 func NewFakeProvider(name string, fake *FakeUpstream, opts ...func(*openaicompat.Config)) (*FakeProvider, error) {
 	cfg := openaicompat.Config{
@@ -113,6 +126,7 @@ func NewFakeProvider(name string, fake *FakeUpstream, opts ...func(*openaicompat
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	optOutOfModelDiscovery(&cfg)
 	inner, err := openaicompat.New(cfg)
 	if err != nil {
 		return nil, err
@@ -263,6 +277,7 @@ func NewHarness(opts ...HarnessOption) (*Harness, error) {
 		if hcfg.customOpenCodeCfg != nil {
 			hcfg.customOpenCodeCfg(&ocCfg)
 		}
+		optOutOfModelDiscovery(&ocCfg)
 		p, err := openaicompat.New(ocCfg)
 		if err != nil {
 			return nil, fmt.Errorf("create opencode provider: %w", err)

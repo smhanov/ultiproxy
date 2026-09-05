@@ -121,3 +121,115 @@ func TestParseGrokCreditsResponse_NoCreditPools(t *testing.T) {
 		t.Errorf("Detail = %q, want it to mention the spending limit", snap.Detail)
 	}
 }
+
+// TestNewDiscoversModelsByDefault: a plain OpenAI-compatible lane (no quirks at
+// all) must discover its upstream catalog at construction. Discovery is the
+// default; quirks.model_list_passthrough is the opt-OUT, not the opt-in.
+func TestNewDiscoversModelsByDefault(t *testing.T) {
+	var models int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&models, 1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data":   []map[string]any{{"id": "deepseek-chat"}, {"id": "deepseek-reasoner"}},
+		})
+	}))
+	defer srv.Close()
+
+	p, err := New(Config{BaseURL: srv.URL, HTTPClient: srv.Client()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := atomic.LoadInt32(&models); got != 1 {
+		t.Fatalf("expected exactly one construction-time discovery request, got %d", got)
+	}
+	if got := p.CachedModels(); len(got) != 2 || got[0] != "deepseek-chat" || got[1] != "deepseek-reasoner" {
+		t.Errorf("CachedModels = %v, want the two upstream ids", got)
+	}
+	if got := p.Models(); len(got) != 2 {
+		t.Errorf("Models = %v, want the cached discovery result", got)
+	}
+}
+
+// TestNewModelDiscoveryOptOut: quirks.model_list_passthrough:false is the
+// explicit opt-out - the lane never probes its upstream, caches nothing and
+// tells the server-side discovery loop it is not discoverable.
+func TestNewModelDiscoveryOptOut(t *testing.T) {
+	var models int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&models, 1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data":   []map[string]any{{"id": "deepseek-chat"}},
+		})
+	}))
+	defer srv.Close()
+
+	p, err := New(Config{
+		BaseURL:                    srv.URL,
+		HTTPClient:                 srv.Client(),
+		OptOutModelListPassthrough: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := atomic.LoadInt32(&models); got != 0 {
+		t.Fatalf("opted-out lane probed the upstream %d times, want 0", got)
+	}
+	if got := p.CachedModels(); len(got) != 0 {
+		t.Errorf("CachedModels = %v, want empty for an opted-out lane", got)
+	}
+	if got := p.Models(); len(got) != 0 {
+		t.Errorf("Models = %v, want empty for an opted-out lane", got)
+	}
+	if p.ModelDiscoveryEnabled() {
+		t.Error("ModelDiscoveryEnabled = true, want false for an opted-out lane")
+	}
+
+	// The explicit opt-in still works and is reported the same way.
+	on, err := New(Config{
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+		Quirks:     Quirks{ModelListPassthrough: true},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if !on.ModelDiscoveryEnabled() {
+		t.Error("ModelDiscoveryEnabled = false for an explicit opt-in")
+	}
+	if got := atomic.LoadInt32(&models); got != 1 {
+		t.Errorf("explicit opt-in made %d discovery requests, want exactly 1", got)
+	}
+}
+
+// TestNewFreebuffLaneDoesNotDiscover: a freebuff lane (serialized requests over
+// the Codebuff wire) is not discoverable - its model set is subscription
+// knowledge, so no ids are invented or fetched for it.
+func TestNewFreebuffLaneDoesNotDiscover(t *testing.T) {
+	var models int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&models, 1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{"id": "x"}}})
+	}))
+	defer srv.Close()
+
+	p, err := New(Config{
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+		Quirks:     Quirks{FreebuffDefaultTool: true},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if p.ModelDiscoveryEnabled() {
+		t.Error("ModelDiscoveryEnabled = true for a freebuff lane, want false")
+	}
+	if got := atomic.LoadInt32(&models); got != 0 {
+		t.Errorf("freebuff lane probed the upstream %d times, want 0", got)
+	}
+}

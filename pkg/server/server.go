@@ -42,6 +42,16 @@ type Server struct {
 	mcpLaneBuilder func(name, kind, apiKey string) (provider.Provider, error)
 	httpServer     *http.Server
 	mux            *http.ServeMux
+	// modelRefreshInterval is the scheduled model-discovery cadence. -1
+	// (NewServer's default) means DefaultModelRefreshInterval; 0 disables the
+	// schedule (the startup backfill still runs).
+	modelRefreshInterval time.Duration
+	// newModelTicker builds the refresh ticker. It is nil in production (a real
+	// *time.Ticker) and replaced by the test hook so the schedule can be driven
+	// with a fake clock.
+	newModelTicker func(d time.Duration) modelTicker
+	// discoveryCancel stops the background model-discovery loop (Shutdown).
+	discoveryCancel context.CancelFunc
 	// requestIDSeq allocates the request ids that tie the request, attempt and
 	// usage telemetry rows of one dispatch together. See nextRequestID.
 	requestIDSeq atomic.Int64
@@ -100,6 +110,19 @@ func WithMCPServer(m *mcp.Server) Option {
 	}
 }
 
+// WithModelRefreshInterval sets how often every discovery-capable lane
+// re-fetches its upstream model list. Zero disables the schedule (lanes are
+// still discovered at registration and backfilled at startup); a negative value
+// restores the default, DefaultModelRefreshInterval.
+func WithModelRefreshInterval(d time.Duration) Option {
+	return func(s *Server) {
+		if d < 0 {
+			d = DefaultModelRefreshInterval
+		}
+		s.modelRefreshInterval = d
+	}
+}
+
 // NewServer creates a new Server.
 func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server {
 	if cfg == nil {
@@ -110,6 +133,9 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		cfg:      cfg,
 		registry: registry,
 		mux:      http.NewServeMux(),
+		// -1 means "no explicit interval": startModelDiscovery then uses
+		// DefaultModelRefreshInterval. (0 is a valid, explicit "disabled".)
+		modelRefreshInterval: -1,
 	}
 	s.requestIDSeq.Store(time.Now().UnixNano())
 
@@ -187,6 +213,12 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 	// Auth middleware
 	s.auth = NewAuthMiddleware(cfg.Server.APIKey, cfg.Server.ClientKeys)
 
+	// Background model discovery: backfill lanes whose cache is still empty
+	// after Restore, then refresh every discovery lane on a schedule. Never
+	// blocks startup and never touches the request path (/v1/models keeps
+	// reading the cache only).
+	s.startModelDiscovery()
+
 	// Mount routes
 	s.setupRoutes()
 
@@ -230,8 +262,13 @@ func (s *Server) Start() error {
 	return s.httpServer.ListenAndServe()
 }
 
-// Shutdown gracefully stops the HTTP server.
+// Shutdown gracefully stops the HTTP server and the background model-discovery
+// loop. In-flight discovery calls are cancelled through their per-call budget
+// context; the loop is not waited on, so a slow upstream cannot delay shutdown.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.discoveryCancel != nil {
+		s.discoveryCancel()
+	}
 	if s.httpServer != nil {
 		return s.httpServer.Shutdown(ctx)
 	}

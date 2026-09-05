@@ -29,6 +29,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,16 +57,20 @@ var ErrProviderNotStored = errors.New("provider not present in runtime store")
 // storedQuirks is the JSON-able projection of openaicompat.Quirks. FreebuffActor
 // is deliberately a bool (see the package comment).
 type storedQuirks struct {
-	CodingPlanPath         bool           `json:"coding_plan_path,omitempty"`
-	MaxTokensByModel       map[string]int `json:"max_tokens_by_model,omitempty"`
-	EchoReasoning          bool           `json:"echo_reasoning,omitempty"`
-	ModelListPassthrough   bool           `json:"model_list_passthrough,omitempty"`
-	AuthViaOAuthManager    bool           `json:"auth_via_oauth_manager,omitempty"`
-	CreditsQuotaObserver   string         `json:"credits_quota_observer,omitempty"`
-	AuthViaSupabaseRefresh bool           `json:"auth_via_supabase_refresh,omitempty"`
-	FreebuffActor          bool           `json:"freebuff_actor,omitempty"`
-	FreebuffDefaultTool    bool           `json:"freebuff_default_tool,omitempty"`
-	DefaultModel           string         `json:"default_model,omitempty"`
+	CodingPlanPath   bool           `json:"coding_plan_path,omitempty"`
+	MaxTokensByModel map[string]int `json:"max_tokens_by_model,omitempty"`
+	EchoReasoning    bool           `json:"echo_reasoning,omitempty"`
+	// ModelListPassthrough is the persisted model-discovery flag. nil (field
+	// absent - the legacy and default shape) keeps discovery ON;
+	// model_list_passthrough:false is the explicit opt-out and must survive a
+	// restart, so it cannot collapse into an omitted boolean.
+	ModelListPassthrough   *bool  `json:"model_list_passthrough,omitempty"`
+	AuthViaOAuthManager    bool   `json:"auth_via_oauth_manager,omitempty"`
+	CreditsQuotaObserver   string `json:"credits_quota_observer,omitempty"`
+	AuthViaSupabaseRefresh bool   `json:"auth_via_supabase_refresh,omitempty"`
+	FreebuffActor          bool   `json:"freebuff_actor,omitempty"`
+	FreebuffDefaultTool    bool   `json:"freebuff_default_tool,omitempty"`
+	DefaultModel           string `json:"default_model,omitempty"`
 }
 
 // storedProvider is the JSON-able projection of openaicompat.Config. Lanes
@@ -80,6 +85,20 @@ type storedProvider struct {
 	Quirks  storedQuirks `json:"quirks"`
 }
 
+// storedModelListPassthrough projects the model-discovery flag onto the
+// persisted DTO. Only an EXPLICIT decision is written: an explicit opt-out is
+// persisted as false, an explicit opt-in as true, and a lane that said nothing
+// keeps the field absent so the default (discovery ON) still applies after a
+// restart - exactly how lanes added before this default existed start
+// discovering without being re-added.
+func storedModelListPassthrough(cfg openaicompat.Config) *bool {
+	if !cfg.OptOutModelListPassthrough && !cfg.Quirks.ModelListPassthrough {
+		return nil
+	}
+	enabled := openaicompat.ModelListPassthroughEnabled(cfg)
+	return &enabled
+}
+
 func toStoredProvider(cfg openaicompat.Config) storedProvider {
 	return storedProvider{
 		Name:    cfg.Name,
@@ -89,7 +108,7 @@ func toStoredProvider(cfg openaicompat.Config) storedProvider {
 			CodingPlanPath:         cfg.Quirks.CodingPlanPath,
 			MaxTokensByModel:       cfg.Quirks.MaxTokensByModel,
 			EchoReasoning:          cfg.Quirks.EchoReasoning,
-			ModelListPassthrough:   cfg.Quirks.ModelListPassthrough,
+			ModelListPassthrough:   storedModelListPassthrough(cfg),
 			AuthViaOAuthManager:    cfg.Quirks.AuthViaOAuthManager,
 			CreditsQuotaObserver:   cfg.Quirks.CreditsQuotaObserver,
 			AuthViaSupabaseRefresh: cfg.Quirks.AuthViaSupabaseRefresh,
@@ -109,7 +128,6 @@ func (s storedProvider) toConfig(actorBuilder func(openaicompat.Config) any) ope
 			CodingPlanPath:         s.Quirks.CodingPlanPath,
 			MaxTokensByModel:       s.Quirks.MaxTokensByModel,
 			EchoReasoning:          s.Quirks.EchoReasoning,
-			ModelListPassthrough:   s.Quirks.ModelListPassthrough,
 			AuthViaOAuthManager:    s.Quirks.AuthViaOAuthManager,
 			CreditsQuotaObserver:   s.Quirks.CreditsQuotaObserver,
 			AuthViaSupabaseRefresh: s.Quirks.AuthViaSupabaseRefresh,
@@ -119,6 +137,15 @@ func (s storedProvider) toConfig(actorBuilder func(openaicompat.Config) any) ope
 	}
 	if s.Quirks.FreebuffActor && actorBuilder != nil {
 		cfg.Quirks.FreebuffActor = actorBuilder(cfg)
+	}
+	// A persisted model_list_passthrough is an explicit decision: apply it as
+	// the opt-in/opt-out the operator made. An absent field leaves both flags
+	// zero, so openaicompat.New applies the default (discovery ON) - which is
+	// how lanes persisted before the default existed start discovering without
+	// being re-added.
+	if s.Quirks.ModelListPassthrough != nil {
+		cfg.Quirks.ModelListPassthrough = *s.Quirks.ModelListPassthrough
+		cfg.OptOutModelListPassthrough = !*s.Quirks.ModelListPassthrough
 	}
 	return cfg
 }
@@ -151,6 +178,10 @@ type RuntimeProviderStore struct {
 	// and returns the provider bundle. When nil, custom kinds can be stored but
 	// not restored.
 	LaneBuilder func(name, kind, dataDir, apiKey string) (provider.Provider, error)
+	// restoreDiscovery tracks the bounded model-discovery pool Restore
+	// launches, so a later startup pass can wait for it instead of racing it
+	// into duplicate upstream calls.
+	restoreDiscovery sync.WaitGroup
 }
 
 // RuntimeProviderKind is the persisted provider kind discriminator.
@@ -315,6 +346,10 @@ func (s *RuntimeProviderStore) Add(cfg openaicompat.Config) error {
 		return err
 	}
 	cfg = s.credentialDir(cfg)
+	// Resolve the effective model-discovery flag once, so the in-memory
+	// config, MCP list_providers and the persisted DTO all report what a
+	// restart would do (openaicompat.New applies the same rule).
+	cfg.Quirks.ModelListPassthrough = openaicompat.ModelListPassthroughEnabled(cfg)
 	// A freebuff lane added over MCP carries only a non-nil marker (the real
 	// actor is not JSON-serializable and cannot cross that boundary). Build the
 	// serialized-request actor here from the lane's own key / data dir so the
@@ -509,7 +544,32 @@ func (s *RuntimeProviderStore) Restore(registry *provider.Registry) []string {
 		registered = append(registered, name)
 		log.Printf("[providers] registered runtime %s (kind %s)", name, sp.Kind)
 	}
+
+	// Model discovery for the restored lanes. openaicompat.New already tried
+	// each OpenAI-compatible lane at construction, so this pass only covers
+	// lanes whose cache is still empty (built while their upstream was
+	// unreachable, or added before discovery became the default). It runs in a
+	// bounded background pool so a slow upstream never stalls startup, and it
+	// is tracked so the server's own startup pass can wait instead of
+	// duplicating those calls.
+	targets := discoveryTargetsFor(registry, registered, true)
+	if len(targets) > 0 {
+		s.restoreDiscovery.Add(1)
+		go func() {
+			defer s.restoreDiscovery.Done()
+			discoverLanes(context.Background(), targets, "restore")
+		}()
+	}
 	return registered
+}
+
+// WaitForRestoreDiscovery blocks until the model-discovery pool launched by
+// Restore has finished (a no-op when Restore launched nothing).
+func (s *RuntimeProviderStore) WaitForRestoreDiscovery() {
+	if s == nil {
+		return
+	}
+	s.restoreDiscovery.Wait()
 }
 
 func sortedCustomNames(m map[string]storedProvider) []string {

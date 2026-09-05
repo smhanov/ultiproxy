@@ -72,7 +72,7 @@ curl -s http://localhost:9050/v1/messages \
 ### 3. Model Catalog
 - **Route**: `GET /v1/models`
 - **Auth**: `Authorization: Bearer <api-key>`
-- **Description**: Enumerates everything Ultiproxy can route: catalog aliases (config + MCP `set_model_alias`, carrying `context_length` / `max_output_tokens` from the alias `context_limit` / `max_output`), one entry per registered lane named exactly `<lane>` (every lane accepts prefix-routed models, including lanes with no model discovery such as `anthropic` / `codex`), and one entry per discovered upstream model on lanes that slurp their upstream `/v1/models` (`model_list_passthrough`), exposed as `<lane>/<model>` — the exact id routing accepts. Listing is served from the discovery cache and never fans out to the upstreams. `context_length` is advisory metadata; `max_output_tokens` is enforced (the request's `max_tokens` is clamped to it).
+- **Description**: Enumerates everything Ultiproxy can route: catalog aliases (config + MCP `set_model_alias`, carrying `context_length` / `max_output_tokens` from the alias `context_limit` / `max_output`), one entry per registered lane named exactly `<lane>` (every lane accepts prefix-routed models, including lanes with no model discovery such as `anthropic` / `codex`), and one entry per discovered upstream model on OpenAI-compatible lanes (model discovery is ON by default; `model_list_passthrough:false` opts out), exposed as `<lane>/<model>` — the exact id routing accepts. Discovery runs when a lane is registered, again at startup for lanes whose cache is still empty, and every 6h afterwards; listing itself is served from that cache and never fans out to the upstreams. `context_length` is advisory metadata; `max_output_tokens` is enforced (the request's `max_tokens` is clamped to it).
 - **Response Structure**:
 ```json
 {
@@ -181,8 +181,8 @@ curl -s http://localhost:9050/v1/messages \
   - `submit_oauth_code`: Submits the authorization code from the redirect callback URL (e.g. antigravity).
   - `list_model_aliases` / `set_model_alias` / `remove_model_alias`: The alias table (client-visible name -> provider lane + upstream id, with `context_limit`, `max_output`, `pricing_tag`, `input_cost`, `output_cost`); runtime changes persist in `data_dir/aliases.json`.
   - `get_provider_timeouts` / `set_provider_timeout` / `remove_provider_timeout`: Per-lane timeouts as Go duration strings (`10m`, `3m30s`), persisted in `data_dir/timeouts.json`.
-  - `add_provider` / `remove_provider` / `list_providers`: Runtime lane registration (OpenAI-compatible lanes via name/base_url/api_key/quirks, plus the antigravity, anthropic, codex and freebuff custom-wire kinds), persisted in `data_dir/providers.json`; `list_providers` redacts secrets.
-  - `refresh_models`: Re-fetches `GET <base>/v1/models` and caches the ids so `<lane>/<model>` appears in `/v1/models`.
+  - `add_provider` / `remove_provider` / `list_providers`: Runtime lane registration (OpenAI-compatible lanes via name/base_url/api_key/quirks, plus the antigravity, anthropic, codex and freebuff custom-wire kinds), persisted in `data_dir/providers.json`; `list_providers` redacts secrets. `add_provider` runs model discovery before replying and reports "discovered N models".
+  - `refresh_models`: Re-fetches `GET <base>/v1/models` and caches the ids so `<lane>/<model>` appears in `/v1/models`. Manual override on top of the automatic schedule (registration, startup backfill, 6h refresh).
 
 ### 7. Discovery & Health
 - **Route**: `GET /llms.txt` — Machine-readable overview for LLMs. The document is served from `llms.txt` in the process working directory when present, and otherwise from the copy embedded in the binary at build time (`go:embed`, see `llms_embed.go`), so an installed daemon serves it with no source checkout present.
