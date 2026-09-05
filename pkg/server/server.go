@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/http"
@@ -207,6 +209,11 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		if s.mcpLaneBuilder != nil {
 			mcpOpts = append(mcpOpts, mcp.WithCustomLaneBuilder(s.mcpLaneBuilder))
 		}
+		if s.writer != nil {
+			// get_client_usage answers from the SQLite telemetry store instead
+			// of synthetic zeros.
+			mcpOpts = append(mcpOpts, mcp.WithUsageSource(newStorageUsageSource(s.writer, cfg.Server.ClientKeys)))
+		}
 		s.mcpServer = mcp.NewServer(registry, stateSrc, mcpOpts...)
 	}
 
@@ -273,6 +280,58 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return s.httpServer.Shutdown(ctx)
 	}
 	return nil
+}
+
+// storageUsageSource adapts the SQLite telemetry writer to mcp.UsageSource, so
+// the MCP get_client_usage tool answers from the recorded requests/usage rows
+// instead of hardcoded zeros.
+type storageUsageSource struct {
+	writer *storage.Writer
+	// clientHashes maps configured client key names to the sha256 hex digest
+	// stored in requests.client_key_hash, so callers may pass either a key
+	// name ("alice") or the digest itself.
+	clientHashes map[string]string
+}
+
+// newStorageUsageSource builds a usage source over a telemetry writer. The
+// client key map only resolves names to digests; it is never used to
+// authenticate anything.
+func newStorageUsageSource(w *storage.Writer, clientKeys map[string]string) *storageUsageSource {
+	hashes := make(map[string]string, len(clientKeys))
+	for name, key := range clientKeys {
+		if key == "" {
+			continue
+		}
+		sum := sha256.Sum256([]byte(key))
+		hashes[name] = hex.EncodeToString(sum[:])
+	}
+	return &storageUsageSource{writer: w, clientHashes: hashes}
+}
+
+// GetClientUsage implements mcp.UsageSource. An empty clientID asks for the
+// aggregate over every client (including rows with no client key hash); a
+// non-empty one is matched as a configured client key name, or verbatim as the
+// key hash. Windows and totals come from the storage layer; an unreachable or
+// empty database yields zeros rather than an error.
+func (s *storageUsageSource) GetClientUsage(ctx context.Context, clientID, window string) (any, error) {
+	if s == nil || s.writer == nil || s.writer.DB() == nil {
+		return storage.ClientUsageTotals{ClientID: clientID, Window: window}, nil
+	}
+
+	// An empty client id means "every client"; otherwise resolve a configured
+	// client key name to its digest, falling back to treating the value as the
+	// digest itself.
+	hash := clientID
+	if resolved, ok := s.clientHashes[clientID]; ok {
+		hash = resolved
+	}
+
+	totals, err := s.writer.GetClientUsage(ctx, hash, window)
+	if err != nil {
+		return nil, err
+	}
+	totals.ClientID = clientID
+	return totals, nil
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {

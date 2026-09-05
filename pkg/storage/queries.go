@@ -172,3 +172,83 @@ func (w *Writer) ListUsageSummary(ctx context.Context) ([]DailySummaryRow, error
 func (w *Writer) ListUsageByClient(ctx context.Context, window string) ([]ClientUsageRow, error) {
 	return ListUsageByClient(ctx, w.db, window)
 }
+
+// ClientUsageTotals is the aggregate usage report the MCP get_client_usage
+// tool returns: request count, token counts and estimated USD cost for one
+// client key hash (or for the whole proxy when ClientKeyHash is empty) within
+// the requested window. The zero value is the legitimate answer for an empty
+// database.
+type ClientUsageTotals struct {
+	ClientID         string  `json:"client_id"`
+	ClientKeyHash    string  `json:"client_key_hash,omitempty"`
+	Window           string  `json:"window"`
+	Requests         int64   `json:"total_requests"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	ReasoningTokens  int64   `json:"reasoning_tokens"`
+	CachedTokens     int64   `json:"cached_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	Cost             float64 `json:"cost"`
+	FirstSeen        string  `json:"first_seen"`
+	LastSeen         string  `json:"last_seen"`
+}
+
+// GetClientUsage aggregates usage totals from the requests/usage tables for a
+// single client key hash, or for every client when clientKeyHash is empty, over
+// the given lookback window ("1h", "24h", "7d", ...; empty means the default
+// window). An empty database returns the zero value with no error.
+func GetClientUsage(ctx context.Context, db *sql.DB, clientKeyHash, window string) (ClientUsageTotals, error) {
+	dur, err := ParseWindowDuration(window)
+	if err != nil {
+		return ClientUsageTotals{}, err
+	}
+
+	since := time.Now().UTC().Add(-dur).Format(time.RFC3339)
+
+	query := `
+SELECT
+    COUNT(r.id) as requests,
+    COALESCE(SUM(u.prompt_tokens), 0) as prompt_tokens,
+    COALESCE(SUM(u.completion_tokens), 0) as completion_tokens,
+    COALESCE(SUM(u.reasoning_tokens), 0) as reasoning_tokens,
+    COALESCE(SUM(u.cached_tokens), 0) as cached_tokens,
+    COALESCE(SUM(u.prompt_tokens + u.completion_tokens), 0) as total_tokens,
+    COALESCE(SUM(u.cost), 0.0) as cost,
+    COALESCE(MIN(r.created_at), '') as first_seen,
+    COALESCE(MAX(r.created_at), '') as last_seen
+FROM requests r
+LEFT JOIN usage u ON r.id = u.request_id
+WHERE r.created_at >= ?
+`
+	args := []any{since}
+	if clientKeyHash != "" {
+		// Match the stored digest exactly; NULL and '' key hashes only belong
+		// to the aggregate view, never to a named client.
+		query += " AND COALESCE(r.client_key_hash, '') = ?"
+		args = append(args, clientKeyHash)
+	}
+	query += ";"
+
+	var totals ClientUsageTotals
+	if err := db.QueryRowContext(ctx, query, args...).Scan(
+		&totals.Requests,
+		&totals.PromptTokens,
+		&totals.CompletionTokens,
+		&totals.ReasoningTokens,
+		&totals.CachedTokens,
+		&totals.TotalTokens,
+		&totals.Cost,
+		&totals.FirstSeen,
+		&totals.LastSeen,
+	); err != nil {
+		return ClientUsageTotals{}, fmt.Errorf("query client usage totals: %w", err)
+	}
+	totals.ClientKeyHash = clientKeyHash
+	totals.Window = window
+	return totals, nil
+}
+
+// GetClientUsage aggregates usage totals using the writer's underlying DB.
+func (w *Writer) GetClientUsage(ctx context.Context, clientKeyHash, window string) (ClientUsageTotals, error) {
+	return GetClientUsage(ctx, w.db, clientKeyHash, window)
+}

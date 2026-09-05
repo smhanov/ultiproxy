@@ -82,7 +82,7 @@ Use it as a soft kill switch: a model that is misbehaving, an alias being draine
 - client_id: the client key identity to report on; leave it empty for the overall / aggregate view
 - window: lookback window such as "1h", "24h" or "7d"; leave it empty for the default window
 
-The report covers prompt (input) tokens, completion (output) tokens, cached prompt tokens, total tokens, request counts and the estimated USD cost derived from each model's pricing (set_model_alias input_cost / output_cost). Streaming and non-streaming requests are accounted the same way. When the running daemon has no usage source attached the totals come back as zero - use GET /api/stats/summary for the SQL-backed aggregate in that case.`,
+The report covers prompt (input) tokens, completion (output) tokens, cached prompt tokens, total tokens, request counts and the estimated USD cost derived from each model's pricing (set_model_alias input_cost / output_cost). Streaming and non-streaming requests are accounted the same way. Totals are read live from the daemon's SQLite telemetry store; only a daemon built without storage reports zeros, in which case GET /api/stats/summary carries the same SQL-backed aggregate.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
