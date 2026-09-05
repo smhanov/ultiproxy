@@ -467,3 +467,153 @@ func TestParseGrokCreditsResponse_MalformedInputNeverPanics(t *testing.T) {
 		}
 	}
 }
+
+// ----------------------------------------------------------------------------
+// Freebuff usage parsing
+// ----------------------------------------------------------------------------
+
+// modernFreebuffUsageJSON is the shape the current Codebuff usage endpoint
+// (POST https://www.codebuff.com/api/v1/usage) answers with: a single credit
+// balance plus the next quota reset, not the legacy day/week/month counters.
+const modernFreebuffUsageJSON = `{
+	"type": "usage-response",
+	"usage": 12.5,
+	"remainingBalance": 37.5,
+	"balanceBreakdown": {"free": 5, "referral": 2.5, "subscription": 30, "purchase": 0},
+	"next_quota_reset": "2026-10-03T12:42:08.035Z",
+	"autoTopupEnabled": false
+}`
+
+// TestParseFreebuffUsageSnapshot_ModernFormat verifies the modern
+// usage-response payload: one credits window carrying the remaining balance,
+// the used/total percentage, the limit and the next_quota_reset countdown.
+func TestParseFreebuffUsageSnapshot_ModernFormat(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 42, 8, 0, time.UTC)
+	wantReset := time.Date(2026, 10, 3, 12, 42, 8, 35000000, time.UTC)
+
+	snap, err := ParseFreebuffUsageSnapshot([]byte(modernFreebuffUsageJSON), now)
+	if err != nil {
+		t.Fatalf("ParseFreebuffUsageSnapshot: %v", err)
+	}
+	if !snap.ObservedAt.Equal(now) {
+		t.Errorf("ObservedAt = %v, want %v", snap.ObservedAt, now)
+	}
+	if len(snap.Windows) != 1 {
+		t.Fatalf("Windows = %+v, want exactly one credits window", snap.Windows)
+	}
+	win := snap.Windows[0]
+	if win.Label != "Credits" && win.Label != "Monthly" {
+		t.Errorf("Label = %q, want %q or %q", win.Label, "Credits", "Monthly")
+	}
+	if win.Unit != "credits" {
+		t.Errorf("Unit = %q, want %q", win.Unit, "credits")
+	}
+	if win.Remaining != 37.5 {
+		t.Errorf("Remaining = %v, want 37.5 (remainingBalance)", win.Remaining)
+	}
+	if win.Limit != 50 {
+		t.Errorf("Limit = %v, want 50 (usage + remainingBalance)", win.Limit)
+	}
+	if win.UsedPct != 25 {
+		t.Errorf("UsedPct = %v, want 25 (12.5 of 50)", win.UsedPct)
+	}
+	if !win.ResetAt.Equal(wantReset) {
+		t.Errorf("ResetAt = %v, want %v (next_quota_reset)", win.ResetAt, wantReset)
+	}
+	// 2026-09-03 -> 2026-10-03 is exactly 30 days.
+	if win.SecondsRemaining != 30*24*60*60 {
+		t.Errorf("SecondsRemaining = %d, want %d", win.SecondsRemaining, 30*24*60*60)
+	}
+}
+
+// TestParseFreebuffUsageSnapshot_ModernFormatZeroBalance: an exhausted
+// balance must not divide by zero: the window stays honest at 0%.
+func TestParseFreebuffUsageSnapshot_ModernFormatZeroBalance(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 42, 8, 0, time.UTC)
+	body := `{"type":"usage-response","usage":0,"remainingBalance":0,"next_quota_reset":"2026-10-03T12:42:08.035Z"}`
+
+	snap, err := ParseFreebuffUsageSnapshot([]byte(body), now)
+	if err != nil {
+		t.Fatalf("ParseFreebuffUsageSnapshot: %v", err)
+	}
+	if len(snap.Windows) != 1 {
+		t.Fatalf("Windows = %+v, want one window", snap.Windows)
+	}
+	win := snap.Windows[0]
+	if win.UsedPct != 0 || win.Limit != 0 || win.Remaining != 0 {
+		t.Errorf("window = %+v, want all-zero usage and balance", win)
+	}
+	if win.Unit != "credits" {
+		t.Errorf("Unit = %q, want credits", win.Unit)
+	}
+}
+
+// TestParseFreebuffUsageSnapshot_LegacyFormatStillParses: the legacy
+// day/week/month counters keep their three request windows when the modern
+// fields are absent.
+func TestParseFreebuffUsageSnapshot_LegacyFormatStillParses(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 42, 8, 0, time.UTC)
+	body := `{"dayUsed":10,"dayLimit":100,"weekUsed":30,"weekLimit":300,"monthUsed":50,"monthLimit":500,"resetAt":"2026-09-04T00:00:00Z"}`
+
+	snap, err := ParseFreebuffUsageSnapshot([]byte(body), now)
+	if err != nil {
+		t.Fatalf("ParseFreebuffUsageSnapshot: %v", err)
+	}
+	if len(snap.Windows) != 3 {
+		t.Fatalf("Windows = %+v, want the legacy daily/weekly/monthly trio", snap.Windows)
+	}
+	want := []struct {
+		label     string
+		remaining float64
+		limit     float64
+	}{
+		{"Daily", 90, 100},
+		{"Weekly", 270, 300},
+		{"Monthly", 450, 500},
+	}
+	for i, w := range want {
+		win := snap.Windows[i]
+		if win.Label != w.label || win.Remaining != w.remaining || win.Limit != w.limit || win.Unit != "requests" {
+			t.Errorf("window %d = %+v, want %s remaining %v limit %v requests", i, win, w.label, w.remaining, w.limit)
+		}
+	}
+	if snap.Windows[0].UsedPct != 10 {
+		t.Errorf("Daily UsedPct = %v, want 10", snap.Windows[0].UsedPct)
+	}
+}
+
+// modernUsageActor is a freebuff actor whose /usage endpoint answers with the
+// modern Codebuff usage-response payload.
+type modernUsageActor struct{}
+
+func (a *modernUsageActor) Acquire(ctx context.Context) error { return nil }
+func (a *modernUsageActor) Release()                          {}
+func (a *modernUsageActor) InstanceID() string                { return "fb-inst-mid" }
+func (a *modernUsageActor) FetchUsage(ctx context.Context, fingerprintID string) ([]byte, error) {
+	return []byte(modernFreebuffUsageJSON), nil
+}
+func (a *modernUsageActor) SessionInfo(ctx context.Context) (string, string, error) {
+	return "fb-inst-mid", "claude-opus-4.6", nil
+}
+
+// TestFreebuffQuota_ModernUsageResponse wires the modern payload through the
+// actor-backed quota path the freebuff lane actually uses.
+func TestFreebuffQuota_ModernUsageResponse(t *testing.T) {
+	snap, err := freebuffQuota(context.Background(), &modernUsageActor{})
+	if err != nil {
+		t.Fatalf("freebuffQuota: %v", err)
+	}
+	if len(snap.Windows) != 1 {
+		t.Fatalf("Windows = %+v, want one credits window", snap.Windows)
+	}
+	win := snap.Windows[0]
+	if win.Unit != "credits" || win.Remaining != 37.5 || win.Limit != 50 || win.UsedPct != 25 {
+		t.Errorf("window = %+v, want 37.5 of 50 credits (25%% used)", win)
+	}
+	if !win.ResetAt.Equal(time.Date(2026, 10, 3, 12, 42, 8, 35000000, time.UTC)) {
+		t.Errorf("ResetAt = %v, want the next_quota_reset instant", win.ResetAt)
+	}
+	if snap.Detail != "instance: fb-inst-mid, model: claude-opus-4.6" {
+		t.Errorf("Detail = %q, want the actor session detail", snap.Detail)
+	}
+}

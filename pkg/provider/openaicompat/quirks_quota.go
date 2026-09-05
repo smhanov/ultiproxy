@@ -493,6 +493,15 @@ type freebuffUsagePayload struct {
 	MonthLimit float64 `json:"monthLimit"`
 	ResetAt    string  `json:"resetAt"`
 
+	// Modern Codebuff usage response (POST https://www.codebuff.com/api/v1/usage):
+	// a single credit balance plus the next quota reset, not the legacy
+	// day/week/month request counters.
+	Type             string             `json:"type"`
+	Usage            float64            `json:"usage"`
+	RemainingBalance float64            `json:"remainingBalance"`
+	NextQuotaReset   string             `json:"next_quota_reset"`
+	BalanceBreakdown map[string]float64 `json:"balanceBreakdown"`
+
 	// snake_case fallback
 	DayUsedSnake    float64 `json:"day_used"`
 	DayLimitSnake   float64 `json:"day_limit"`
@@ -503,12 +512,57 @@ type freebuffUsagePayload struct {
 	ResetAtSnake    string  `json:"reset_at"`
 }
 
+// parseReset parses an RFC3339 reset timestamp into the instant plus the
+// seconds remaining until then (clamped at zero for past resets).
+func parseReset(resetStr string, now time.Time) (time.Time, int64) {
+	if resetStr == "" {
+		return time.Time{}, 0
+	}
+	t, err := time.Parse(time.RFC3339, resetStr)
+	if err != nil {
+		return time.Time{}, 0
+	}
+	secRem := int64(t.Sub(now).Seconds())
+	if secRem < 0 {
+		secRem = 0
+	}
+	return t, secRem
+}
+
 // ParseFreebuffUsageSnapshot parses freebuff usage response bytes into a
-// normalized QuotaSnapshot (ported verbatim from freebuff).
+// normalized QuotaSnapshot (ported verbatim from freebuff, extended for the
+// modern Codebuff usage-response payload).
 func ParseFreebuffUsageSnapshot(data []byte, now time.Time) (*provider.QuotaSnapshot, error) {
 	var u freebuffUsagePayload
 	if err := json.Unmarshal(data, &u); err != nil {
 		return nil, fmt.Errorf("failed to parse freebuff usage json: %w", err)
+	}
+
+	calcPct := func(used, limit float64) float64 {
+		if limit <= 0 {
+			return 0
+		}
+		return (used / limit) * 100.0
+	}
+
+	// Modern Codebuff usage-response: one credit-balance window that resets at
+	// next_quota_reset. The legacy day/week/month counters are absent there,
+	// and vice versa, so the two shapes never mix.
+	if u.Type == "usage-response" || u.NextQuotaReset != "" {
+		resetAt, secRem := parseReset(u.NextQuotaReset, now)
+		limit := u.Usage + u.RemainingBalance
+		return &provider.QuotaSnapshot{
+			ObservedAt: now,
+			Windows: []provider.QuotaWindow{{
+				Label:            "Credits",
+				Remaining:        u.RemainingBalance,
+				UsedPct:          calcPct(u.Usage, limit),
+				Limit:            limit,
+				Unit:             "credits",
+				ResetAt:          resetAt,
+				SecondsRemaining: secRem,
+			}},
+		}, nil
 	}
 
 	dayUsed := u.DayUsed
@@ -542,24 +596,7 @@ func ParseFreebuffUsageSnapshot(data []byte, now time.Time) (*provider.QuotaSnap
 	if resetStr == "" {
 		resetStr = u.ResetAtSnake
 	}
-	var resetAt time.Time
-	var secRem int64
-	if resetStr != "" {
-		if t, err := time.Parse(time.RFC3339, resetStr); err == nil {
-			resetAt = t
-			secRem = int64(t.Sub(now).Seconds())
-			if secRem < 0 {
-				secRem = 0
-			}
-		}
-	}
-
-	calcPct := func(used, limit float64) float64 {
-		if limit <= 0 {
-			return 0
-		}
-		return (used / limit) * 100.0
-	}
+	resetAt, secRem := parseReset(resetStr, now)
 
 	windows := []provider.QuotaWindow{
 		{
