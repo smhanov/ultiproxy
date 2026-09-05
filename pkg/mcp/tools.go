@@ -395,6 +395,8 @@ type listedModel struct {
 	Provider        string             `json:"provider"`
 	Enabled         bool               `json:"enabled"`
 	ContextLimit    int                `json:"context_limit,omitempty"`
+	ContextLength   int                `json:"context_length,omitempty"`
+	MaxModelLen     int                `json:"max_model_len,omitempty"`
 	MaxOutput       int                `json:"max_output,omitempty"`
 	PricingTag      string             `json:"pricing_tag,omitempty"`
 	BenchmarkScores map[string]float64 `json:"benchmarks,omitempty"`
@@ -474,10 +476,21 @@ func (s *Server) listedModels() map[string]listedModel {
 		sort.Strings(keys)
 		for _, k := range keys {
 			m := snap.Models[k]
+			upstream := ""
+			if s.aliases != nil {
+				if entries := s.aliases.List(); entries != nil {
+					if e, ok := entries[m.ID]; ok {
+						upstream = e.Upstream
+					}
+				}
+			}
+			window := mcpResolvedContext(m.ContextLimit, s.discoveredContext(m.Provider, upstream))
 			set(m.ID, listedModel{
 				Provider:        m.Provider,
 				Enabled:         m.Enabled,
-				ContextLimit:    m.ContextLimit,
+				ContextLimit:    window,
+				ContextLength:   window,
+				MaxModelLen:     window,
 				MaxOutput:       m.MaxOutput,
 				PricingTag:      m.PricingTag,
 				BenchmarkScores: m.BenchmarkScores,
@@ -500,10 +513,13 @@ func (s *Server) listedModels() map[string]listedModel {
 					enabled = mr.Enabled
 				}
 			}
+			window := mcpResolvedContext(entry.ContextLimit, s.discoveredContext(entry.Provider, entry.Upstream))
 			set(alias, listedModel{
 				Provider:        entry.Provider,
 				Enabled:         enabled,
-				ContextLimit:    entry.ContextLimit,
+				ContextLimit:    window,
+				ContextLength:   window,
+				MaxModelLen:     window,
 				MaxOutput:       entry.MaxOutput,
 				PricingTag:      entry.PricingTag,
 				BenchmarkScores: entry.BenchmarkScores,
@@ -525,21 +541,74 @@ func (s *Server) listedModels() map[string]listedModel {
 				continue
 			}
 			if cacher, ok := bundle.Inference.(modelsCacheProvider); ok {
-				discovered := append([]string(nil), cacher.CachedModels()...)
-				sort.Strings(discovered)
-				for _, m := range discovered {
-					set(name+"/"+m, listedModel{Provider: name, Enabled: true, Source: "discovery"})
+				if meta, ok := bundle.Inference.(provider.ModelInfoCache); ok {
+					info := meta.CachedModelInfo()
+					sort.Slice(info, func(i, j int) bool { return info[i].ID < info[j].ID })
+					for _, m := range info {
+						set(name+"/"+m.ID, listedModel{
+							Provider:      name,
+							Enabled:       true,
+							ContextLimit:  m.ContextLength,
+							ContextLength: m.ContextLength,
+							MaxModelLen:   m.ContextLength,
+							Source:        "discovery",
+						})
+					}
+				} else {
+					discovered := append([]string(nil), cacher.CachedModels()...)
+					sort.Strings(discovered)
+					for _, m := range discovered {
+						set(name+"/"+m, listedModel{Provider: name, Enabled: true, Source: "discovery"})
+					}
 				}
 			}
 			if def, ok := bundle.Inference.(defaultModelProvider); ok {
 				if m := def.DefaultModel(); m != "" {
-					set(name+"/"+m, listedModel{Provider: name, Enabled: true, Source: "default"})
+					w := s.discoveredContext(name, m)
+					set(name+"/"+m, listedModel{
+						Provider:      name,
+						Enabled:       true,
+						ContextLimit:  w,
+						ContextLength: w,
+						MaxModelLen:   w,
+						Source:        "default",
+					})
 				}
 			}
 		}
 	}
 
 	return out
+}
+
+func mcpResolvedContext(aliasLimit, discovered int) int {
+	if aliasLimit > 0 {
+		return aliasLimit
+	}
+	if discovered > 0 {
+		return discovered
+	}
+	return 0
+}
+
+func (s *Server) discoveredContext(lane, upstream string) int {
+	if s == nil || s.registry == nil || lane == "" || upstream == "" {
+		return 0
+	}
+	bundle, ok := s.registry.Get(lane)
+	if !ok || bundle.Inference == nil {
+		return 0
+	}
+	meta, ok := bundle.Inference.(provider.ModelInfoCache)
+	if !ok {
+		return 0
+	}
+	for _, m := range meta.CachedModelInfo() {
+		if m.ID == upstream {
+			return m.ContextLength
+		}
+	}
+	return 0
 }
 
 func (s *Server) toolGetQuotaStatus(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {
