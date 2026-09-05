@@ -204,16 +204,6 @@ Configure MCP in Claude Desktop or your agent's MCP config:
 
 ---
 
-## Replacing `quota.fjkl.cc`
-
-Ultiproxy is a 100% drop-in replacement for the legacy `quota.fjkl.cc` dashboard and `dashboard-quota-probe.py` probe scripts.
-
-- **`GET /api/quota`**: Serves the exact JSON shape required by existing web dashboards, router probes, and monitoring jobs.
-- **`GET /quota.txt` & `GET /quota.md`**: Text and Markdown formatted quota reports for terminal inspection and LLM context loading.
-- **`GET /llms.txt`**: Machine-readable specification adhering to the llms.txt standard for automated agent discovery.
-
----
-
 ## Security & Architecture
 
 - **Single Key Surface**: Clients communicate with Ultiproxy via a single client key (`sk-up-...`). Upstream subscription credentials never leak to clients or network traces.
