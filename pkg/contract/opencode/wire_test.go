@@ -16,6 +16,7 @@ import (
 type wireActor struct {
 	mu            sync.Mutex
 	instanceID    string
+	actingUserID  string
 	acquireCount  int
 	releaseCount  int
 	active        int
@@ -45,6 +46,15 @@ func (a *wireActor) Release() {
 
 // InstanceID feeds the x-freebuff-instance-id header and codebuff_metadata.
 func (a *wireActor) InstanceID() string { return a.instanceID }
+
+// ActingUserID satisfies the binary-identical header surface (the shipped CLI
+// resolves the acting user from /me at runtime).
+func (a *wireActor) ActingUserID(ctx context.Context) string {
+	if a.actingUserID == "" {
+		return "usr-wire"
+	}
+	return a.actingUserID
+}
 
 // StartRun feeds codebuff_metadata.run_id.
 func (a *wireActor) StartRun(ctx context.Context, model string) (any, error) {
@@ -321,7 +331,8 @@ func TestWire_FreebuffQuirk(t *testing.T) {
 		t.Errorf("expected exactly 1 injected tool, got %d: %+v", len(rec.Tools), rec.Tools)
 	}
 
-	// codebuff_metadata injected.
+	// codebuff_metadata injected — binary-identical shape (no instance id in
+	// metadata; instance rides session API calls only).
 	meta, ok := rec.JSON["codebuff_metadata"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected codebuff_metadata in upstream body, got %v", rec.JSON["codebuff_metadata"])
@@ -329,19 +340,32 @@ func TestWire_FreebuffQuirk(t *testing.T) {
 	if meta["run_id"] != "run-wire-42" {
 		t.Errorf("expected run_id run-wire-42, got %v", meta["run_id"])
 	}
-	if meta["freebuff_instance_id"] != "fb-inst-wire" {
-		t.Errorf("expected freebuff_instance_id fb-inst-wire, got %v", meta["freebuff_instance_id"])
-	}
 	if meta["cost_mode"] != "free" {
 		t.Errorf("expected cost_mode free, got %v", meta["cost_mode"])
 	}
-
-	// Actor instance id header.
-	if got := rec.GetHeader("x-freebuff-instance-id"); got != "fb-inst-wire" {
-		t.Errorf("expected x-freebuff-instance-id fb-inst-wire, got %q", got)
+	if _, ok := meta["freebuff_instance_id"]; ok {
+		t.Errorf("freebuff_instance_id must be absent from metadata (binary omits it)")
 	}
-	if rec.GetHeader("x-freebuff-acting-user-id") == "" {
-		t.Error("expected x-freebuff-acting-user-id header to be set")
+	if cid, _ := meta["client_id"].(string); cid == "" || strings.HasPrefix(cid, "cli-") || strings.Contains(cid, "-") {
+		t.Errorf("client_id = %v, want base36 random per run (no cli- prefix)", meta["client_id"])
+	}
+
+	// provider block: allow_fallbacks=false for official models.
+	prov, ok := rec.JSON["provider"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected provider object in upstream body, got %v", rec.JSON["provider"])
+	}
+	if prov["allow_fallbacks"] != false {
+		t.Errorf("expected provider.allow_fallbacks false, got %v", prov["allow_fallbacks"])
+	}
+
+	// Instance header IS present on chat (upstream keys the free session to
+	// it — without it chat 428s even with an active session; verified live).
+	if got := rec.GetHeader("x-freebuff-instance-id"); got == "" {
+		t.Error("expected x-freebuff-instance-id on chat (session keying), got none")
+	}
+	if got := rec.GetHeader("x-freebuff-acting-user-id"); got != "usr-wire" {
+		t.Errorf("expected x-freebuff-acting-user-id usr-wire, got %q", got)
 	}
 
 	// The account lock must be acquired and released exactly once.

@@ -97,6 +97,8 @@ type FreebuffAccountActor struct {
 	boundModel string
 	currentRun *AgentRun
 
+	actingUserID string // cached from GET /me?fields=id (binary-identical)
+
 	queueCap   int
 	queue      chan streamJob
 	stopCh     chan struct{}
@@ -171,11 +173,58 @@ func (a *FreebuffAccountActor) SetInstanceID(id string) {
 	a.instanceID = id
 }
 
-// SetToken updates the bearer token.
+// SetToken updates the bearer token and invalidates the cached acting-user
+// id: a new token is a new user, so the next ActingUserID call re-fetches.
 func (a *FreebuffAccountActor) SetToken(tok string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.token = tok
+	a.actingUserID = ""
+}
+
+// ActingUserID returns the account id for the x-freebuff-acting-user-id
+// header, fetched live from GET /me?fields=id exactly like the shipped CLI
+// (which resolves it at run start) and cached for the actor's lifetime. The
+// id must never be hardcoded or stale: a user-id that doesn't match the
+// bearer token is itself a fingerprint signal.
+func (a *FreebuffAccountActor) ActingUserID(ctx context.Context) string {
+	a.mu.Lock()
+	if a.actingUserID != "" {
+		id := a.actingUserID
+		a.mu.Unlock()
+		return id
+	}
+	tok := a.token
+	baseURL := a.baseURL
+	client := a.httpClient
+	a.mu.Unlock()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/me?fields=id", nil)
+	if err != nil {
+		return ""
+	}
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ""
+	}
+	var me struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&me); err != nil || me.ID == "" {
+		return ""
+	}
+
+	a.mu.Lock()
+	a.actingUserID = me.ID
+	a.mu.Unlock()
+	return me.ID
 }
 
 // TryAcquire attempts to acquire the advisory lock non-blockingly.
@@ -337,23 +386,21 @@ func (a *FreebuffAccountActor) Bind(ctxOrModel any, optionalModel ...string) err
 	}
 
 	a.mu.Lock()
-	instID := a.instanceID
 	tok := a.token
 	client := a.httpClient
 	a.mu.Unlock()
 
 	doBind := func() (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/freebuff/session", bytes.NewReader([]byte("{}")))
+		// Binary-identical bind: header-only POST (x-freebuff-model), NO body.
+		// The upstream mints and returns the instanceId; sending a body was
+		// the historical "instance dropped → 409" bind bug.
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/freebuff/session", nil)
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("x-freebuff-model", model)
 		if tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
-		}
-		if instID != "" {
-			req.Header.Set("x-freebuff-instance-id", instID)
 		}
 		return client.Do(req)
 	}
@@ -365,9 +412,6 @@ func (a *FreebuffAccountActor) Bind(ctxOrModel any, optionalModel ...string) err
 	if resp.StatusCode == http.StatusConflict {
 		resp.Body.Close()
 		_ = a.DeleteSession(ctx)
-		a.mu.Lock()
-		instID = a.instanceID
-		a.mu.Unlock()
 		resp, err = doBind()
 		if err != nil {
 			return err

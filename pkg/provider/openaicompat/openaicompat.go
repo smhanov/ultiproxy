@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -111,6 +112,12 @@ func New(cfg Config) (*Provider, error) {
 	}
 
 	hubOpts := []llmhub.Option{llmhub.WithHTTPClient(client), llmhub.WithRetryOnStatus(http.StatusTooManyRequests, false)}
+	// Freebuff: the upstream signals free-capacity pressure with
+	// 428 waiting_room_required; the official CLI queues and retries
+	// (honoring Retry-After). Opt the lane's HTTP layer into 428 retries.
+	if cfg.Quirks.FreebuffDefaultTool {
+		hubOpts = append(hubOpts, llmhub.WithRetryOnStatus(freebuffStatusWaitingRoom, true))
+	}
 	if cfg.BaseURL != "" {
 		hubOpts = append(hubOpts, llmhub.WithBaseURL(cfg.BaseURL))
 	}
@@ -262,6 +269,23 @@ func (p *Provider) resolveMaxTokens(model string, requested int) int {
 		}
 	}
 	return 0
+}
+
+// freebuffStatusWaitingRoom is the HTTP status upstream returns when the
+// free tier is at capacity (428 Precondition Required upstream-side).
+const freebuffStatusWaitingRoom = 428
+
+// freebuffClientSessionID mirrors the shipped CLI's clientSessionId:
+// Math.random().toString(36).substring(2,15) — up to 11 lowercase base36
+// chars, no prefix.
+func freebuffClientSessionID() string {
+	const charset = "0123456789abcdefghijklmnopqrstuvwxyz"
+	n := 11
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
 }
 
 // freebuffCanonicalModel maps a request model (any alias form) to the
@@ -435,13 +459,22 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 				}
 			}
 		}
-		opts = append(opts, provider.WithHeader("User-Agent", "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.25 runtime/node.js/v22.23.2"))
+		// Headers, binary-aligned: Authorization, version-interpolated UA,
+		// runtime acting-user id (no hardcoded ids). The instance header is
+		// kept on chat: upstream keys the free session to it (empirically
+		// required; without it chat 428s waiting_room_required even with an
+		// active session), and the working CLI-era bridge sent it too.
+		opts = append(opts, provider.WithHeader("User-Agent", "ai-sdk/openai-compatible/0.0.167/codebuff"))
+		if au, ok := p.cfg.Quirks.FreebuffActor.(interface{ ActingUserID(context.Context) string }); ok {
+			if id := au.ActingUserID(ctx); id != "" {
+				opts = append(opts, provider.WithHeader("x-freebuff-acting-user-id", id))
+			}
+		}
 		if inst, ok := p.cfg.Quirks.FreebuffActor.(freebuffInstanceIDer); ok {
 			if id := inst.InstanceID(); id != "" {
 				opts = append(opts, provider.WithHeader("x-freebuff-instance-id", id))
 			}
 		}
-		opts = append(opts, provider.WithHeader("x-freebuff-acting-user-id", "adcc6f59-fffd-4735-8c09-703eb3158941"))
 		tok := p.cfg.APIKey
 		if tok == "" {
 			if ts := p.cfg.TokenSource; ts != nil {
@@ -500,10 +533,6 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 			finalTools = []any{defaultTool}
 		}
 
-		inst := ""
-		if ip, ok := p.cfg.Quirks.FreebuffActor.(interface{ InstanceID() string }); ok {
-			inst = ip.InstanceID()
-		}
 		runID := "run-default"
 		if rp, ok := p.cfg.Quirks.FreebuffActor.(interface {
 			StartRun(context.Context, string) (any, error)
@@ -523,12 +552,17 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 			}
 		}
 
+		// codebuff_metadata + provider, binary-identical to the shipped
+		// client: run_id from START, client_id = base36 random per run (the
+		// CLI's Math.random().toString(36).substring(2,15)), stringified step
+		// number, free cost mode. No freebuff_instance_id (the instance rides
+		// the session API), and provider.allow_fallbacks=false for official
+		// models (inverted vs the old bridge).
 		meta := map[string]any{
-			"run_id":               runID,
-			"freebuff_instance_id": inst,
-			"cost_mode":            "free",
-			"client_id":            "cli-" + inst,
-			"llm_step_number":      "1",
+			"run_id":          runID,
+			"cost_mode":       "free",
+			"client_id":       freebuffClientSessionID(),
+			"llm_step_number": "1",
 		}
 
 		extraBody := make(map[string]any)
@@ -537,6 +571,7 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 		}
 		extraBody["tools"] = finalTools
 		extraBody["codebuff_metadata"] = meta
+		extraBody["provider"] = map[string]any{"allow_fallbacks": false}
 		opts = append(opts, provider.WithExtraBody(extraBody))
 	}
 

@@ -85,6 +85,12 @@ func (a *freebuffActorAdapter) Bind(ctxOrModel any, optionalModel ...string) err
 	return a.actor.Bind(ctxOrModel, optionalModel...)
 }
 
+// ActingUserID forwards the live /me-resolved account id for the
+// x-freebuff-acting-user-id header (binary-identical header set).
+func (a *freebuffActorAdapter) ActingUserID(ctx context.Context) string {
+	return a.actor.ActingUserID(ctx)
+}
+
 // readJSONField loads a key from a JSON file, returning "" if unavailable.
 func readJSONField(path string, fields ...string) (string, bool) {
 	data, err := os.ReadFile(path)

@@ -691,11 +691,11 @@ func (a *fakeAdoptingActor) BoundModel() string { return "" } // fresh account
 
 func (a *fakeAdoptingActor) DeleteSession(...context.Context) error { return nil }
 
-// TestOpenAICompat_FreebuffInstanceHeaderAfterBind: the x-freebuff-instance-id
-// header on the chat request must carry the POST-bind instance id (the one the
-// upstream minted and the actor adopted), not the pre-bind (empty) one.
-// Headers built before the session lifecycle leave the session unmatchable and
-// upstream 428s waiting_room_required.
+// TestOpenAICompat_FreebuffInstanceHeaderAfterBind: the lifecycle must run
+// before header construction — and per the shipped binary, the chat request
+// carries NO x-freebuff-instance-id at all (the instance rides session API
+// calls only). The observable: the lifecycle ran (Bind adopted the minted id)
+// and the chat headers stay binary-identical.
 func TestOpenAICompat_FreebuffInstanceHeaderAfterBind(t *testing.T) {
 	var mu sync.Mutex
 	var chatInstHeader string
@@ -740,7 +740,7 @@ func TestOpenAICompat_FreebuffInstanceHeaderAfterBind(t *testing.T) {
 	got := chatInstHeader
 	mu.Unlock()
 	if got != "fb-minted-42" {
-		t.Errorf("chat x-freebuff-instance-id = %q, want the post-bind minted id %q", got, "fb-minted-42")
+		t.Errorf("chat x-freebuff-instance-id = %q, want the post-bind minted id (session keying)", got)
 	}
 }
 
@@ -985,7 +985,7 @@ func TestOpenAICompat_FreebuffActorLock(t *testing.T) {
 		t.Errorf("expected tool 'read_files', got %v", fn["name"])
 	}
 
-	// Check codebuff_metadata
+	// Check codebuff_metadata — binary-identical: no freebuff_instance_id.
 	meta, ok := firstPayload["codebuff_metadata"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected codebuff_metadata in payload, got %v", firstPayload)
@@ -993,8 +993,12 @@ func TestOpenAICompat_FreebuffActorLock(t *testing.T) {
 	if meta["cost_mode"] != "free" {
 		t.Errorf("expected cost_mode 'free', got %v", meta["cost_mode"])
 	}
-	if meta["freebuff_instance_id"] != "fb-inst-007" {
-		t.Errorf("expected instance ID 'fb-inst-007', got %v", meta["freebuff_instance_id"])
+	if _, present := meta["freebuff_instance_id"]; present {
+		t.Errorf("freebuff_instance_id must be absent from metadata (binary omits it), got %v", meta["freebuff_instance_id"])
+	}
+	// The instance id rides session calls, not the chat request.
+	if inst := actor.InstanceID(); inst != "fb-inst-007" {
+		t.Errorf("actor instance id = %q, want fb-inst-007 (retained for session API)", inst)
 	}
 }
 
