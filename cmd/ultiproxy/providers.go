@@ -236,22 +236,14 @@ func registerProviders(registry *provider.Registry) {
 		}
 	}
 
-	// OpenCode Go — env only (ultiproxy self-contained): API key, workspace id,
-	// session cookie all come from env; no external CLI config reads.
+	// OpenCode Go — env only (ultiproxy self-contained): standard Bearer API
+	// key (opencode.ai/auth); no external CLI config reads.
 	ocKey := firstEnv("OPENCODE_API_KEY", "ULTIPROXY_OPENCODE_API_KEY")
-
-	ocWorkspace := firstEnv("OPENCODE_WORKSPACE_ID", "ULTIPROXY_OPENCODE_WORKSPACE")
-	ocCookie := firstEnv("OPENCODE_SESSION_COOKIE", "ULTIPROXY_OPENCODE_COOKIE")
-	if ocKey != "" || (ocWorkspace != "" && ocCookie != "") {
+	if ocKey != "" {
 		if p, err := openaicompat.New(openaicompat.Config{
-			Name:          "opencode",
-			BaseURL:       "https://opencode.ai/zen/go/v1",
-			APIKey:        ocKey,
-			WorkspaceID:   ocWorkspace,
-			SessionCookie: ocCookie,
-			Quirks: openaicompat.Quirks{
-				AuthViaWorkspaceCookie: true,
-			},
+			Name:    "opencode",
+			BaseURL: "https://opencode.ai/zen/go/v1",
+			APIKey:  ocKey,
 		}); err == nil {
 			add("opencode", p.Provider())
 		} else {

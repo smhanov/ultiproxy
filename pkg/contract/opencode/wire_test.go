@@ -197,30 +197,6 @@ func TestWire_EchoReasoning(t *testing.T) {
 	}
 }
 
-// TestWire_WorkspaceCookieAuth verifies the opencode quirk on the wire: the
-// workspace id and session cookie reach the upstream as headers.
-func TestWire_WorkspaceCookieAuth(t *testing.T) {
-	h, _ := newWireHarness(t, "wslane", func(c *openaicompat.Config) {
-		c.Quirks.AuthViaWorkspaceCookie = true
-		c.WorkspaceID = "ws-test"
-		c.SessionCookie = "sess-test"
-	})
-
-	rec := postChatAndRecord(t, h, map[string]any{
-		"model": "wslane/gpt-5",
-		"messages": []map[string]any{
-			{"role": "user", "content": "check auth"},
-		},
-	})
-
-	if cookie := rec.GetHeader("Cookie"); !strings.Contains(cookie, "session=sess-test") {
-		t.Errorf("expected Cookie header containing session=sess-test, got %q", cookie)
-	}
-	if ws := rec.GetHeader("X-Workspace-ID"); ws != "ws-test" {
-		t.Errorf("expected X-Workspace-ID %q, got %q", "ws-test", ws)
-	}
-}
-
 // TestWire_ModelListPassthrough verifies the vllm quirk on the wire: the model
 // catalog is discovered from the upstream /v1/models endpoint. GET /v1/models on
 // the ultiproxy server is served from the local catalog, so the passthrough is

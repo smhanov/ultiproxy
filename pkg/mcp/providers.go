@@ -41,7 +41,6 @@ type providerQuirksArgs struct {
 	MaxTokensByModel       map[string]int `json:"max_tokens_by_model"`
 	EchoReasoning          bool           `json:"echo_reasoning"`
 	ModelListPassthrough   bool           `json:"model_list_passthrough"`
-	AuthViaWorkspaceCookie bool           `json:"auth_via_workspace_cookie"`
 	AuthViaOAuthManager    bool           `json:"auth_via_oauth_manager"`
 	CreditsQuotaObserver   string         `json:"credits_quota_observer"`
 	AuthViaSupabaseRefresh bool           `json:"auth_via_supabase_refresh"`
@@ -68,7 +67,6 @@ func (a addProviderArgs) config() openaicompat.Config {
 			MaxTokensByModel:       a.Quirks.MaxTokensByModel,
 			EchoReasoning:          a.Quirks.EchoReasoning,
 			ModelListPassthrough:   a.Quirks.ModelListPassthrough,
-			AuthViaWorkspaceCookie: a.Quirks.AuthViaWorkspaceCookie,
 			AuthViaOAuthManager:    a.Quirks.AuthViaOAuthManager,
 			CreditsQuotaObserver:   a.Quirks.CreditsQuotaObserver,
 			AuthViaSupabaseRefresh: a.Quirks.AuthViaSupabaseRefresh,
@@ -252,8 +250,8 @@ func (s *Server) toolRemoveProvider(ctx context.Context, argsRaw json.RawMessage
 	}), nil
 }
 
-// toolListProviders lists runtime-registered lanes. Secrets (api_key,
-// session_cookie) are never returned, only presence booleans.
+// toolListProviders lists runtime-registered lanes. Secrets (the api_key)
+// are never returned, only a presence boolean.
 func (s *Server) toolListProviders(ctx context.Context) (*CallToolResult, *JSONRPCError) {
 	stored := map[string]openaicompat.Config{}
 	if s.providers != nil {
@@ -270,18 +268,14 @@ func (s *Server) toolListProviders(ctx context.Context) (*CallToolResult, *JSONR
 	for _, name := range names {
 		cfg := stored[name]
 		lanes = append(lanes, map[string]any{
-			"name":               name,
-			"base_url":           cfg.BaseURL,
-			"data_dir":           cfg.DataDir,
-			"has_api_key":        cfg.APIKey != "",
-			"has_session_cookie": cfg.SessionCookie != "",
-			"has_workspace_id":   cfg.WorkspaceID != "",
-			"auth_via_oauth":     cfg.Quirks.AuthViaOAuthManager || cfg.Quirks.AuthViaSupabaseRefresh || cfg.Quirks.AuthViaWorkspaceCookie,
+			"name":           name,
+			"base_url":       cfg.BaseURL,
+			"has_api_key":    cfg.APIKey != "",
+			"auth_via_oauth": cfg.Quirks.AuthViaOAuthManager || cfg.Quirks.AuthViaSupabaseRefresh,
 			"quirks": map[string]any{
 				"coding_plan_path":          cfg.Quirks.CodingPlanPath,
 				"echo_reasoning":            cfg.Quirks.EchoReasoning,
 				"model_list_passthrough":    cfg.Quirks.ModelListPassthrough,
-				"auth_via_workspace_cookie": cfg.Quirks.AuthViaWorkspaceCookie,
 				"auth_via_oauth_manager":    cfg.Quirks.AuthViaOAuthManager,
 				"auth_via_supabase_refresh": cfg.Quirks.AuthViaSupabaseRefresh,
 				"credits_quota_observer":    cfg.Quirks.CreditsQuotaObserver,

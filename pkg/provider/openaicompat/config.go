@@ -12,14 +12,15 @@ type Config struct {
 	Name        string           // registry lane name ("openai-zai", "openai-vllm", ...)
 	BaseURL     string           // vendor default OR configured
 	APIKey      string           // static key
-	TokenSource auth.TokenSource // opencode cookie, xai OAuth, augure refresh
+	TokenSource auth.TokenSource // xai OAuth, augure refresh (set by the daemon, never by MCP)
 	HTTPClient  *http.Client
-	DataDir     string // for xai OAuth cred dir, augure token file
-	Quirks      Quirks
+	// DataDir is internal daemon plumbing (not client-facing): the server-level
+	// directory holding xai OAuth creds / the augure token file. Runtime lanes
+	// get it assigned by the daemon runner, never from a config option.
+	DataDir string // for xai OAuth cred dir, augure token file
+	Quirks  Quirks
 
-	// Optional quirk-specific credentials / overrides
-	WorkspaceID   string // for AuthViaWorkspaceCookie (opencode)
-	SessionCookie string // for AuthViaWorkspaceCookie (opencode)
+	// Optional quirk-specific overrides
 	RefreshURL    string // for AuthViaSupabaseRefresh (augure)
 	TokenFile     string // for AuthViaSupabaseRefresh (augure)
 	DeviceAuthURL string // for AuthViaOAuthManager (xai)
@@ -32,7 +33,6 @@ type Quirks struct {
 	MaxTokensByModel       map[string]int // zai: glm-4.5-air -> 98304, else 131072 (resolveMaxTokens)
 	EchoReasoning          bool           // deepseek: re-emit reasoning_content on input + parse on output
 	ModelListPassthrough   bool           // vllm: /v1/models from upstream, no auth required
-	AuthViaWorkspaceCookie bool           // opencode: workspace id + session cookie headers
 	AuthViaOAuthManager    bool           // xai: auth.Manager creds + refresh
 	CreditsQuotaObserver   string         // xai: credits endpoint id for the quota observer ("" = none)
 	AuthViaSupabaseRefresh bool           // augure: token file + Supabase refresh

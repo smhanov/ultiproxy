@@ -66,16 +66,6 @@ func New(cfg Config) (*Provider, error) {
 		cfg.Quirks.CodingPlanPath = true
 	}
 
-	// Quirks: AuthViaWorkspaceCookie environment fallbacks
-	if cfg.Quirks.AuthViaWorkspaceCookie {
-		if cfg.WorkspaceID == "" {
-			cfg.WorkspaceID = os.Getenv("OPENCODE_WORKSPACE_ID")
-		}
-		if cfg.SessionCookie == "" {
-			cfg.SessionCookie = os.Getenv("OPENCODE_SESSION_COOKIE")
-		}
-	}
-
 	// Quirks: AuthViaSupabaseRefresh TokenSource initialization
 	if cfg.Quirks.AuthViaSupabaseRefresh && cfg.TokenSource == nil {
 		refreshURL := cfg.RefreshURL
@@ -123,20 +113,6 @@ func New(cfg Config) (*Provider, error) {
 	}
 	if cfg.TokenSource != nil {
 		hubOpts = append(hubOpts, llmhub.WithTokenSource(cfg.TokenSource))
-	}
-
-	// Attach headers for AuthViaWorkspaceCookie if available at construction time
-	if cfg.Quirks.AuthViaWorkspaceCookie {
-		cookieHeader := cfg.SessionCookie
-		if cookieHeader != "" && !strings.Contains(cookieHeader, "=") {
-			cookieHeader = "session=" + cookieHeader
-		}
-		if cookieHeader != "" {
-			hubOpts = append(hubOpts, llmhub.WithHeader("Cookie", cookieHeader))
-		}
-		if cfg.WorkspaceID != "" {
-			hubOpts = append(hubOpts, llmhub.WithHeader("X-Workspace-ID", cfg.WorkspaceID))
-		}
 	}
 
 	// ALWAYS build the underlying llmhub provider using the openai client, NEVER vendor providers
@@ -391,42 +367,7 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 	// 3. Reasoning sanitization (EchoReasoning)
 	msgs = sanitizeReasoning(msgs, p.cfg.Quirks.EchoReasoning)
 
-	// 4. OpenCode Workspace / Session-Cookie auth
-	if p.cfg.Quirks.AuthViaWorkspaceCookie {
-		sessCookie := p.cfg.SessionCookie
-		wsID := p.cfg.WorkspaceID
-
-		if p.cfg.TokenSource != nil {
-			if wts, ok := p.cfg.TokenSource.(interface {
-				WorkspaceID() string
-				SessionCookie() string
-			}); ok {
-				if wsID == "" {
-					wsID = wts.WorkspaceID()
-				}
-				if sessCookie == "" {
-					sessCookie = wts.SessionCookie()
-				}
-			} else if tok, err := p.cfg.TokenSource.Token(ctx); err == nil && tok != nil {
-				if sessCookie == "" {
-					sessCookie = tok.AccessToken
-				}
-			}
-		}
-
-		if sessCookie != "" {
-			cookieHeader := sessCookie
-			if !strings.Contains(cookieHeader, "=") {
-				cookieHeader = "session=" + cookieHeader
-			}
-			opts = append(opts, provider.WithHeader("Cookie", cookieHeader))
-		}
-		if wsID != "" {
-			opts = append(opts, provider.WithHeader("X-Workspace-ID", wsID))
-		}
-	}
-
-	// 5+6. Freebuff session lifecycle BEFORE header construction, then the
+	// 4+5. Freebuff session lifecycle BEFORE header construction, then the
 	// freebuff headers and default tool/codebuff_metadata transform.
 	if p.cfg.Quirks.FreebuffActor != nil {
 		// Lifecycle first: reconcile, bind to the canonical publisher model

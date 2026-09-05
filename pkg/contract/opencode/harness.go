@@ -255,15 +255,10 @@ func NewHarness(opts ...HarnessOption) (*Harness, error) {
 		registry.Register(activeProvBundle)
 	} else {
 		ocCfg := openaicompat.Config{
-			Name:          "opencode",
-			BaseURL:       fake.URL(),
-			APIKey:        "test-key",
-			WorkspaceID:   "test-workspace",
-			SessionCookie: "test-cookie",
-			HTTPClient:    fake.Client(),
-			Quirks: openaicompat.Quirks{
-				AuthViaWorkspaceCookie: true,
-			},
+			Name:       "opencode",
+			BaseURL:    fake.URL(),
+			APIKey:     "test-key",
+			HTTPClient: fake.Client(),
 		}
 		if hcfg.customOpenCodeCfg != nil {
 			hcfg.customOpenCodeCfg(&ocCfg)

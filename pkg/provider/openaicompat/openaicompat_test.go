@@ -248,11 +248,17 @@ func TestOpenAICompat_ModelListPassthrough(t *testing.T) {
 	}
 }
 
-func TestOpenAICompat_OpenCodeCookieAuth(t *testing.T) {
+// TestOpenAICompat_BearerAuth asserts the standard authentication path now
+// that the legacy opencode workspace-cookie scheme is gone: lanes authenticate
+// with a plain Authorization: Bearer <api_key> header and never emit Cookie or
+// X-Workspace-ID headers.
+func TestOpenAICompat_BearerAuth(t *testing.T) {
+	var capturedAuth string
 	var capturedCookie string
 	var capturedWorkspace string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("Authorization")
 		capturedCookie = r.Header.Get("Cookie")
 		capturedWorkspace = r.Header.Get("X-Workspace-ID")
 
@@ -274,13 +280,10 @@ func TestOpenAICompat_OpenCodeCookieAuth(t *testing.T) {
 	defer server.Close()
 
 	p, err := New(Config{
-		BaseURL:       server.URL,
-		WorkspaceID:   "ws-corp-99",
-		SessionCookie: "my-session-token-xyz",
-		HTTPClient:    server.Client(),
-		Quirks: Quirks{
-			AuthViaWorkspaceCookie: true,
-		},
+		Name:       "opencode",
+		BaseURL:    server.URL,
+		APIKey:     "sk-opencode-bearer",
+		HTTPClient: server.Client(),
 	})
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
@@ -298,11 +301,14 @@ func TestOpenAICompat_OpenCodeCookieAuth(t *testing.T) {
 		t.Fatalf("Generate failed: %v", err)
 	}
 
-	if capturedCookie != "session=my-session-token-xyz" {
-		t.Errorf("expected session cookie header 'session=my-session-token-xyz', got %q", capturedCookie)
+	if capturedAuth != "Bearer sk-opencode-bearer" {
+		t.Errorf("expected Authorization 'Bearer sk-opencode-bearer', got %q", capturedAuth)
 	}
-	if capturedWorkspace != "ws-corp-99" {
-		t.Errorf("expected workspace header 'ws-corp-99', got %q", capturedWorkspace)
+	if capturedCookie != "" {
+		t.Errorf("expected no Cookie header, got %q", capturedCookie)
+	}
+	if capturedWorkspace != "" {
+		t.Errorf("expected no X-Workspace-ID header, got %q", capturedWorkspace)
 	}
 }
 

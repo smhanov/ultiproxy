@@ -198,6 +198,72 @@ func TestMCPToolsList(t *testing.T) {
 	}
 }
 
+// TestMCPAddProviderSchemaMinimal locks the add_provider input schema down to
+// the active parameter surface: the obsolete options (data_dir, workspace_id,
+// session_cookie, refresh_url, token_file, device_auth_url, token_url and the
+// auth_via_workspace_cookie quirk) must not come back.
+func TestMCPAddProviderSchemaMinimal(t *testing.T) {
+	stateSrc := newStubStateSource()
+	server := NewServer(nil, stateSrc)
+
+	body := `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	var resp JSONRPCResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	resMap, ok := resp.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map result, got %T", resp.Result)
+	}
+	tools, ok := resMap["tools"].([]any)
+	if !ok {
+		t.Fatalf("expected tools list, got %T", resMap["tools"])
+	}
+
+	var schema map[string]any
+	for _, item := range tools {
+		tMap := item.(map[string]any)
+		if tMap["name"] != "add_provider" {
+			continue
+		}
+		schema, ok = tMap["inputSchema"].(map[string]any)
+		if !ok {
+			t.Fatalf("add_provider inputSchema: got %T", tMap["inputSchema"])
+		}
+	}
+	if schema == nil {
+		t.Fatal("add_provider tool not found in tools/list")
+	}
+
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("add_provider properties: got %T", schema["properties"])
+	}
+	want := map[string]bool{"name": false, "kind": false, "base_url": false, "api_key": false, "quirks": false}
+	for name := range props {
+		if _, ok := want[name]; !ok {
+			t.Errorf("add_provider exposes unexpected parameter %q", name)
+			continue
+		}
+		want[name] = true
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("add_provider is missing parameter %q", name)
+		}
+	}
+
+	if quirks, ok := props["quirks"].(map[string]any); ok {
+		if desc, _ := quirks["description"].(string); strings.Contains(desc, "auth_via_workspace_cookie") {
+			t.Errorf("quirks description still documents auth_via_workspace_cookie: %q", desc)
+		}
+	}
+}
+
 func TestMCPToolCall_ListModelsAndToggleModel(t *testing.T) {
 	stateSrc := newStubStateSource()
 	server := NewServer(nil, stateSrc)

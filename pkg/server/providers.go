@@ -20,8 +20,9 @@
 //     the compile-time lane). When no builder is installed the lane still
 //     loads, just without the serialized-request lock actor.
 //   - TokenSource is never persisted. openaicompat.New rebuilds token sources
-//     from the JSON-able fields (DataDir, TokenFile, RefreshURL, ...) exactly
-//     the way cmd/ultiproxy/providers.go builds them today.
+//     from compiled-in vendor defaults plus the server's DataDir (credential
+//     state lives under <DefaultDataDir>/credentials/<lane>), exactly the way
+//     cmd/ultiproxy/providers.go builds them today.
 package server
 
 import (
@@ -56,7 +57,6 @@ type storedQuirks struct {
 	MaxTokensByModel       map[string]int `json:"max_tokens_by_model,omitempty"`
 	EchoReasoning          bool           `json:"echo_reasoning,omitempty"`
 	ModelListPassthrough   bool           `json:"model_list_passthrough,omitempty"`
-	AuthViaWorkspaceCookie bool           `json:"auth_via_workspace_cookie,omitempty"`
 	AuthViaOAuthManager    bool           `json:"auth_via_oauth_manager,omitempty"`
 	CreditsQuotaObserver   string         `json:"credits_quota_observer,omitempty"`
 	AuthViaSupabaseRefresh bool           `json:"auth_via_supabase_refresh,omitempty"`
@@ -65,40 +65,28 @@ type storedQuirks struct {
 	DefaultModel           string         `json:"default_model,omitempty"`
 }
 
-// storedProvider is the JSON-able projection of openaicompat.Config.
+// storedProvider is the JSON-able projection of openaicompat.Config. Lanes
+// never carry their own data dir or auth endpoint overrides: credential state
+// is derived from the server's DefaultDataDir, and token endpoints use the
+// compiled-in vendor defaults.
 type storedProvider struct {
-	Kind          string       `json:"kind,omitempty"` // "" or "openaicompat" | "antigravity"
-	Name          string       `json:"name"`
-	BaseURL       string       `json:"base_url"`
-	APIKey        string       `json:"api_key,omitempty"`
-	DataDir       string       `json:"data_dir,omitempty"`
-	WorkspaceID   string       `json:"workspace_id,omitempty"`
-	SessionCookie string       `json:"session_cookie,omitempty"`
-	RefreshURL    string       `json:"refresh_url,omitempty"`
-	TokenFile     string       `json:"token_file,omitempty"`
-	DeviceAuthURL string       `json:"device_auth_url,omitempty"`
-	TokenURL      string       `json:"token_url,omitempty"`
-	Quirks        storedQuirks `json:"quirks"`
+	Kind    string       `json:"kind,omitempty"` // "" or "openaicompat" | "antigravity"
+	Name    string       `json:"name"`
+	BaseURL string       `json:"base_url"`
+	APIKey  string       `json:"api_key,omitempty"`
+	Quirks  storedQuirks `json:"quirks"`
 }
 
 func toStoredProvider(cfg openaicompat.Config) storedProvider {
 	return storedProvider{
-		Name:          cfg.Name,
-		BaseURL:       cfg.BaseURL,
-		APIKey:        cfg.APIKey,
-		DataDir:       cfg.DataDir,
-		WorkspaceID:   cfg.WorkspaceID,
-		SessionCookie: cfg.SessionCookie,
-		RefreshURL:    cfg.RefreshURL,
-		TokenFile:     cfg.TokenFile,
-		DeviceAuthURL: cfg.DeviceAuthURL,
-		TokenURL:      cfg.TokenURL,
+		Name:    cfg.Name,
+		BaseURL: cfg.BaseURL,
+		APIKey:  cfg.APIKey,
 		Quirks: storedQuirks{
 			CodingPlanPath:         cfg.Quirks.CodingPlanPath,
 			MaxTokensByModel:       cfg.Quirks.MaxTokensByModel,
 			EchoReasoning:          cfg.Quirks.EchoReasoning,
 			ModelListPassthrough:   cfg.Quirks.ModelListPassthrough,
-			AuthViaWorkspaceCookie: cfg.Quirks.AuthViaWorkspaceCookie,
 			AuthViaOAuthManager:    cfg.Quirks.AuthViaOAuthManager,
 			CreditsQuotaObserver:   cfg.Quirks.CreditsQuotaObserver,
 			AuthViaSupabaseRefresh: cfg.Quirks.AuthViaSupabaseRefresh,
@@ -111,22 +99,14 @@ func toStoredProvider(cfg openaicompat.Config) storedProvider {
 
 func (s storedProvider) toConfig(actorBuilder func(openaicompat.Config) any) openaicompat.Config {
 	cfg := openaicompat.Config{
-		Name:          s.Name,
-		BaseURL:       s.BaseURL,
-		APIKey:        s.APIKey,
-		DataDir:       s.DataDir,
-		WorkspaceID:   s.WorkspaceID,
-		SessionCookie: s.SessionCookie,
-		RefreshURL:    s.RefreshURL,
-		TokenFile:     s.TokenFile,
-		DeviceAuthURL: s.DeviceAuthURL,
-		TokenURL:      s.TokenURL,
+		Name:    s.Name,
+		BaseURL: s.BaseURL,
+		APIKey:  s.APIKey,
 		Quirks: openaicompat.Quirks{
 			CodingPlanPath:         s.Quirks.CodingPlanPath,
 			MaxTokensByModel:       s.Quirks.MaxTokensByModel,
 			EchoReasoning:          s.Quirks.EchoReasoning,
 			ModelListPassthrough:   s.Quirks.ModelListPassthrough,
-			AuthViaWorkspaceCookie: s.Quirks.AuthViaWorkspaceCookie,
 			AuthViaOAuthManager:    s.Quirks.AuthViaOAuthManager,
 			CreditsQuotaObserver:   s.Quirks.CreditsQuotaObserver,
 			AuthViaSupabaseRefresh: s.Quirks.AuthViaSupabaseRefresh,
@@ -185,7 +165,7 @@ func NewRuntimeProviderStore(path string) *RuntimeProviderStore {
 				if sp.Kind != "" && sp.Kind != RuntimeProviderKindOpenAICompat {
 					s.custom[name] = sp
 				} else {
-					s.providers[name] = sp.toConfig(s.ActorBuilder)
+					s.providers[name] = s.credentialDir(sp.toConfig(s.ActorBuilder))
 				}
 			}
 		}
@@ -280,6 +260,17 @@ func (s *RuntimeProviderStore) Get(name string) (openaicompat.Config, bool) {
 	return cfg, ok
 }
 
+// credentialDir assigns a lane's credential directory from the server's
+// general DataDir. Runtime lanes never carry their own data dir, so restored
+// lanes get <DefaultDataDir>/credentials/<lane> exactly like a freshly added
+// one; the persisted DTO holds no data_dir of its own.
+func (s *RuntimeProviderStore) credentialDir(cfg openaicompat.Config) openaicompat.Config {
+	if cfg.DataDir == "" && s != nil && s.DefaultDataDir != "" {
+		cfg.DataDir = filepath.Join(s.DefaultDataDir, "credentials", cfg.Name)
+	}
+	return cfg
+}
+
 // Add validates and stores a lane config, replacing any existing entry with
 // the same name (replacement is intentional: re-running add_provider is how a
 // lane's base URL or key gets rotated), then persists.
@@ -290,11 +281,7 @@ func (s *RuntimeProviderStore) Add(cfg openaicompat.Config) error {
 	if err := validateProviderConfig(cfg); err != nil {
 		return err
 	}
-	// Runtime lanes never carry their own data dir: credential state lives
-	// under the server's general DataDir, mirroring compile-time lanes.
-	if cfg.DataDir == "" && s.DefaultDataDir != "" {
-		cfg.DataDir = filepath.Join(s.DefaultDataDir, "credentials", cfg.Name)
-	}
+	cfg = s.credentialDir(cfg)
 	// A freebuff lane added over MCP carries only a non-nil marker (the real
 	// actor is not JSON-serializable and cannot cross that boundary). Build the
 	// serialized-request actor here from the lane's own key / data dir so the
@@ -401,7 +388,7 @@ func (s *RuntimeProviderStore) Load() (map[string]openaicompat.Config, error) {
 		if sp.Kind != "" && sp.Kind != RuntimeProviderKindOpenAICompat {
 			s.custom[name] = sp
 		} else {
-			s.providers[name] = sp.toConfig(s.ActorBuilder)
+			s.providers[name] = s.credentialDir(sp.toConfig(s.ActorBuilder))
 		}
 	}
 	s.mu.Unlock()
@@ -435,7 +422,7 @@ func (s *RuntimeProviderStore) Restore(registry *provider.Registry) []string {
 
 	registered := make([]string, 0, len(snapshot)+len(customSnap))
 	for _, name := range sortedConfigNames(snapshot) {
-		cfg := snapshot[name]
+		cfg := s.credentialDir(snapshot[name])
 		if builder != nil && cfg.Quirks.FreebuffActor == nil {
 			// storedProvider only keeps a bool flag; rebuild the actor here.
 			cfg.Quirks.FreebuffActor = builder(cfg)

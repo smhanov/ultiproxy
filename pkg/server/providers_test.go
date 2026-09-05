@@ -130,6 +130,76 @@ func TestRuntimeProviderStore_PersistRestart(t *testing.T) {
 	}
 }
 
+// TestRuntimeProviderStore_LegacyFieldsIgnored covers the removal of the
+// obsolete provider options (data_dir, workspace_id, session_cookie,
+// refresh_url, token_file, device_auth_url, token_url and the
+// auth_via_workspace_cookie quirk): a providers.json written by an older build
+// still loads (unknown JSON fields are ignored), the lane keeps its real
+// identity, credential state is re-derived from the server DataDir, and the
+// next persist drops the legacy keys entirely.
+func TestRuntimeProviderStore_LegacyFieldsIgnored(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.json")
+	legacy := `{
+  "opencode": {
+    "name": "opencode",
+    "base_url": "https://opencode.ai/zen/go/v1",
+    "api_key": "sk-opencode",
+    "data_dir": "/old/state",
+    "workspace_id": "ws-legacy",
+    "session_cookie": "sess-legacy",
+    "refresh_url": "https://legacy.example/refresh",
+    "token_file": "/old/state/augure-auth.json",
+    "device_auth_url": "https://legacy.example/device",
+    "token_url": "https://legacy.example/token",
+    "quirks": {
+      "auth_via_workspace_cookie": true,
+      "model_list_passthrough": true
+    }
+  }
+}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatalf("write providers.json: %v", err)
+	}
+
+	s := NewRuntimeProviderStore(path)
+	s.DefaultDataDir = dir
+	loaded, err := s.Load()
+	if err != nil {
+		t.Fatalf("Load legacy providers.json: %v", err)
+	}
+	got, ok := loaded["opencode"]
+	if !ok {
+		t.Fatalf("legacy lane not loaded: %v", loaded)
+	}
+	if got.BaseURL != "https://opencode.ai/zen/go/v1" || got.APIKey != "sk-opencode" {
+		t.Fatalf("lane identity lost: %+v", got)
+	}
+	if !got.Quirks.ModelListPassthrough {
+		t.Errorf("model_list_passthrough did not survive the legacy load: %+v", got.Quirks)
+	}
+	if want := filepath.Join(dir, "credentials", "opencode"); got.DataDir != want {
+		t.Errorf("credential dir = %q, want %q (legacy data_dir must not win)", got.DataDir, want)
+	}
+
+	// Re-persisting (add_provider is how a lane is rotated) drops the legacy keys.
+	if err := s.Add(got); err != nil {
+		t.Fatalf("re-add lane: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read providers.json: %v", err)
+	}
+	for _, legacyKey := range []string{
+		"data_dir", "workspace_id", "session_cookie", "refresh_url",
+		"token_file", "device_auth_url", "token_url", "auth_via_workspace_cookie",
+	} {
+		if strings.Contains(string(data), `"`+legacyKey+`"`) {
+			t.Errorf("providers.json still carries the removed key %q: %s", legacyKey, data)
+		}
+	}
+}
+
 // TestRuntimeProviderRestoreAcrossRestart covers the fresh-install bootstrap:
 // a lane added at runtime is served again after a restart from the same
 // DataDir, with no config file anywhere.
