@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -22,6 +23,29 @@ import (
 type streamEventEncoder interface {
 	EncodeEvent(evt ir.Event) error
 	Close() error
+}
+
+// Telemetry error classes for outcomes the provider did not cause: the provider
+// may have succeeded, but the proxy could not serialize the response or the
+// client did not receive it. Such requests are recorded with
+// stream_complete=0 so per-client accounting never claims a delivery that did
+// not happen.
+const (
+	errClassResponseEncode = "response_encode_failed"
+	errClassStreamEncode   = "stream_encode_failed"
+	errClassStreamClose    = "stream_encode_close_failed"
+	errClassClientWrite    = "client_write_failed"
+	errClassClientGone     = "client_disconnected"
+)
+
+// logTelemetryError reports a telemetry enqueue failure instead of swallowing
+// it: queue pressure (ErrQueueFull) and a closed writer (ErrClosed) otherwise
+// disappear, and the accounting quietly becomes incomplete.
+func logTelemetryError(what string, err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("ultiproxy: telemetry %s: %v", what, err)
 }
 
 // stripProviderPrefix removes a "<provider>/" prefix from a model identifier.
@@ -302,7 +326,7 @@ func (s *Server) dispatchRequest(
 			return
 		}
 		requestOpened = true
-		_ = s.writer.TrackRequest(storage.RequestRecord{
+		logTelemetryError("open request row", s.writer.TrackRequest(storage.RequestRecord{
 			ID:             reqID,
 			ClientKeyHash:  clientKeyHash,
 			RequestedModel: model,
@@ -311,7 +335,7 @@ func (s *Server) dispatchRequest(
 			CreatedAt:      startTime.UTC().Format(time.RFC3339),
 			StreamComplete: 0,
 			ErrorClass:     "in_flight",
-		})
+		}))
 	}
 
 	// trackAttempt records one provider attempt, opening the request row first so
@@ -321,7 +345,7 @@ func (s *Server) dispatchRequest(
 			return
 		}
 		openRequestRow()
-		_ = s.writer.TrackAttempt(rec)
+		logTelemetryError("track attempt", s.writer.TrackAttempt(rec))
 	}
 
 	// recordRequest writes the terminal request row exactly once per dispatch:
@@ -335,7 +359,7 @@ func (s *Server) dispatchRequest(
 		}
 		requestTracked = true
 		openRequestRow()
-		_ = s.writer.TrackRequest(storage.RequestRecord{
+		logTelemetryError("record request", s.writer.TrackRequest(storage.RequestRecord{
 			ID:             reqID,
 			ClientKeyHash:  clientKeyHash,
 			RequestedModel: model,
@@ -348,7 +372,7 @@ func (s *Server) dispatchRequest(
 			ErrorClass:     errorClass,
 			TTFTMs:         ttftMs,
 			TotalMs:        time.Since(startTime).Milliseconds(),
-		})
+		}))
 	}
 
 	failedProviders := make(map[string]bool)
@@ -521,18 +545,34 @@ func (s *Server) dispatchRequest(
 				// NO FAILOVER AFTER FIRST BYTE: stream rest of events
 				var finishReason string
 				var errorClass string
+				// deliveryFailed records that the client did not receive a complete
+				// stream (encode/flush failure, or a client that hung up). The provider
+				// may have succeeded, but the request row must not claim a successful
+				// delivery, so stream_complete stays 0.
+				deliveryFailed := false
 				// Usage events are cumulative across a stream (Anthropic reports
 				// one per delta): keep the last one and record a single usage row
 				// for the request, so per-event rows cannot double-count tokens or
 				// cost.
 				var lastUsage *ir.EventUsageUpdate
 
+				// classifyDelivery fills in the downstream failure class without ever
+				// masking an upstream one.
+				classifyDelivery := func(class string) {
+					if errorClass == "" {
+						errorClass = class
+					}
+				}
+
 				encoder := createEncoder(w)
-				_ = encoder.EncodeEvent(firstEvt)
+				if err := encoder.EncodeEvent(firstEvt); err != nil {
+					deliveryFailed = true
+					classifyDelivery(errClassStreamEncode)
+				}
 				if stopEvt, isStop := firstEvt.(ir.EventMessageStop); isStop {
 					finishReason = stopEvt.FinishReason
 				}
-				if canFlush {
+				if canFlush && !deliveryFailed {
 					flusher.Flush()
 				}
 
@@ -540,8 +580,10 @@ func (s *Server) dispatchRequest(
 					if midStreamErr, isErr := ev.(ir.EventUpstreamError); isErr {
 						// Upstream error mid-stream: emit error frame and TERMINATE. NEVER switch provider!
 						errorClass = midStreamErr.Kind
-						_ = encoder.EncodeEvent(midStreamErr)
-						if canFlush {
+						if err := encoder.EncodeEvent(midStreamErr); err != nil {
+							deliveryFailed = true
+						}
+						if canFlush && !deliveryFailed {
 							flusher.Flush()
 						}
 						break
@@ -556,14 +598,36 @@ func (s *Server) dispatchRequest(
 						finishReason = stopEvt.FinishReason
 					}
 
-					_ = encoder.EncodeEvent(ev)
+					// The client is gone or the encoder already failed: stop writing
+					// (the writes cannot succeed anyway) but keep draining so the
+					// provider goroutine is never left blocked on the channel.
+					if deliveryFailed {
+						continue
+					}
+
+					select {
+					case <-r.Context().Done():
+						deliveryFailed = true
+						classifyDelivery(errClassClientGone)
+						continue
+					default:
+					}
+
+					if err := encoder.EncodeEvent(ev); err != nil {
+						deliveryFailed = true
+						classifyDelivery(errClassStreamEncode)
+						continue
+					}
 					if canFlush {
 						flusher.Flush()
 					}
 				}
 
-				_ = encoder.Close()
-				if canFlush {
+				if err := encoder.Close(); err != nil {
+					deliveryFailed = true
+					classifyDelivery(errClassStreamClose)
+				}
+				if canFlush && !deliveryFailed {
 					flusher.Flush()
 				}
 
@@ -577,14 +641,21 @@ func (s *Server) dispatchRequest(
 						Cost:                     lastUsage.Cost,
 					}, alias)
 				}
-				recordRequest(finishReason, errorClass, 1, ttft)
+				// A stream is only "complete" when nothing failed it: an
+				// upstream error, an encode failure or a client that hung up all
+				// leave stream_complete=0.
+				streamComplete := 1
+				if errorClass != "" || deliveryFailed {
+					streamComplete = 0
+				}
+				recordRequest(finishReason, errorClass, streamComplete, ttft)
 				return
 
 			case <-r.Context().Done():
 				// Client went away mid-stream: the request still happened, and its
 				// attempts/usage rows are already queued against reqID, so close the
 				// request row instead of orphaning them.
-				recordRequest("", "client_disconnected", 0, ttft)
+				recordRequest("", errClassClientGone, 0, ttft)
 				return
 			}
 
@@ -614,17 +685,26 @@ func (s *Server) dispatchRequest(
 				StatusCode: http.StatusOK,
 			})
 			s.trackUsage(reqID, resp.Usage, alias)
-			recordRequest(resp.FinishReason, "", 1, 0)
 
+			// The request row only claims a successful delivery once the response
+			// was serialized AND handed to the client: a failed encode (the client
+			// gets a 500) or a failed write (the client got nothing) is recorded
+			// with stream_complete=0 and the matching error class instead.
 			outBytes, err := encodeResponse(resp, model)
 			if err != nil {
+				recordRequest("", errClassResponseEncode, 0, 0)
 				http.Error(w, fmt.Sprintf(`{"error":{"message":"failed to encode response: %v"}}`, err), http.StatusInternalServerError)
 				return
 			}
 
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(outBytes)
+			if _, err := w.Write(outBytes); err != nil {
+				recordRequest(resp.FinishReason, errClassClientWrite, 0, 0)
+				return
+			}
+
+			recordRequest(resp.FinishReason, "", 1, 0)
 			return
 		}
 	}
@@ -689,14 +769,14 @@ func (s *Server) trackUsage(reqID int64, u *ir.Usage, alias ModelAlias) {
 	if cost == 0 {
 		cost = estimatedCost(int64(u.PromptTokens), int64(u.CompletionTokens), alias.InputCost, alias.OutputCost)
 	}
-	_ = s.writer.TrackUsage(storage.UsageRecord{
+	logTelemetryError("track usage", s.writer.TrackUsage(storage.UsageRecord{
 		RequestID:        reqID,
 		PromptTokens:     int64(u.PromptTokens),
 		CompletionTokens: int64(u.CompletionTokens),
 		ReasoningTokens:  int64(u.ReasoningTokens),
 		CachedTokens:     int64(u.CacheCreationInputTokens + u.CacheReadInputTokens),
 		Cost:             cost,
-	})
+	}))
 }
 
 // estimatedCost prices a prompt/completion token pair at the given

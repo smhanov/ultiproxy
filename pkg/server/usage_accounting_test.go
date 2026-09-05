@@ -1,11 +1,15 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -421,4 +425,200 @@ func int64String(v int64) string {
 func jsonInt(v int64) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// --- T023: honest stream accounting ---
+
+// streamAccountingRow reads the terminal request row of a dispatch and reports
+// its stream_complete flag and error class.
+func streamAccountingRow(t *testing.T, w *storage.Writer) (streamComplete int, errorClass string) {
+	t.Helper()
+	waitForTerminalRequest(t, w, `SELECT COALESCE(stream_complete, -1), error_class FROM requests WHERE error_class <> 'in_flight'`, &streamComplete, &errorClass)
+	return streamComplete, errorClass
+}
+
+// 7. A stream that terminates because the upstream errored mid-stream is a
+// failed stream: it must not be persisted with stream_complete=1.
+func TestAccounting_StreamingUpstreamErrorIsNotStreamComplete(t *testing.T) {
+	prov := &fakeInferenceProvider{
+		name: "prov",
+		streamFn: func(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (<-chan ir.Event, error) {
+			ch := make(chan ir.Event, 3)
+			ch <- ir.EventMessageStart{ID: "msg-1"}
+			ch <- ir.EventTextDelta{Index: 0, Text: "partial answer"}
+			ch <- ir.EventUpstreamError{Kind: "overloaded_error", Message: "upstream exploded mid-stream"}
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	srv, writer := newAccountingServer(t, prov, nil)
+
+	body := `{"model":"prov/gpt-4o","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("streaming dispatch = %d (%s), want 200 (headers already committed)", rec.Code, rec.Body.String())
+	}
+
+	streamComplete, errorClass := streamAccountingRow(t, writer)
+	if streamComplete != 0 {
+		t.Errorf("stream_complete = %d for an upstream-error stream, want 0", streamComplete)
+	}
+	if errorClass != "overloaded_error" {
+		t.Errorf("error_class = %q, want the upstream error kind", errorClass)
+	}
+}
+
+// failingWriteRecorder is an http.ResponseWriter whose body writes fail, the
+// way a client that hung up mid-response does.
+type failingWriteRecorder struct {
+	*httptest.ResponseRecorder
+	failWrite bool
+}
+
+func (r *failingWriteRecorder) Write(b []byte) (int, error) {
+	if r.failWrite {
+		return 0, errors.New("write tcp 127.0.0.1:1->127.0.0.1:2: broken pipe")
+	}
+	return r.ResponseRecorder.Write(b)
+}
+
+// 8. A non-streaming response the client never received (w.Write fails) is not
+// recorded as a successful complete request.
+func TestAccounting_ClientWriteFailureIsNotStreamComplete(t *testing.T) {
+	prov := &fakeInferenceProvider{
+		name: "prov",
+		generateFn: func(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (*ir.Response, error) {
+			return &ir.Response{ID: "resp-1", FinishReason: "stop", Usage: &ir.Usage{PromptTokens: 10, CompletionTokens: 5}}, nil
+		},
+	}
+
+	srv, writer := newAccountingServer(t, prov, nil)
+
+	rec := &failingWriteRecorder{ResponseRecorder: httptest.NewRecorder(), failWrite: true}
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"prov/gpt-4o","messages":[]}`)))
+
+	streamComplete, errorClass := streamAccountingRow(t, writer)
+	if streamComplete != 0 {
+		t.Errorf("stream_complete = %d for a failed client write, want 0", streamComplete)
+	}
+	if errorClass == "" {
+		t.Errorf("error_class empty for a failed client write, want a delivery failure class")
+	}
+}
+
+// 9. When the proxy cannot serialize the provider response (encodeResponse
+// fails) the client gets a 500, so the request row must not claim success.
+func TestAccounting_EncodeResponseFailureIsNotStreamComplete(t *testing.T) {
+	prov := &fakeInferenceProvider{
+		name: "prov",
+		generateFn: func(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (*ir.Response, error) {
+			return &ir.Response{ID: "resp-1", FinishReason: "stop", Usage: &ir.Usage{PromptTokens: 10, CompletionTokens: 5}}, nil
+		},
+	}
+
+	srv, writer := newAccountingServer(t, prov, nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"prov/gpt-4o","messages":[]}`))
+	srv.dispatchRequest(rec, req, nil, nil, "prov/gpt-4o", false, false,
+		func(w io.Writer) streamEventEncoder { return nil },
+		func(resp *ir.Response, model string) ([]byte, error) {
+			return nil, errors.New("cannot encode response")
+		},
+	)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("dispatch with failing encodeResponse = %d, want 500", rec.Code)
+	}
+
+	streamComplete, errorClass := streamAccountingRow(t, writer)
+	if streamComplete != 0 {
+		t.Errorf("stream_complete = %d for a failed encodeResponse, want 0", streamComplete)
+	}
+	if errorClass == "" {
+		t.Errorf("error_class empty for a failed encodeResponse, want a serialization failure class")
+	}
+}
+
+// failingStreamEncoder fails every event encode, the way a client that hung up
+// mid-stream or a broken response writer does.
+type failingStreamEncoder struct {
+	written int
+}
+
+func (f *failingStreamEncoder) EncodeEvent(evt ir.Event) error {
+	f.written++
+	return errors.New("encode failed: client hung up")
+}
+
+func (f *failingStreamEncoder) Close() error { return nil }
+
+// 10. A streaming response whose events cannot be delivered to the client is
+// not recorded as a successful complete stream.
+func TestAccounting_StreamingEncodeFailureIsNotStreamComplete(t *testing.T) {
+	prov := &fakeInferenceProvider{
+		name: "prov",
+		streamFn: func(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (<-chan ir.Event, error) {
+			ch := make(chan ir.Event, 3)
+			ch <- ir.EventMessageStart{ID: "msg-1"}
+			ch <- ir.EventTextDelta{Index: 0, Text: "hello"}
+			ch <- ir.EventMessageStop{FinishReason: "stop"}
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	srv, writer := newAccountingServer(t, prov, nil)
+
+	body := `{"model":"prov/gpt-4o","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+
+	enc := &failingStreamEncoder{}
+	srv.dispatchRequest(rec, req, nil, nil, "prov/gpt-4o", true, false,
+		func(w io.Writer) streamEventEncoder { return enc },
+		func(resp *ir.Response, model string) ([]byte, error) { return nil, nil },
+	)
+
+	streamComplete, errorClass := streamAccountingRow(t, writer)
+	if streamComplete != 0 {
+		t.Errorf("stream_complete = %d for a stream the client never received, want 0", streamComplete)
+	}
+	if errorClass == "" {
+		t.Errorf("error_class empty for a failed stream encode, want a delivery failure class")
+	}
+}
+
+// 11. Producer-side telemetry failures are reported: when the writer refuses a
+// record (here: it is already closed), the dispatch logs it instead of
+// discarding the accounting silently.
+func TestAccounting_TelemetryEnqueueErrorsAreLogged(t *testing.T) {
+	prov := &fakeInferenceProvider{
+		name: "prov",
+		generateFn: func(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (*ir.Response, error) {
+			return &ir.Response{ID: "resp-1", FinishReason: "stop"}, nil
+		},
+	}
+
+	srv, writer := newAccountingServer(t, prov, nil)
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer func() { log.SetOutput(os.Stderr) }()
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"prov/gpt-4o","messages":[]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dispatch = %d (%s), want 200: the provider succeeded", rec.Code, rec.Body.String())
+	}
+
+	if !strings.Contains(buf.String(), "closed") {
+		t.Errorf("closed-writer telemetry errors were discarded: dispatch log = %q", buf.String())
+	}
 }

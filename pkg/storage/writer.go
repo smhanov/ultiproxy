@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -96,9 +97,20 @@ type Writer struct {
 	batchSize int
 	queue     chan any
 
-	mu     sync.Mutex
+	// logger receives every telemetry write failure (begin/prepare/exec/commit)
+	// so accounting gaps stay observable. It defaults to the standard logger.
+	logger *log.Logger
+
+	mu sync.Mutex
+	// closed is read and written only while mu is held, and the queue send in
+	// enqueue happens under the same mutex, so a producer can never observe
+	// closed == false and then send on a channel Close already closed.
 	closed bool
 	done   chan struct{}
+
+	// flushErr is the first batch error of the worker's final flush, published
+	// before done is closed and read by Close after done, so no lock is needed.
+	flushErr error
 }
 
 // NewWriter opens SQLite database at dbPath, applies schema and PRAGMAs, and starts background worker.
@@ -132,6 +144,7 @@ func NewWriter(dbPath string, opts ...Option) (*Writer, error) {
 		queueCap:  4096,
 		batchSize: 100,
 		done:      make(chan struct{}),
+		logger:    log.Default(),
 	}
 
 	for _, opt := range opts {
@@ -149,13 +162,17 @@ func (w *Writer) DB() *sql.DB {
 	return w.db
 }
 
+// enqueue admits one record without blocking. The whole admission - the closed
+// check and the channel send - happens under mu, and Close closes the queue
+// under the same mutex, so the two can never interleave into a send on a closed
+// channel (which would panic the process).
 func (w *Writer) enqueue(item any) error {
 	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	if w.closed {
-		w.mu.Unlock()
 		return ErrClosed
 	}
-	w.mu.Unlock()
 
 	select {
 	case w.queue <- item:
@@ -163,6 +180,14 @@ func (w *Writer) enqueue(item any) error {
 	default:
 		return ErrQueueFull
 	}
+}
+
+// logf reports a telemetry write failure instead of dropping it silently.
+func (w *Writer) logf(format string, args ...any) {
+	if w.logger == nil {
+		return
+	}
+	w.logger.Printf("ultiproxy/storage: "+format, args...)
 }
 
 // TrackRequest enqueues a request record non-blockingly.
@@ -201,11 +226,27 @@ func (w *Writer) Close() error {
 	w.mu.Unlock()
 
 	<-w.done
-	return w.db.Close()
+	dbErr := w.db.Close()
+	if w.flushErr != nil {
+		// A failed final flush is a data loss the caller must see; the database
+		// close error is kept alongside it rather than dropped.
+		return errors.Join(fmt.Errorf("telemetry flush failed: %w", w.flushErr), dbErr)
+	}
+	return dbErr
 }
 
 func (w *Writer) worker() {
-	defer close(w.done)
+	var firstErr error
+	keepErr := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	defer func() {
+		// Published before done closes; Close reads it only after <-w.done.
+		w.flushErr = firstErr
+		close(w.done)
+	}()
 
 	batch := make([]any, 0, w.batchSize)
 
@@ -214,7 +255,7 @@ func (w *Writer) worker() {
 		if !ok {
 			// Queue closed: write any remaining in batch
 			if len(batch) > 0 {
-				w.writeBatch(batch)
+				keepErr(w.writeBatch(batch))
 			}
 			return
 		}
@@ -227,7 +268,7 @@ func (w *Writer) worker() {
 			select {
 			case nextItem, nextOk := <-w.queue:
 				if !nextOk {
-					w.writeBatch(batch)
+					keepErr(w.writeBatch(batch))
 					return
 				}
 				batch = append(batch, nextItem)
@@ -236,19 +277,24 @@ func (w *Writer) worker() {
 			}
 		}
 
-		w.writeBatch(batch)
+		keepErr(w.writeBatch(batch))
 		batch = batch[:0]
 	}
 }
 
-func (w *Writer) writeBatch(batch []any) {
+// writeBatch persists one batch inside a single transaction and reports the
+// first failure. Every layer - begin, prepare, exec, commit - is logged, so a
+// telemetry gap is always observable, and the error is returned so Close can
+// surface a failed final flush.
+func (w *Writer) writeBatch(batch []any) error {
 	if len(batch) == 0 {
-		return
+		return nil
 	}
 
 	tx, err := w.db.Begin()
 	if err != nil {
-		return
+		w.logf("dropping %d telemetry record(s): begin transaction: %v", len(batch), err)
+		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -259,7 +305,7 @@ func (w *Writer) writeBatch(batch []any) {
 	// in place before the children even when a batch flushes one item at a
 	// time. Rows without an explicit id get a fresh auto rowid and never
 	// conflict.
-	reqStmt, _ := tx.Prepare(`
+	reqStmt, err := tx.Prepare(`
 INSERT INTO requests (id, client_key_hash, logical_id, requested_model, resolved_model, provider, created_at, completed_at, finish_reason, stream_complete, error_class, ttft_ms, total_ms)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
@@ -276,78 +322,98 @@ ON CONFLICT(id) DO UPDATE SET
     ttft_ms = excluded.ttft_ms,
     total_ms = excluded.total_ms;
 `)
-	if reqStmt != nil {
-		defer reqStmt.Close()
+	if err != nil {
+		w.logf("dropping %d telemetry record(s): prepare requests statement: %v", len(batch), err)
+		return fmt.Errorf("prepare requests statement: %w", err)
 	}
+	defer reqStmt.Close()
 
-	attStmt, _ := tx.Prepare(`
+	attStmt, err := tx.Prepare(`
 INSERT INTO request_attempts (id, request_id, attempt, provider, model, upstream_request_id, status_code, error_class, retry_after_seconds, reset_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 `)
-	if attStmt != nil {
-		defer attStmt.Close()
+	if err != nil {
+		w.logf("dropping %d telemetry record(s): prepare request_attempts statement: %v", len(batch), err)
+		return fmt.Errorf("prepare request_attempts statement: %w", err)
 	}
+	defer attStmt.Close()
 
-	usgStmt, _ := tx.Prepare(`
+	usgStmt, err := tx.Prepare(`
 INSERT INTO usage (id, request_id, prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, cost)
 VALUES (?, ?, ?, ?, ?, ?, ?);
 `)
-	if usgStmt != nil {
-		defer usgStmt.Close()
+	if err != nil {
+		w.logf("dropping %d telemetry record(s): prepare usage statement: %v", len(batch), err)
+		return fmt.Errorf("prepare usage statement: %w", err)
 	}
+	defer usgStmt.Close()
 
-	qtaStmt, _ := tx.Prepare(`
+	qtaStmt, err := tx.Prepare(`
 INSERT INTO quota_observations (id, provider, label, used_pct, remaining, "limit", unit, reset_at, observed_at, source)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 `)
-	if qtaStmt != nil {
-		defer qtaStmt.Close()
+	if err != nil {
+		w.logf("dropping %d telemetry record(s): prepare quota_observations statement: %v", len(batch), err)
+		return fmt.Errorf("prepare quota_observations statement: %w", err)
+	}
+	defer qtaStmt.Close()
+
+	var firstErr error
+	exec := func(kind, stmtName string, stmt *sql.Stmt, args ...any) {
+		if _, err := stmt.Exec(args...); err != nil {
+			w.logf("telemetry %s insert failed (%s): %v", kind, stmtName, err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("insert %s: %w", kind, err)
+			}
+		}
 	}
 
 	for _, item := range batch {
 		switch r := item.(type) {
 		case RequestRecord:
-			if reqStmt != nil {
-				var idArg any = nil
-				if r.ID > 0 {
-					idArg = r.ID
-				}
-				_, _ = reqStmt.Exec(idArg, r.ClientKeyHash, r.LogicalID, r.RequestedModel, r.ResolvedModel, r.Provider, r.CreatedAt, r.CompletedAt, r.FinishReason, r.StreamComplete, r.ErrorClass, r.TTFTMs, r.TotalMs)
+			var idArg any = nil
+			if r.ID > 0 {
+				idArg = r.ID
 			}
+			exec("request", fmt.Sprintf("id=%d logical_id=%q", r.ID, r.LogicalID), reqStmt,
+				idArg, r.ClientKeyHash, r.LogicalID, r.RequestedModel, r.ResolvedModel, r.Provider, r.CreatedAt, r.CompletedAt, r.FinishReason, r.StreamComplete, r.ErrorClass, r.TTFTMs, r.TotalMs)
 		case AttemptRecord:
-			if attStmt != nil {
-				var idArg any = nil
-				if r.ID > 0 {
-					idArg = r.ID
-				}
-				var reqIDArg any = nil
-				if r.RequestID > 0 {
-					reqIDArg = r.RequestID
-				}
-				_, _ = attStmt.Exec(idArg, reqIDArg, r.Attempt, r.Provider, r.Model, r.UpstreamRequestID, r.StatusCode, r.ErrorClass, r.RetryAfterSeconds, r.ResetAt)
+			var idArg any = nil
+			if r.ID > 0 {
+				idArg = r.ID
 			}
+			var reqIDArg any = nil
+			if r.RequestID > 0 {
+				reqIDArg = r.RequestID
+			}
+			exec("request_attempt", fmt.Sprintf("request_id=%d attempt=%d provider=%q", r.RequestID, r.Attempt, r.Provider), attStmt,
+				idArg, reqIDArg, r.Attempt, r.Provider, r.Model, r.UpstreamRequestID, r.StatusCode, r.ErrorClass, r.RetryAfterSeconds, r.ResetAt)
 		case UsageRecord:
-			if usgStmt != nil {
-				var idArg any = nil
-				if r.ID > 0 {
-					idArg = r.ID
-				}
-				var reqIDArg any = nil
-				if r.RequestID > 0 {
-					reqIDArg = r.RequestID
-				}
-				_, _ = usgStmt.Exec(idArg, reqIDArg, r.PromptTokens, r.CompletionTokens, r.ReasoningTokens, r.CachedTokens, r.Cost)
+			var idArg any = nil
+			if r.ID > 0 {
+				idArg = r.ID
 			}
+			var reqIDArg any = nil
+			if r.RequestID > 0 {
+				reqIDArg = r.RequestID
+			}
+			exec("usage", fmt.Sprintf("request_id=%d", r.RequestID), usgStmt,
+				idArg, reqIDArg, r.PromptTokens, r.CompletionTokens, r.ReasoningTokens, r.CachedTokens, r.Cost)
 		case QuotaObservationRecord:
-			if qtaStmt != nil {
-				var idArg any = nil
-				if r.ID > 0 {
-					idArg = r.ID
-				}
-				_, _ = qtaStmt.Exec(idArg, r.Provider, r.Label, r.UsedPct, r.Remaining, r.Limit, r.Unit, r.ResetAt, r.ObservedAt, r.Source)
+			var idArg any = nil
+			if r.ID > 0 {
+				idArg = r.ID
 			}
+			exec("quota_observation", fmt.Sprintf("provider=%q label=%q", r.Provider, r.Label), qtaStmt,
+				idArg, r.Provider, r.Label, r.UsedPct, r.Remaining, r.Limit, r.Unit, r.ResetAt, r.ObservedAt, r.Source)
 		}
 	}
 
-	_ = tx.Commit()
+	if err := tx.Commit(); err != nil {
+		w.logf("telemetry commit failed for %d record(s): %v", len(batch), err)
+		if firstErr == nil {
+			firstErr = fmt.Errorf("commit: %w", err)
+		}
+	}
+	return firstErr
 }

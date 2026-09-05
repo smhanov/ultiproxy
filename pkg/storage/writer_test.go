@@ -1,10 +1,14 @@
 package storage
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -209,5 +213,170 @@ func TestAllRecordTypes(t *testing.T) {
 
 	if reqCount != 1 || attCount != 1 || usgCount != 1 || qtaCount != 1 {
 		t.Errorf("counts mismatch: req=%d, att=%d, usg=%d, qta=%d", reqCount, attCount, usgCount, qtaCount)
+	}
+}
+
+// --- T023: close-safe enqueue and honest SQLite error reporting ---
+
+// TestWriter_ConcurrentCloseAndEnqueueNeverPanics stresses the enqueue/Close
+// lifecycle: producers keep enqueueing while Close drains and closes the queue.
+// Send-on-closed-channel must be impossible, so the test (and the process) must
+// survive without a panic.
+func TestWriter_ConcurrentCloseAndEnqueueNeverPanics(t *testing.T) {
+	tempDir := t.TempDir()
+
+	for round := 0; round < 40; round++ {
+		dbPath := filepath.Join(tempDir, fmt.Sprintf("race_%d.db", round))
+
+		// Tiny queue and batch so the worker cannot keep up and the window
+		// between the closed check and the channel send stays wide open.
+		writer, err := NewWriter(dbPath, WithQueueCapacity(2), WithBatchSize(1))
+		if err != nil {
+			t.Fatalf("round %d: failed to create writer: %v", round, err)
+		}
+
+		var wg sync.WaitGroup
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < 100; i++ {
+					// RequestID stays 0 so the stress stays about the channel
+					// lifecycle and not about foreign-key noise.
+					_ = writer.TrackUsage(UsageRecord{PromptTokens: 1})
+					_ = writer.TrackRequest(RequestRecord{ID: int64(i), LogicalID: fmt.Sprintf("req-%d", i)})
+				}
+			}()
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := writer.Close(); err != nil {
+				t.Errorf("round %d: Close: %v", round, err)
+			}
+		}()
+
+		wg.Wait()
+	}
+}
+
+// TestWriter_EnqueueAfterCloseReturnsTypedError proves a closed writer answers
+// producers with the sentinel ErrClosed (and not ErrQueueFull, and not a panic).
+func TestWriter_EnqueueAfterCloseReturnsTypedError(t *testing.T) {
+	tempDir := t.TempDir()
+	writer, err := NewWriter(filepath.Join(tempDir, "closed.db"))
+	if err != nil {
+		t.Fatalf("failed to create writer: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	err = writer.TrackRequest(RequestRecord{LogicalID: "after-close"})
+	if err == nil {
+		t.Fatalf("TrackRequest after Close returned nil, want an error")
+	}
+	if !errors.Is(err, ErrClosed) {
+		t.Errorf("TrackRequest after Close = %v, want ErrClosed", err)
+	}
+	if errors.Is(err, ErrQueueFull) {
+		t.Errorf("closed writer must not be reported as ErrQueueFull, got %v", err)
+	}
+
+	err = writer.TrackUsage(UsageRecord{PromptTokens: 1})
+	if !errors.Is(err, ErrClosed) {
+		t.Errorf("TrackUsage after Close = %v, want ErrClosed", err)
+	}
+
+	// Closing twice must stay a no-op, not panic.
+	if err := writer.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
+}
+
+// TestWriter_SQLiteExecErrorIsSurfaced injects a failing statement into SQLite
+// (a BEFORE INSERT trigger that aborts) and requires the writer to report the
+// failure instead of silently dropping the record.
+func TestWriter_SQLiteExecErrorIsSurfaced(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "exec_error.db")
+
+	writer, err := NewWriter(dbPath, WithQueueCapacity(16), WithBatchSize(8))
+	if err != nil {
+		t.Fatalf("failed to create writer: %v", err)
+	}
+
+	if _, err := writer.DB().Exec(`CREATE TRIGGER fail_requests_before_insert
+BEFORE INSERT ON requests
+BEGIN
+    SELECT RAISE(ABORT, 'injected_exec_failure');
+END;`); err != nil {
+		t.Fatalf("failed to install failing trigger: %v", err)
+	}
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer func() { log.SetOutput(os.Stderr) }()
+
+	_ = writer.TrackRequest(RequestRecord{ID: 7, LogicalID: "req-7", Provider: "prov"})
+
+	// The failed flush must also be returned by Close, not only logged.
+	if err := writer.Close(); err == nil {
+		t.Errorf("Close returned nil although the batch insert failed")
+	} else if !strings.Contains(err.Error(), "injected_exec_failure") {
+		t.Errorf("Close error = %v, want it to carry the injected exec failure", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "injected_exec_failure") {
+		t.Errorf("SQLite exec error was dropped: writer log = %q", out)
+	}
+	if !strings.Contains(strings.ToLower(out), "request") {
+		t.Errorf("log line does not identify the affected telemetry kind: %q", out)
+	}
+
+	// The row really did not land.
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	var rows int
+	if err := db.QueryRow("SELECT COUNT(*) FROM requests;").Scan(&rows); err != nil {
+		t.Fatalf("count requests: %v", err)
+	}
+	if rows != 0 {
+		t.Errorf("requests rows = %d, want 0 (trigger aborts the insert)", rows)
+	}
+}
+
+// TestWriter_SQLiteBeginErrorIsSurfaced makes even the transaction begin fail
+// (the schema is dropped out from under the writer) and requires a log line.
+func TestWriter_SQLiteBeginErrorIsSurfaced(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "begin_error.db")
+
+	writer, err := NewWriter(dbPath, WithQueueCapacity(16), WithBatchSize(8))
+	if err != nil {
+		t.Fatalf("failed to create writer: %v", err)
+	}
+
+	if _, err := writer.DB().Exec(`DROP TABLE requests;`); err != nil {
+		t.Fatalf("failed to drop table: %v", err)
+	}
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer func() { log.SetOutput(os.Stderr) }()
+
+	_ = writer.TrackRequest(RequestRecord{ID: 9, LogicalID: "req-9"})
+	if err := writer.Close(); err == nil {
+		t.Errorf("Close returned nil although the batch could not be written")
+	}
+
+	logged := strings.ToLower(buf.String())
+	if !strings.Contains(logged, "prepare") && !strings.Contains(logged, "begin") {
+		t.Errorf("SQLite begin/prepare error was dropped: writer log = %q", buf.String())
 	}
 }
