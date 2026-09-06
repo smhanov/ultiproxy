@@ -500,14 +500,16 @@ func (b *catalogBridge) List() map[string]mcp.ModelAlias {
 	out := make(map[string]mcp.ModelAlias)
 	for alias, entry := range b.catalog.List() {
 		out[alias] = mcp.ModelAlias{
-			Provider:        entry.Provider,
-			Upstream:        entry.Upstream,
-			ContextLimit:    entry.ContextLimit,
-			MaxOutput:       entry.MaxOutput,
-			PricingTag:      entry.PricingTag,
-			InputCost:       entry.InputCost,
-			OutputCost:      entry.OutputCost,
-			BenchmarkScores: entry.BenchmarkScores,
+			Provider:         entry.Provider,
+			Upstream:         entry.Upstream,
+			ContextLimit:     entry.ContextLimit,
+			MaxOutput:        entry.MaxOutput,
+			PricingTag:       entry.PricingTag,
+			InputCost:        entry.InputCost,
+			OutputCost:       entry.OutputCost,
+			BenchmarkScores:  entry.BenchmarkScores,
+			InputModalities:  entry.InputModalities,
+			OutputModalities: entry.OutputModalities,
 		}
 	}
 	return out
@@ -517,14 +519,16 @@ func (b *catalogBridge) Sorted() []string { return b.catalog.Sorted() }
 
 func (b *catalogBridge) Set(alias string, entry mcp.ModelAlias) error {
 	if err := b.catalog.Set(alias, ModelAlias{
-		Provider:        entry.Provider,
-		Upstream:        entry.Upstream,
-		ContextLimit:    entry.ContextLimit,
-		MaxOutput:       entry.MaxOutput,
-		PricingTag:      entry.PricingTag,
-		InputCost:       entry.InputCost,
-		OutputCost:      entry.OutputCost,
-		BenchmarkScores: entry.BenchmarkScores,
+		Provider:         entry.Provider,
+		Upstream:         entry.Upstream,
+		ContextLimit:     entry.ContextLimit,
+		MaxOutput:        entry.MaxOutput,
+		PricingTag:       entry.PricingTag,
+		InputCost:        entry.InputCost,
+		OutputCost:       entry.OutputCost,
+		BenchmarkScores:  entry.BenchmarkScores,
+		InputModalities:  entry.InputModalities,
+		OutputModalities: entry.OutputModalities,
 	}); err != nil {
 		return err
 	}

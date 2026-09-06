@@ -15,6 +15,7 @@ import (
 
 	"github.com/smhanov/ultiproxy/pkg/codec"
 	"github.com/smhanov/ultiproxy/pkg/ir"
+	"github.com/smhanov/ultiproxy/pkg/modelmeta"
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/state"
 	"github.com/smhanov/ultiproxy/pkg/storage"
@@ -137,41 +138,32 @@ func isTestLane(name string) bool {
 //     on the fly. Lanes named like test wiring ("probe", "fake", ...) are
 //     skipped entirely when ULTIPROXY_HIDE_TEST_LANES is set.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	type ModelEntry struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		OwnedBy string `json:"owned_by"`
-		// ContextLength / MaxOutputTokens surface the alias catalog's
-		// context_limit / max_output (OpenAI-style flat limits fields).
-		// ContextLength is advisory metadata: it is reported to clients but
-		// not enforced on the request path.
-		ContextLength   int `json:"context_length,omitempty"`
-		MaxModelLen     int `json:"max_model_len,omitempty"`
-		MaxOutputTokens int `json:"max_output_tokens,omitempty"`
-	}
-
-	type ModelsResponse struct {
-		Object string       `json:"object"`
-		Data   []ModelEntry `json:"data"`
-	}
-
 	data := []ModelEntry{}
 	seen := make(map[string]bool)
-	add := func(id, ownedBy string, contextLength, maxOutput int) {
+	add := func(id, ownedBy string, meta listedModelMeta) {
 		if id == "" || seen[id] {
 			return
 		}
 		seen[id] = true
-		data = append(data, ModelEntry{
-			ID:              id,
-			Object:          "model",
-			Created:         1700000000,
-			OwnedBy:         ownedBy,
-			ContextLength:   contextLength,
-			MaxModelLen:     contextLength,
-			MaxOutputTokens: maxOutput,
-		})
+		entry := ModelEntry{
+			ID:        id,
+			Object:    "model",
+			Created:   1700000000,
+			OwnedBy:   ownedBy,
+			MaxOutput: meta.maxOutput,
+		}
+		// One window, two names: OpenRouter/LiteLLM clients read
+		// context_length, vLLM clients read max_model_len. Never a legacy
+		// max_tokens, and never a zero standing in for "unknown".
+		if meta.contextLength > 0 {
+			entry.ContextLength = meta.contextLength
+			entry.MaxModelLen = meta.contextLength
+		}
+		if arch := meta.architecture(); arch != nil {
+			entry.Architecture = arch
+			entry.SupportsVision = meta.supportsVision()
+		}
+		data = append(data, entry)
 	}
 
 	var snap *state.RuntimeSnapshot
@@ -191,7 +183,15 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			if !m.Enabled {
 				continue
 			}
-			add(m.ID, m.Provider, resolvedContext(m.ContextLimit, s.discoveredContext(m.Provider, aliasUpstream(s.catalog, m.ID))), m.MaxOutput)
+			// The catalog entry is authoritative for alias metadata; state
+			// rows that are not aliases (lane-prefixed toggles) keep their
+			// own limits.
+			alias := ModelAlias{ContextLimit: m.ContextLimit, MaxOutput: m.MaxOutput}
+			upstream := aliasUpstream(s.catalog, m.ID)
+			if entry, ok := s.aliasEntry(m.ID); ok {
+				alias = entry
+			}
+			add(m.ID, m.Provider, s.resolveModelMeta(m.ID, m.Provider, upstream, alias))
 		}
 	}
 
@@ -207,7 +207,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
-			add(alias, entry.Provider, resolvedContext(entry.ContextLimit, s.discoveredContext(entry.Provider, entry.Upstream)), entry.MaxOutput)
+			add(alias, entry.Provider, s.resolveModelMeta(alias, entry.Provider, entry.Upstream, entry))
 		}
 	}
 
@@ -227,13 +227,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 					info := meta.CachedModelInfo()
 					sort.Slice(info, func(i, j int) bool { return info[i].ID < info[j].ID })
 					for _, m := range info {
-						add(name+"/"+m.ID, name, m.ContextLength, 0)
+						add(name+"/"+m.ID, name, s.resolveModelMeta(name+"/"+m.ID, name, m.ID, ModelAlias{ContextLimit: m.ContextLength, MaxOutput: m.MaxOutput, InputModalities: m.InputModalities, OutputModalities: m.OutputModalities}))
 					}
 				} else {
 					discovered := cacher.CachedModels()
 					sort.Strings(discovered)
 					for _, m := range discovered {
-						add(name+"/"+m, name, 0, 0)
+						add(name+"/"+m, name, s.resolveModelMeta(name+"/"+m, name, m, ModelAlias{}))
 					}
 				}
 			}
@@ -241,7 +241,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			// model still yields exactly one routable, advertised id.
 			if def, ok := bundle.Inference.(defaultModelProvider); ok {
 				if m := def.DefaultModel(); m != "" {
-					add(name+"/"+m, name, s.discoveredContext(name, m), 0)
+					add(name+"/"+m, name, s.resolveModelMeta(name+"/"+m, name, m, ModelAlias{}))
 				}
 			}
 		}
@@ -256,16 +256,160 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// resolvedContext prefers an operator-set alias context_limit over a
-// discovered upstream window. Zero means unknown and stays omitted.
-func resolvedContext(aliasLimit, discovered int) int {
-	if aliasLimit > 0 {
-		return aliasLimit
+// ModelEntry is one row of GET /v1/models. OpenAI specifies only
+// id/object/created/owned_by; every extra field below is an ultiproxy
+// addition and is omitted when unknown - never 0, false or an empty array.
+type ModelEntry struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+	// ContextLength / MaxModelLen are the same advisory window in tokens
+	// under the two names clients actually read. It comes from an operator
+	// alias context_limit, live discovery, or a cited catalog row.
+	ContextLength int `json:"context_length,omitempty"`
+	MaxModelLen   int `json:"max_model_len,omitempty"`
+	// MaxOutput is the output cap in tokens (discovered
+	// max_completion_tokens / max_output_tokens, an alias max_output, or a
+	// cited catalog row). The legacy max_tokens name is never emitted.
+	MaxOutput int `json:"max_output_tokens,omitempty"`
+	// Architecture carries the OpenRouter/HF-style modality arrays.
+	Architecture *ModelArchitecture `json:"architecture,omitempty"`
+	// SupportsVision is the LiteLLM-style flag, derived from image being an
+	// advertised input modality. It is omitted (never false) when unknown.
+	SupportsVision bool `json:"supports_vision,omitempty"`
+}
+
+// ModelArchitecture is the modality block of a listed model.
+type ModelArchitecture struct {
+	InputModalities  []string `json:"input_modalities,omitempty"`
+	OutputModalities []string `json:"output_modalities,omitempty"`
+}
+
+// ModelsResponse is the GET /v1/models envelope.
+type ModelsResponse struct {
+	Object string       `json:"object"`
+	Data   []ModelEntry `json:"data"`
+}
+
+// listedModelMeta is the metadata resolved for one listed id.
+type listedModelMeta struct {
+	contextLength    int
+	maxOutput        int
+	inputModalities  []string
+	outputModalities []string
+}
+
+// architecture returns the modality block, or nil when nothing is advertised:
+// an empty object would read as "no modalities", which is a claim.
+func (m listedModelMeta) architecture() *ModelArchitecture {
+	if len(m.inputModalities) == 0 && len(m.outputModalities) == 0 {
+		return nil
 	}
-	if discovered > 0 {
-		return discovered
+	return &ModelArchitecture{
+		InputModalities:  m.inputModalities,
+		OutputModalities: m.outputModalities,
 	}
-	return 0
+}
+
+// supportsVision reports image input. Only called when a modality is known.
+func (m listedModelMeta) supportsVision() bool {
+	return modelmeta.HasImage(m.inputModalities)
+}
+
+// aliasEntry returns the catalog entry for a listed id when it is an alias.
+func (s *Server) aliasEntry(id string) (ModelAlias, bool) {
+	if s == nil || s.catalog == nil {
+		return ModelAlias{}, false
+	}
+	return s.catalog.Get(id)
+}
+
+// resolveModelMeta applies the listing precedence chain for one id, per field:
+//
+//	operator alias  >  live discovery  >  cited static catalog  >  omit
+//
+// The static catalog is looked up by the listed id first, then "<lane>/<id>",
+// then the bare upstream id. Live metadata is only ever filled in, never
+// replaced: a served window (vLLM max_model_len, Anthropic max_input_tokens)
+// always survives a catalog row. Everything unknown stays zero/nil so the
+// emitted JSON omits the key.
+func (s *Server) resolveModelMeta(listedID, lane, upstream string, alias ModelAlias) listedModelMeta {
+	var meta listedModelMeta
+	if alias.ContextLimit > 0 {
+		meta.contextLength = alias.ContextLimit
+	}
+	if alias.MaxOutput > 0 {
+		meta.maxOutput = alias.MaxOutput
+	}
+	if len(alias.InputModalities) > 0 {
+		meta.inputModalities = alias.InputModalities
+	}
+	if len(alias.OutputModalities) > 0 {
+		meta.outputModalities = alias.OutputModalities
+	}
+
+	if disc, ok := s.discoveredModelInfo(lane, upstream); ok {
+		if meta.contextLength <= 0 && disc.ContextLength > 0 {
+			meta.contextLength = disc.ContextLength
+		}
+		if meta.maxOutput <= 0 && disc.MaxOutput > 0 {
+			meta.maxOutput = disc.MaxOutput
+		}
+		if len(meta.inputModalities) == 0 {
+			meta.inputModalities = disc.InputModalities
+		}
+		if len(meta.outputModalities) == 0 {
+			meta.outputModalities = disc.OutputModalities
+		}
+	}
+
+	if entry, ok := s.staticModelEntry(listedID, lane, upstream); ok {
+		if meta.contextLength <= 0 && entry.ContextLength > 0 {
+			meta.contextLength = entry.ContextLength
+		}
+		if meta.maxOutput <= 0 && entry.MaxOutput > 0 {
+			meta.maxOutput = entry.MaxOutput
+		}
+		if len(meta.inputModalities) == 0 {
+			meta.inputModalities = entry.InputModalities
+		}
+		if len(meta.outputModalities) == 0 {
+			meta.outputModalities = entry.OutputModalities
+		}
+	}
+	return meta
+}
+
+// staticModelEntry looks the cited catalog up for one listed id. See
+// ModelCatalog.MetaEntry for the key order.
+func (s *Server) staticModelEntry(listedID, lane, upstream string) (modelmeta.Entry, bool) {
+	if s == nil || s.catalog == nil {
+		return modelmeta.Entry{}, false
+	}
+	return s.catalog.MetaEntry(listedID, lane, upstream)
+}
+
+// discoveredModelInfo returns the cached discovery metadata of one upstream id
+// on one lane. It reads the lane's cache only: listing never fans out.
+func (s *Server) discoveredModelInfo(lane, upstream string) (provider.ModelInfo, bool) {
+	if s == nil || s.registry == nil || lane == "" || upstream == "" {
+		return provider.ModelInfo{}, false
+	}
+	bundle, ok := s.registry.Get(lane)
+	if !ok || bundle.Inference == nil {
+		return provider.ModelInfo{}, false
+	}
+	meta, ok := bundle.Inference.(provider.ModelInfoCache)
+	if !ok {
+		return provider.ModelInfo{}, false
+	}
+	for _, m := range meta.CachedModelInfo() {
+		if m.ID == upstream {
+			return m, true
+		}
+	}
+	return provider.ModelInfo{}, false
 }
 
 func aliasUpstream(catalog *ModelCatalog, alias string) string {
@@ -277,26 +421,6 @@ func aliasUpstream(catalog *ModelCatalog, alias string) string {
 		return ""
 	}
 	return entry.Upstream
-}
-
-func (s *Server) discoveredContext(lane, upstream string) int {
-	if s == nil || s.registry == nil || lane == "" || upstream == "" {
-		return 0
-	}
-	bundle, ok := s.registry.Get(lane)
-	if !ok || bundle.Inference == nil {
-		return 0
-	}
-	meta, ok := bundle.Inference.(provider.ModelInfoCache)
-	if !ok {
-		return 0
-	}
-	for _, m := range meta.CachedModelInfo() {
-		if m.ID == upstream {
-			return m.ContextLength
-		}
-	}
-	return 0
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {

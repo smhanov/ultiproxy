@@ -681,12 +681,48 @@ components:
           type: string
         context_length:
           type: integer
-          description: Context window in tokens (advisory). Duplicate of max_model_len.
+          description: >-
+            Context window in tokens (advisory), under the OpenRouter/LiteLLM
+            name. Same integer as max_model_len. Precedence per field: alias
+            context_limit, then live discovery, then the cited static catalog;
+            omitted when no source reported it (never 0).
         max_model_len:
           type: integer
-          description: vLLM-compatible alias of context_length. Same integer; omitted when unknown.
+          description: >-
+            vLLM-compatible alias of context_length. Same integer; omitted when
+            unknown.
         max_output_tokens:
           type: integer
+          description: >-
+            Output cap in tokens, from alias max_output or a discovered
+            top_provider.max_completion_tokens / max_output_tokens /
+            max_completion_tokens (Anthropic max_tokens). The legacy max_tokens
+            name is never emitted.
+        architecture:
+          type: object
+          description: >-
+            Input/output modalities, normalized to text, image, file, audio or
+            video (pdf becomes file). Omitted entirely when no source
+            advertised modalities - an empty object would read as a claim of
+            none.
+          properties:
+            input_modalities:
+              type: array
+              items:
+                type: string
+                enum: [text, image, file, audio, video]
+            output_modalities:
+              type: array
+              items:
+                type: string
+                enum: [text, image, file, audio, video]
+        supports_vision:
+          type: boolean
+          enum: [true]
+          description: >-
+            Present (and always true) only when image is one of the advertised
+            input modalities. Never false and never inferred from a model name
+            or a lane capability.
         pricing:
           type: object
           properties:

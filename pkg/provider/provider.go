@@ -25,13 +25,37 @@ var ErrProviderNotFound = errors.New("provider: not found")
 // they do not support.
 var ErrNotImplemented = errors.New("provider: not implemented")
 
-// ModelInfo is one cached upstream model: the id plus an optional context
-// window in tokens. ContextLength 0 means unknown (do not advertise 0 as a
-// real window). OpenAI-compatible discovery fills this from max_model_len
-// or context_length on GET /v1/models.
+// ModelInfo is one cached upstream model: the id plus the metadata the
+// upstream actually reported on its model-list endpoint.
+//
+// Every field except ID is optional and zero/nil means "unknown": discovery
+// only fills what the upstream said, and listing (GET /v1/models, MCP
+// list_models) omits unknown keys instead of advertising 0, false or an empty
+// array. OpenAI-compatible discovery fills ContextLength from the first
+// positive of max_model_len / context_length / top_provider.context_length /
+// meta.context_length / meta.n_ctx / context_window / meta.n_ctx_train,
+// MaxOutput from the first positive of top_provider.max_completion_tokens /
+// max_output_tokens / max_completion_tokens, and the modality arrays from the
+// upstream's modality fields (normalized to text|image|file|audio|video).
 type ModelInfo struct {
 	ID            string
 	ContextLength int
+	MaxOutput     int
+	// InputModalities / OutputModalities are normalized modality tokens
+	// (text, image, file, audio, video). nil means the upstream did not say.
+	InputModalities  []string
+	OutputModalities []string
+}
+
+// SupportsImageInput reports whether the upstream advertised image input.
+// Vision is never inferred from a model name or from lane capabilities.
+func (m ModelInfo) SupportsImageInput() bool {
+	for _, mod := range m.InputModalities {
+		if mod == "image" {
+			return true
+		}
+	}
+	return false
 }
 
 // ModelInfoCache is implemented by lanes that retain per-model metadata

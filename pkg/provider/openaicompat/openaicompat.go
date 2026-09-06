@@ -22,6 +22,7 @@ import (
 	hubopenai "github.com/smhanov/llmhub/providers/openai"
 	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/ir"
+	"github.com/smhanov/ultiproxy/pkg/modelmeta"
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/provider/hublane"
 	"github.com/smhanov/ultiproxy/pkg/provider/internal/oauth"
@@ -914,14 +915,37 @@ func (p *Provider) FetchModels(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("models endpoint returned status %d", resp.StatusCode)
 	}
 
+	// Upstream model rows have no OpenAI standard beyond id, so every extra
+	// field ultiproxy understands is declared here: vLLM (max_model_len),
+	// OpenRouter (context_length, top_provider.*, architecture.*),
+	// LiteLLM/OpenAI-compatible gateways (max_output_tokens,
+	// max_completion_tokens, supports_vision, top-level modality arrays),
+	// llama.cpp (meta.n_ctx / meta.n_ctx_train) and Groq (context_window).
 	var raw struct {
 		Data []struct {
-			ID            string `json:"id"`
-			MaxModelLen   int    `json:"max_model_len"`
-			ContextLength int    `json:"context_length"`
-			Meta          struct {
+			ID            string   `json:"id"`
+			MaxModelLen   int      `json:"max_model_len"`
+			ContextLength int      `json:"context_length"`
+			ContextWindow int      `json:"context_window"`
+			MaxOutputTok  int      `json:"max_output_tokens"`
+			MaxComplTok   int      `json:"max_completion_tokens"`
+			SupportsVis   bool     `json:"supports_vision"`
+			InModalities  []string `json:"input_modalities"`
+			OutModalities []string `json:"output_modalities"`
+			TopProvider   struct {
+				ContextLength    int `json:"context_length"`
+				MaxCompletionTok int `json:"max_completion_tokens"`
+			} `json:"top_provider"`
+			Meta struct {
 				ContextLength int `json:"context_length"`
+				NCtx          int `json:"n_ctx"`
+				NCtxTrain     int `json:"n_ctx_train"`
 			} `json:"meta"`
+			Architecture struct {
+				InModalities  []string `json:"input_modalities"`
+				OutModalities []string `json:"output_modalities"`
+				Modality      string   `json:"modality"`
+			} `json:"architecture"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
@@ -936,8 +960,23 @@ func (p *Provider) FetchModels(ctx context.Context) ([]string, error) {
 		}
 		models = append(models, m.ID)
 		info = append(info, provider.ModelInfo{
-			ID:            m.ID,
-			ContextLength: pickContextLength(m.MaxModelLen, m.ContextLength, m.Meta.ContextLength),
+			ID: m.ID,
+			ContextLength: pickContextLength(
+				m.MaxModelLen,
+				m.ContextLength,
+				m.TopProvider.ContextLength,
+				m.Meta.ContextLength,
+				m.Meta.NCtx,
+				m.ContextWindow,
+				m.Meta.NCtxTrain,
+			),
+			MaxOutput: pickContextLength(
+				m.TopProvider.MaxCompletionTok,
+				m.MaxOutputTok,
+				m.MaxComplTok,
+			),
+			InputModalities:  pickInputModalities(m.Architecture.InModalities, m.InModalities, m.Architecture.Modality, m.SupportsVis),
+			OutputModalities: pickOutputModalities(m.Architecture.OutModalities, m.OutModalities, m.Architecture.Modality),
 		})
 	}
 
@@ -949,8 +988,13 @@ func (p *Provider) FetchModels(ctx context.Context) ([]string, error) {
 	return models, nil
 }
 
-// pickContextLength returns the first positive window from upstream field
-// variants: vLLM max_model_len, OpenRouter-style context_length, nested meta.
+// pickContextLength returns the first positive value from the upstream field
+// variants it is handed. It is used for the context window (vLLM max_model_len,
+// OpenRouter context_length / top_provider.context_length, llama.cpp
+// meta.context_length / meta.n_ctx, Groq context_window, trained
+// meta.n_ctx_train last) and for the output cap (top_provider
+// max_completion_tokens, then max_output_tokens / max_completion_tokens). Zero
+// means the upstream did not say, and is never advertised.
 func pickContextLength(values ...int) int {
 	for _, v := range values {
 		if v > 0 {
@@ -958,6 +1002,49 @@ func pickContextLength(values ...int) int {
 		}
 	}
 	return 0
+}
+
+// pickInputModalities resolves the advertised input modalities of one upstream
+// row: explicit arrays win (architecture first, then top level), then an
+// HF-style architecture.modality string ("text+image->text"), then a bare
+// supports_vision flag, which advertises image input without naming the rest.
+// nil means unknown - never an empty array standing in for "unknown".
+func pickInputModalities(architecture, topLevel []string, modalityString string, supportsVision bool) []string {
+	if in := modelmeta.NormalizeModalities(architecture); len(in) > 0 {
+		return in
+	}
+	if in := modelmeta.NormalizeModalities(topLevel); len(in) > 0 {
+		return in
+	}
+	if modalityString != "" {
+		in, _ := modelmeta.ParseModalityString(modalityString)
+		if len(in) > 0 {
+			return in
+		}
+	}
+	if supportsVision {
+		return []string{modelmeta.ModalityImage}
+	}
+	return nil
+}
+
+// pickOutputModalities resolves the advertised output modalities of one
+// upstream row: explicit arrays first (architecture, then top level), then the
+// output side of an architecture.modality string.
+func pickOutputModalities(architecture, topLevel []string, modalityString string) []string {
+	if out := modelmeta.NormalizeModalities(architecture); len(out) > 0 {
+		return out
+	}
+	if out := modelmeta.NormalizeModalities(topLevel); len(out) > 0 {
+		return out
+	}
+	if modalityString != "" {
+		_, out := modelmeta.ParseModalityString(modalityString)
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return nil
 }
 
 // Quota implements provider.QuotaProvider.

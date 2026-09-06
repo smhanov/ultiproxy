@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/smhanov/ultiproxy/pkg/modelmeta"
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/state"
 )
@@ -23,12 +24,13 @@ Returns a JSON object mapping every model id to its metadata:
 - id: the exact string a client passes as "model" in POST /v1/chat/completions and POST /v1/messages
 - provider: the lane serving it (antigravity, xai, copilot, codex, freebuff, zai, or any lane added with add_provider)
 - enabled: whether the id is routable right now (flip it with toggle_model)
-- context_limit: context window in tokens; advisory metadata surfaced as context_length on GET /v1/models, never enforced against the prompt
-- max_output: hard cap on generated tokens; a request's max_tokens is clamped down to it
+- context_limit / context_length / max_model_len: the context window in tokens under all three names (context_length and max_model_len match GET /v1/models); advisory metadata, never enforced against the prompt
+- max_output / max_output_tokens: hard cap on generated tokens; a request's max_tokens is clamped down to it
+- architecture.input_modalities / architecture.output_modalities: normalized modality arrays (text, image, file, audio, video), plus supports_vision: true exactly when image is an input
 - pricing_tag, benchmark_scores: pricing / quality labels carried by the alias
 - source: where the id comes from - "alias" (set_model_alias catalog), "discovery" (the lane's cached upstream model list, exposed as "<lane>/<model>"), or "default" (a lane's default model, exposed as "<lane>/<default>", e.g. antigravity/gemini-3.7-flash-high)
 
-This is the same id set GET /v1/models advertises. Only routable ids appear: a bare lane name is never listed, because a lane name is a routing prefix, not a model. Lanes whose discovery cache is empty and that have no default model contribute nothing (refresh_models refills the cache). Ids disabled with toggle_model stay listed with "enabled": false so they can be switched back on, while GET /v1/models omits them. Setting ULTIPROXY_HIDE_TEST_LANES=1 additionally drops clearly-test lanes such as "probe" or "fake" from both surfaces.
+This is the same id set GET /v1/models advertises, with the same metadata precedence per field: operator alias (set_model_alias context_limit / max_output / input_modalities / output_modalities) > live discovery > the cited static catalog (pkg/modelmeta, extended with data_dir/windows.json) > the key is omitted, never 0, false or []. Only routable ids appear: a bare lane name is never listed, because a lane name is a routing prefix, not a model. Lanes whose discovery cache is empty and that have no default model contribute nothing (refresh_models refills the cache). Ids disabled with toggle_model stay listed with "enabled": false so they can be switched back on, while GET /v1/models omits them. Setting ULTIPROXY_HIDE_TEST_LANES=1 additionally drops clearly-test lanes such as "probe" or "fake" from both surfaces.
 
 One routing shape is deliberately NOT advertised but still works, for backward compatibility: "model": "<lane>" with no slash routes to that lane and lets it pick its own upstream model. Prefer the listed ids. Use list_providers for lane-level inventory/health and list_model_aliases for the raw alias table.`,
 		InputSchema: &InputSchema{
@@ -154,7 +156,7 @@ On success the code is exchanged for tokens server-side and the answer is status
 		Name: "list_model_aliases",
 		Description: `List the alias table: client-visible model name -> provider lane + upstream model id, with limits and pricing.
 
-Returns a JSON object keyed by alias; every value carries provider, upstream, context_limit, max_output, pricing_tag, input_cost / output_cost (USD per 1M tokens) and benchmarks. This is the same data list_models reports per id, but complete and unfiltered. Every alias here is a valid "model" value for POST /v1/chat/completions and POST /v1/messages. Mutate the table with set_model_alias and remove_model_alias.`,
+Returns a JSON object keyed by alias; every value carries provider, upstream, context_limit, max_output, input_modalities / output_modalities, pricing_tag, input_cost / output_cost (USD per 1M tokens) and benchmarks. This is the same data list_models reports per id, but complete and unfiltered. Every alias here is a valid "model" value for POST /v1/chat/completions and POST /v1/messages. Mutate the table with set_model_alias and remove_model_alias.`,
 		InputSchema: &InputSchema{Type: "object", Properties: map[string]PropertyDef{}},
 	},
 	{
@@ -164,8 +166,9 @@ Returns a JSON object keyed by alias; every value carries provider, upstream, co
 - alias (required): the name clients will send as "model", e.g. "qwenpoint-3.8" or "sonnet-big"
 - provider (required): a registered lane name, e.g. "vllm", "zai", "antigravity", "xai", "copilot", "codex", "freebuff" (see list_providers)
 - upstream (required): the model id that lane understands, e.g. "Qwen/Qwen3.8-Instruct-AWQ" or "claude-sonnet-4-5"
-- context_limit (optional): context window in tokens - advisory metadata surfaced as context_length on GET /v1/models, not enforced
-- max_output (optional): hard cap on completion tokens; a request's max_tokens is clamped to it
+- context_limit (optional): context window in tokens - advisory metadata surfaced as context_length / max_model_len on GET /v1/models, not enforced
+- max_output (optional): hard cap on completion tokens; a request's max_tokens is clamped to it and it is surfaced as max_output_tokens
+- input_modalities / output_modalities (optional): arrays of modality tokens (text, image, file, audio, video; pdf normalizes to file). Surfaced as architecture.input_modalities / output_modalities, plus supports_vision: true when image is an input. They override both live discovery and the cited static catalog, so set them only when the lane's own model list is wrong or silent
 - pricing_tag (optional): pricing label such as "flat-subscription" or "paid-api"
 - input_cost / output_cost (optional): USD per 1M prompt / completion tokens, used for cost accounting when the upstream does not price itself
 - benchmarks (optional): map of benchmark name -> score, informational
@@ -174,15 +177,17 @@ Calling it again with the same alias replaces the whole entry. Clients ask for t
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"alias":         {Type: "string", Description: "Client-visible model name clients send as model, e.g. qwenpoint-3.8"},
-				"provider":      {Type: "string", Description: "Provider lane name the alias routes to, e.g. vllm, zai, antigravity, xai"},
-				"upstream":      {Type: "string", Description: "Upstream model id on that lane, e.g. Qwen/Qwen3.8-Instruct-AWQ"},
-				"context_limit": {Type: "number", Description: "Optional context window size in tokens (advisory, surfaced as context_length on /v1/models)"},
-				"max_output":    {Type: "number", Description: "Optional max output tokens; a request's max_tokens is clamped to it"},
-				"pricing_tag":   {Type: "string", Description: "Optional pricing label, e.g. flat-subscription"},
-				"input_cost":    {Type: "number", Description: "Optional input price in US dollars per 1M prompt tokens (drives cost accounting)"},
-				"output_cost":   {Type: "number", Description: "Optional output price in US dollars per 1M completion tokens (drives cost accounting)"},
-				"benchmarks":    {Type: "object", Description: "Optional map of benchmark name -> score, informational only"},
+				"alias":             {Type: "string", Description: "Client-visible model name clients send as model, e.g. qwenpoint-3.8"},
+				"provider":          {Type: "string", Description: "Provider lane name the alias routes to, e.g. vllm, zai, antigravity, xai"},
+				"upstream":          {Type: "string", Description: "Upstream model id on that lane, e.g. Qwen/Qwen3.8-Instruct-AWQ"},
+				"context_limit":     {Type: "number", Description: "Optional context window size in tokens (advisory, surfaced as context_length on /v1/models)"},
+				"max_output":        {Type: "number", Description: "Optional max output tokens; a request's max_tokens is clamped to it"},
+				"input_modalities":  {Type: "array", Description: "Array of input modality strings - text, image, file, audio, video (pdf normalizes to file). Drives architecture.input_modalities and supports_vision"},
+				"output_modalities": {Type: "array", Description: "Array of output modality strings - text, image, file, audio, video. Drives architecture.output_modalities"},
+				"pricing_tag":       {Type: "string", Description: "Optional pricing label, e.g. flat-subscription"},
+				"input_cost":        {Type: "number", Description: "Optional input price in US dollars per 1M prompt tokens (drives cost accounting)"},
+				"output_cost":       {Type: "number", Description: "Optional output price in US dollars per 1M completion tokens (drives cost accounting)"},
+				"benchmarks":        {Type: "object", Description: "Optional map of benchmark name -> score, informational only"},
 			},
 			Required: []string{"alias", "provider", "upstream"},
 		},
@@ -400,12 +405,114 @@ type listedModel struct {
 	ContextLength   int                `json:"context_length,omitempty"`
 	MaxModelLen     int                `json:"max_model_len,omitempty"`
 	MaxOutput       int                `json:"max_output,omitempty"`
+	MaxOutputTokens int                `json:"max_output_tokens,omitempty"`
 	PricingTag      string             `json:"pricing_tag,omitempty"`
 	BenchmarkScores map[string]float64 `json:"benchmarks,omitempty"`
+	// Architecture carries the input/output modality arrays; nil when no
+	// source advertised them (an empty object would read as a claim of none).
+	Architecture *listedArchitecture `json:"architecture,omitempty"`
+	// SupportsVision is derived from image being an advertised input
+	// modality. Omitted - never false - when unknown.
+	SupportsVision bool `json:"supports_vision,omitempty"`
 	// Source is where the id comes from: "alias" (catalog / state model map),
 	// "discovery" (cached upstream catalog) or "default" (the lane's default
 	// model).
 	Source string `json:"source"`
+}
+
+// listedArchitecture mirrors GET /v1/models' architecture block.
+type listedArchitecture struct {
+	InputModalities  []string `json:"input_modalities,omitempty"`
+	OutputModalities []string `json:"output_modalities,omitempty"`
+}
+
+// listedModelMeta is the metadata resolved for one listed id. It mirrors the
+// pkg/server resolution so the two listings cannot disagree.
+type listedModelMeta struct {
+	contextLength    int
+	maxOutput        int
+	inputModalities  []string
+	outputModalities []string
+}
+
+func (m listedModelMeta) architecture() *listedArchitecture {
+	if len(m.inputModalities) == 0 && len(m.outputModalities) == 0 {
+		return nil
+	}
+	return &listedArchitecture{
+		InputModalities:  m.inputModalities,
+		OutputModalities: m.outputModalities,
+	}
+}
+
+func (m listedModelMeta) supportsVision() bool {
+	return modelmeta.HasImage(m.inputModalities)
+}
+
+// resolveListedMeta applies the same precedence GET /v1/models applies, per
+// field: operator alias > live discovery > cited static catalog > omit. The
+// static catalog is read through the alias manager when it also implements
+// ModelMetaSource (the http server's catalog bridge does).
+func (s *Server) resolveListedMeta(listedID, lane, upstream string, alias ModelAlias, disc provider.ModelInfo, discOK bool) listedModelMeta {
+	var meta listedModelMeta
+	if alias.ContextLimit > 0 {
+		meta.contextLength = alias.ContextLimit
+	}
+	if alias.MaxOutput > 0 {
+		meta.maxOutput = alias.MaxOutput
+	}
+	meta.inputModalities = alias.InputModalities
+	meta.outputModalities = alias.OutputModalities
+
+	if discOK {
+		if meta.contextLength <= 0 && disc.ContextLength > 0 {
+			meta.contextLength = disc.ContextLength
+		}
+		if meta.maxOutput <= 0 && disc.MaxOutput > 0 {
+			meta.maxOutput = disc.MaxOutput
+		}
+		if len(meta.inputModalities) == 0 {
+			meta.inputModalities = disc.InputModalities
+		}
+		if len(meta.outputModalities) == 0 {
+			meta.outputModalities = disc.OutputModalities
+		}
+	}
+
+	if src, ok := s.aliases.(ModelMetaSource); ok && src != nil {
+		if entry, ok := src.ModelMetaEntry(listedID, lane, upstream); ok {
+			if meta.contextLength <= 0 && entry.ContextLength > 0 {
+				meta.contextLength = entry.ContextLength
+			}
+			if meta.maxOutput <= 0 && entry.MaxOutput > 0 {
+				meta.maxOutput = entry.MaxOutput
+			}
+			if len(meta.inputModalities) == 0 {
+				meta.inputModalities = entry.InputModalities
+			}
+			if len(meta.outputModalities) == 0 {
+				meta.outputModalities = entry.OutputModalities
+			}
+		}
+	}
+	return meta
+}
+
+// applyListedMeta fills the advertised metadata fields of one entry. Unknown
+// values stay zero/nil so the JSON omits them rather than emitting 0, false or
+// an empty array.
+func applyListedMeta(e *listedModel, meta listedModelMeta) {
+	if meta.contextLength > 0 {
+		e.ContextLimit = meta.contextLength
+		e.ContextLength = meta.contextLength
+		e.MaxModelLen = meta.contextLength
+	}
+	e.MaxOutput = meta.maxOutput
+	e.MaxOutputTokens = meta.maxOutput
+	e.Architecture = meta.architecture()
+	if e.Architecture != nil {
+		e.SupportsVision = meta.supportsVision()
+	}
 }
 
 // modelsCacheProvider, defaultModelProvider, EnvHideTestLanes, hideTestLanes
@@ -486,18 +593,24 @@ func (s *Server) listedModels() map[string]listedModel {
 					}
 				}
 			}
-			window := mcpResolvedContext(m.ContextLimit, s.discoveredContext(m.Provider, upstream))
-			set(m.ID, listedModel{
+			alias := ModelAlias{ContextLimit: m.ContextLimit, MaxOutput: m.MaxOutput}
+			if s.aliases != nil {
+				if entries := s.aliases.List(); entries != nil {
+					if e, ok := entries[m.ID]; ok {
+						alias = e
+					}
+				}
+			}
+			disc, discOK := s.discoveredModelInfo(m.Provider, upstream)
+			entry := listedModel{
 				Provider:        m.Provider,
 				Enabled:         m.Enabled,
-				ContextLimit:    window,
-				ContextLength:   window,
-				MaxModelLen:     window,
-				MaxOutput:       m.MaxOutput,
 				PricingTag:      m.PricingTag,
 				BenchmarkScores: m.BenchmarkScores,
 				Source:          "alias",
-			})
+			}
+			applyListedMeta(&entry, s.resolveListedMeta(m.ID, m.Provider, upstream, alias, disc, discOK))
+			set(m.ID, entry)
 		}
 	}
 
@@ -515,18 +628,16 @@ func (s *Server) listedModels() map[string]listedModel {
 					enabled = mr.Enabled
 				}
 			}
-			window := mcpResolvedContext(entry.ContextLimit, s.discoveredContext(entry.Provider, entry.Upstream))
-			set(alias, listedModel{
+			disc, discOK := s.discoveredModelInfo(entry.Provider, entry.Upstream)
+			row := listedModel{
 				Provider:        entry.Provider,
 				Enabled:         enabled,
-				ContextLimit:    window,
-				ContextLength:   window,
-				MaxModelLen:     window,
-				MaxOutput:       entry.MaxOutput,
 				PricingTag:      entry.PricingTag,
 				BenchmarkScores: entry.BenchmarkScores,
 				Source:          "alias",
-			})
+			}
+			applyListedMeta(&row, s.resolveListedMeta(alias, entry.Provider, entry.Upstream, entry, disc, discOK))
+			set(alias, row)
 		}
 	}
 
@@ -547,34 +658,27 @@ func (s *Server) listedModels() map[string]listedModel {
 					info := meta.CachedModelInfo()
 					sort.Slice(info, func(i, j int) bool { return info[i].ID < info[j].ID })
 					for _, m := range info {
-						set(name+"/"+m.ID, listedModel{
-							Provider:      name,
-							Enabled:       true,
-							ContextLimit:  m.ContextLength,
-							ContextLength: m.ContextLength,
-							MaxModelLen:   m.ContextLength,
-							Source:        "discovery",
-						})
+						row := listedModel{Provider: name, Enabled: true, Source: "discovery"}
+						applyListedMeta(&row, s.resolveListedMeta(name+"/"+m.ID, name, m.ID,
+							ModelAlias{ContextLimit: m.ContextLength, MaxOutput: m.MaxOutput, InputModalities: m.InputModalities, OutputModalities: m.OutputModalities}, m, true))
+						set(name+"/"+m.ID, row)
 					}
 				} else {
 					discovered := append([]string(nil), cacher.CachedModels()...)
 					sort.Strings(discovered)
 					for _, m := range discovered {
-						set(name+"/"+m, listedModel{Provider: name, Enabled: true, Source: "discovery"})
+						row := listedModel{Provider: name, Enabled: true, Source: "discovery"}
+						applyListedMeta(&row, s.resolveListedMeta(name+"/"+m, name, m, ModelAlias{}, provider.ModelInfo{}, false))
+						set(name+"/"+m, row)
 					}
 				}
 			}
 			if def, ok := bundle.Inference.(defaultModelProvider); ok {
 				if m := def.DefaultModel(); m != "" {
-					w := s.discoveredContext(name, m)
-					set(name+"/"+m, listedModel{
-						Provider:      name,
-						Enabled:       true,
-						ContextLimit:  w,
-						ContextLength: w,
-						MaxModelLen:   w,
-						Source:        "default",
-					})
+					disc, discOK := s.discoveredModelInfo(name, m)
+					row := listedModel{Provider: name, Enabled: true, Source: "default"}
+					applyListedMeta(&row, s.resolveListedMeta(name+"/"+m, name, m, ModelAlias{}, disc, discOK))
+					set(name+"/"+m, row)
 				}
 			}
 		}
@@ -583,34 +687,26 @@ func (s *Server) listedModels() map[string]listedModel {
 	return out
 }
 
-func mcpResolvedContext(aliasLimit, discovered int) int {
-	if aliasLimit > 0 {
-		return aliasLimit
-	}
-	if discovered > 0 {
-		return discovered
-	}
-	return 0
-}
-
-func (s *Server) discoveredContext(lane, upstream string) int {
+// discoveredModelInfo returns the cached discovery metadata of one upstream id
+// on one lane. It reads the lane's cache only, so list_models never fans out.
+func (s *Server) discoveredModelInfo(lane, upstream string) (provider.ModelInfo, bool) {
 	if s == nil || s.registry == nil || lane == "" || upstream == "" {
-		return 0
+		return provider.ModelInfo{}, false
 	}
 	bundle, ok := s.registry.Get(lane)
 	if !ok || bundle.Inference == nil {
-		return 0
+		return provider.ModelInfo{}, false
 	}
 	meta, ok := bundle.Inference.(provider.ModelInfoCache)
 	if !ok {
-		return 0
+		return provider.ModelInfo{}, false
 	}
 	for _, m := range meta.CachedModelInfo() {
 		if m.ID == upstream {
-			return m.ContextLength
+			return m, true
 		}
 	}
-	return 0
+	return provider.ModelInfo{}, false
 }
 
 func (s *Server) toolGetQuotaStatus(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {
@@ -956,15 +1052,17 @@ func (s *Server) toolSetModelAlias(ctx context.Context, argsRaw json.RawMessage)
 		}, nil
 	}
 	var args struct {
-		Alias        string             `json:"alias"`
-		Provider     string             `json:"provider"`
-		Upstream     string             `json:"upstream"`
-		ContextLimit int                `json:"context_limit"`
-		MaxOutput    int                `json:"max_output"`
-		PricingTag   string             `json:"pricing_tag"`
-		InputCost    float64            `json:"input_cost"`
-		OutputCost   float64            `json:"output_cost"`
-		Benchmarks   map[string]float64 `json:"benchmarks"`
+		Alias            string             `json:"alias"`
+		Provider         string             `json:"provider"`
+		Upstream         string             `json:"upstream"`
+		ContextLimit     int                `json:"context_limit"`
+		MaxOutput        int                `json:"max_output"`
+		InputModalities  []string           `json:"input_modalities"`
+		OutputModalities []string           `json:"output_modalities"`
+		PricingTag       string             `json:"pricing_tag"`
+		InputCost        float64            `json:"input_cost"`
+		OutputCost       float64            `json:"output_cost"`
+		Benchmarks       map[string]float64 `json:"benchmarks"`
 	}
 	if err := json.Unmarshal(argsRaw, &args); err != nil {
 		return &CallToolResult{
@@ -972,21 +1070,38 @@ func (s *Server) toolSetModelAlias(ctx context.Context, argsRaw json.RawMessage)
 			IsError: true,
 		}, nil
 	}
-	entry := ModelAlias{
-		Provider:        args.Provider,
-		Upstream:        args.Upstream,
-		ContextLimit:    args.ContextLimit,
-		MaxOutput:       args.MaxOutput,
-		PricingTag:      args.PricingTag,
-		InputCost:       args.InputCost,
-		OutputCost:      args.OutputCost,
-		BenchmarkScores: args.Benchmarks,
-	}
-	if args.Alias == "" || entry.Provider == "" || entry.Upstream == "" {
+	if args.Alias == "" || args.Provider == "" || args.Upstream == "" {
 		return &CallToolResult{
 			Content: []ToolContent{{Type: "text", Text: "error: alias, provider and upstream are required"}},
 			IsError: true,
 		}, nil
+	}
+	// Modality tokens are operator assertions, so a token that does not
+	// normalize is rejected with the offending value instead of being dropped
+	// (a silently dropped "image" would advertise a model as text-only).
+	if err := modelmeta.ValidateModalities(args.InputModalities); err != nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: input_modalities: %v", err)}},
+			IsError: true,
+		}, nil
+	}
+	if err := modelmeta.ValidateModalities(args.OutputModalities); err != nil {
+		return &CallToolResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: output_modalities: %v", err)}},
+			IsError: true,
+		}, nil
+	}
+	entry := ModelAlias{
+		Provider:         args.Provider,
+		Upstream:         args.Upstream,
+		ContextLimit:     args.ContextLimit,
+		MaxOutput:        args.MaxOutput,
+		InputModalities:  modelmeta.NormalizeModalities(args.InputModalities),
+		OutputModalities: modelmeta.NormalizeModalities(args.OutputModalities),
+		PricingTag:       args.PricingTag,
+		InputCost:        args.InputCost,
+		OutputCost:       args.OutputCost,
+		BenchmarkScores:  args.Benchmarks,
 	}
 	if err := s.aliases.Set(args.Alias, entry); err != nil {
 		return &CallToolResult{

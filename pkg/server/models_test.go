@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/provider/antigravity"
@@ -252,14 +253,37 @@ func TestHandleModels_DefaultModelEscapeHatch(t *testing.T) {
 		}
 	}
 
-	// The escape hatch must not fan out to the upstream either.
+	// The escape hatch must not fan out to the upstream either. The lane's own
+	// discovery came back empty, so the background startup heal pass re-probes
+	// it once (T030: a lane whose cache is still empty is healed) - wait for
+	// that pass to settle first, so the count this test asserts about is the
+	// count GET /v1/models alone can move.
 	if got := upstream.modelRequests(); got == 0 {
 		t.Fatal("startup discovery never ran")
 	}
+	waitForModelRequests(t, upstream, 2)
 	before := upstream.modelRequests()
+	_ = getModels(t, srv)
 	_ = getModels(t, srv)
 	if got := upstream.modelRequests(); got != before {
 		t.Errorf("GET /v1/models re-probed the upstream: %d -> %d", before, got)
+	}
+}
+
+// waitForModelRequests blocks until the fake upstream has served want model
+// requests (construction-time discovery plus the background heal pass), so a
+// test can assert on request counts without racing the discovery goroutine.
+func waitForModelRequests(t *testing.T, upstream *fakeModelUpstream, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := upstream.modelRequests(); got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("upstream served %d model requests, want at least %d", upstream.modelRequests(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

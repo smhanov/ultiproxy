@@ -13,10 +13,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+
+	"github.com/smhanov/ultiproxy/pkg/mcp"
+	"github.com/smhanov/ultiproxy/pkg/modelmeta"
 )
 
 // ModelAlias maps a client-visible alias to a provider lane + upstream id.
@@ -39,17 +43,35 @@ type ModelAlias struct {
 	InputCost       float64            `yaml:"input_cost,omitempty" json:"input_cost,omitempty"`
 	OutputCost      float64            `yaml:"output_cost,omitempty" json:"output_cost,omitempty"`
 	BenchmarkScores map[string]float64 `yaml:"benchmarks,omitempty" json:"benchmarks,omitempty"`
+	// InputModalities / OutputModalities are optional operator-asserted
+	// modality arrays (text, image, file, audio, video). They are advisory
+	// metadata surfaced on GET /v1/models as architecture.input_modalities /
+	// output_modalities (plus supports_vision when image is an input), and
+	// they win over both live discovery and the cited static catalog. Empty
+	// means "not asserted": nothing is emitted for it.
+	InputModalities  []string `yaml:"input_modalities,omitempty" json:"input_modalities,omitempty"`
+	OutputModalities []string `yaml:"output_modalities,omitempty" json:"output_modalities,omitempty"`
 }
 
-// ModelCatalog is a thread-safe alias registry with JSON persistence.
+// ModelCatalog is a thread-safe alias registry with JSON persistence. It also
+// owns the cited static model catalog (modelmeta) plus its operator overlay,
+// because both describe the same listed ids.
 type ModelCatalog struct {
 	mu          sync.RWMutex
 	aliases     map[string]ModelAlias
 	persistPath string
+	// meta is the cited static catalog (compiled seed merged with the
+	// data_dir/windows.json overlay). Immutable after construction, so reads
+	// need no lock.
+	meta *modelmeta.Catalog
 }
 
 // NewModelCatalog builds a catalog from config models, then overlays any
-// runtime-persisted aliases from persistPath (runtime changes win).
+// runtime-persisted aliases from persistPath (runtime changes win). The cited
+// static catalog is loaded from the same directory (windows.json over the
+// compiled seed); a missing overlay file means the compiled seed only, and a
+// present but invalid overlay is logged and ignored rather than dropping the
+// daemon's model listing.
 func NewModelCatalog(configModels map[string]ModelAlias, persistPath string) (*ModelCatalog, error) {
 	c := &ModelCatalog{
 		aliases:     make(map[string]ModelAlias, len(configModels)+4),
@@ -57,6 +79,18 @@ func NewModelCatalog(configModels map[string]ModelAlias, persistPath string) (*M
 	}
 	for alias, entry := range configModels {
 		c.aliases[alias] = entry
+	}
+	overlayPath := ""
+	if dir := filepath.Dir(persistPath); dir != "" && dir != "." {
+		overlayPath = filepath.Join(dir, modelmeta.OverlayFileName)
+	}
+	meta, metaErr := modelmeta.LoadOverlay(overlayPath)
+	switch {
+	case metaErr != nil:
+		log.Printf("[server] static model catalog overlay ignored: %v (serving the compiled catalog)", metaErr)
+		c.meta = modelmeta.Default()
+	default:
+		c.meta = meta
 	}
 	if persistPath == "" {
 		return c, nil
@@ -223,4 +257,23 @@ func writeFileAtomic(path string, data []byte) error {
 		return fmt.Errorf("rename %s to %s: %w", tmp, path, err)
 	}
 	return nil
+}
+
+// MetaEntry resolves the cited static catalog entry for one listed id. Keys
+// are tried in order - the listed id ("zai/glm-5.3" or an alias), then
+// "<lane>/<upstream>", then the bare upstream id - so both a lane-prefixed
+// discovery row and an alias resolve the same catalog row. Callers only use it
+// to fill gaps: live discovery and operator aliases win over it.
+func (c *ModelCatalog) MetaEntry(listedID, lane, upstream string) (modelmeta.Entry, bool) {
+	if c == nil || c.meta == nil {
+		return modelmeta.Entry{}, false
+	}
+	return c.meta.Lookup(listedID, lane+"/"+upstream, upstream)
+}
+
+// ModelMetaEntry adapts ModelCatalog.MetaEntry to the MCP surface
+// (mcp.ModelMetaSource), so list_models applies the same precedence chain as
+// GET /v1/models.
+func (b *catalogBridge) ModelMetaEntry(listedID, lane, upstream string) (mcp.ModelMeta, bool) {
+	return b.catalog.MetaEntry(listedID, lane, upstream)
 }
