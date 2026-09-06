@@ -241,8 +241,11 @@ func DecodeChatCompletionRequest(body []byte) (*ChatCompletionDecoded, error) {
 	for k, v := range req.ExtraFields {
 		switch k {
 		case "model", "messages", "tools", "tool_choice", "temperature",
-			"max_tokens", "max_completion_tokens", "stream", "stream_options", "reasoning_effort":
-			// already handled
+			"max_tokens", "max_completion_tokens", "stream", "stream_options", "reasoning_effort",
+			// Anthropic-only keys some OpenAI-shaped clients still send.
+			// Strict OpenAI lanes reject them; drop rather than forward.
+			"metadata", "output_config", "context_management":
+			// already handled or Anthropic-only
 		default:
 			extra[k] = v
 		}
@@ -359,23 +362,23 @@ func EncodeChatCompletionResponse(resp *ir.Response, model string) ([]byte, erro
 	}
 
 	finishReason := resp.FinishReason
-		if len(toolCalls) > 0 {
-			// If the model returned tool calls, the finish reason MUST be
-			// "tool_calls" — clients (opencode) use it to decide whether to
-			// execute them. Upstream may say "other"/"stop"/anything.
-			finishReason = "tool_calls"
-		} else if finishReason == "" {
+	if len(toolCalls) > 0 {
+		// If the model returned tool calls, the finish reason MUST be
+		// "tool_calls" — clients (opencode) use it to decide whether to
+		// execute them. Upstream may say "other"/"stop"/anything.
+		finishReason = "tool_calls"
+	} else if finishReason == "" {
+		finishReason = "stop"
+	} else {
+		switch finishReason {
+		case "end_turn":
 			finishReason = "stop"
-		} else {
-			switch finishReason {
-			case "end_turn":
-				finishReason = "stop"
-			case "tool_use":
-				finishReason = "tool_calls"
-			case "max_tokens":
-				finishReason = "length"
-			}
+		case "tool_use":
+			finishReason = "tool_calls"
+		case "max_tokens":
+			finishReason = "length"
 		}
+	}
 
 	msg := OpenAIResponseMessage{
 		Role: "assistant",
@@ -456,6 +459,8 @@ type OpenAIStreamEncoder struct {
 	includeUsage bool
 	started      bool
 	sawToolCalls bool
+	stopped      bool
+	closed       bool
 	lastUsage    *OpenAIUsage
 }
 
@@ -553,6 +558,10 @@ func (e *OpenAIStreamEncoder) EncodeEvent(evt ir.Event) error {
 		e.lastUsage = u
 
 	case ir.EventMessageStop:
+		if e.stopped {
+			return nil
+		}
+		e.stopped = true
 		finish := ev.FinishReason
 		if e.sawToolCalls {
 			finish = "tool_calls"
@@ -587,6 +596,10 @@ func (e *OpenAIStreamEncoder) EncodeEvent(evt ir.Event) error {
 
 // Close finalizes the stream, writing usage if requested and the final [DONE] line.
 func (e *OpenAIStreamEncoder) Close() error {
+	if e.closed {
+		return nil
+	}
+	e.closed = true
 	if e.includeUsage && e.lastUsage != nil {
 		usageChunk := struct {
 			ID      string              `json:"id"`

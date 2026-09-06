@@ -260,8 +260,13 @@ func DecodeMessagesRequest(body []byte) (*MessagesDecoded, error) {
 	}
 	for k, v := range req.ExtraFields {
 		switch k {
-		case "model", "messages", "system", "max_tokens", "temperature", "thinking", "tools", "tool_choice", "stream":
-			// handled
+		case "model", "messages", "system", "max_tokens", "temperature", "thinking", "tools", "tool_choice", "stream",
+			// Anthropic-only: Claude Code sends these on every /v1/messages
+			// request. Strict OpenAI-compatible lanes (z.ai) reject them as
+			// unknown keys (400 code 1210). Drop them here so the Anthropic
+			// inbound surface can still route to an OpenAI lane.
+			"metadata", "output_config", "context_management":
+			// handled or Anthropic-only
 		default:
 			extra[k] = v
 		}
@@ -851,6 +856,9 @@ func (e *AnthropicStreamEncoder) EncodeEvent(evt ir.Event) error {
 		e.usage.CacheReadInputTokens = ev.CacheReadInputTokens
 
 	case ir.EventMessageStop:
+		if e.stopped {
+			return nil
+		}
 		if err := e.ensureMessageStart(); err != nil {
 			return err
 		}

@@ -69,7 +69,7 @@ func NewAuthMiddleware(apiKey string, clientKeys map[string]string) *AuthMiddlew
 func (m *AuthMiddleware) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Public paths that do not require auth
-		if r.URL.Path == "/healthz" || r.URL.Path == "/llms.txt" {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/llms.txt" {
 			next.ServeHTTP(w, r)
 			return
 		}

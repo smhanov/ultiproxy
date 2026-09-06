@@ -322,6 +322,35 @@ Discovery is automatic: every OpenAI-compatible lane discovers when it is regist
 			Required: []string{"name"},
 		},
 	},
+	{
+		Name: "set_model_info",
+		Description: `Patch advisory metadata on an already-listed model id. Does not create, rename, or reroute ids.
+
+id must already appear in list_models / GET /v1/models. Partial update: omitted keys leave stored overlay fields untouched. 0, false and empty arrays are rejected. Persist-before-publish to data_dir/model_info.json. Overlay wins per-field over alias, discovery and the cited catalog.`,
+		InputSchema: &InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"id":                {Type: "string", Description: "Listed model id, e.g. opencode/glm-4.5-air or glm-5.3"},
+				"context_length":    {Type: "number", Description: "Context window in tokens (also advertised as max_model_len)"},
+				"max_output_tokens": {Type: "number", Description: "Output cap in tokens"},
+				"input_modalities":  {Type: "array", Description: "Normalized input modalities: text, image, file, audio, video"},
+				"output_modalities": {Type: "array", Description: "Normalized output modalities"},
+			},
+			Required: []string{"id"},
+		},
+	},
+	{
+		Name:        "clear_model_info",
+		Description: `Drop the set_model_info overlay for a listed id so listing falls back to alias/discovery/catalog. The id stays listed and routable. Optional fields[] clears only those overlay keys.`,
+		InputSchema: &InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"id":     {Type: "string", Description: "Listed model id"},
+				"fields": {Type: "array", Description: "Optional overlay keys to clear (context_length, max_output_tokens, input_modalities, output_modalities)"},
+			},
+			Required: []string{"id"},
+		},
+	},
 }
 
 func (s *Server) handleListTools() any {
@@ -374,6 +403,10 @@ func (s *Server) handleCallTool(ctx context.Context, rawParams json.RawMessage) 
 		return s.toolListProviders(ctx)
 	case "refresh_models":
 		return s.toolRefreshModels(ctx, params.Arguments)
+	case "set_model_info":
+		return s.toolSetModelInfo(ctx, params.Arguments)
+	case "clear_model_info":
+		return s.toolClearModelInfo(ctx, params.Arguments)
 	default:
 		return nil, &JSONRPCError{
 			Code:    CodeMethodNotFound,
@@ -492,6 +525,22 @@ func (s *Server) resolveListedMeta(listedID, lane, upstream string, alias ModelA
 			}
 			if len(meta.outputModalities) == 0 {
 				meta.outputModalities = entry.OutputModalities
+			}
+		}
+	}
+	if store, ok := s.aliases.(ModelInfoStore); ok && store != nil {
+		if overlay, ok := store.ModelInfoEntry(listedID); ok {
+			if overlay.ContextLength > 0 {
+				meta.contextLength = overlay.ContextLength
+			}
+			if overlay.MaxOutput > 0 {
+				meta.maxOutput = overlay.MaxOutput
+			}
+			if len(overlay.InputModalities) > 0 {
+				meta.inputModalities = overlay.InputModalities
+			}
+			if len(overlay.OutputModalities) > 0 {
+				meta.outputModalities = overlay.OutputModalities
 			}
 		}
 	}
@@ -1295,4 +1344,109 @@ func (s *Server) toolRefreshModels(ctx context.Context, argsRaw json.RawMessage)
 	return &CallToolResult{
 		Content: []ToolContent{{Type: "text", Text: sb.String()}},
 	}, nil
+}
+
+func (s *Server) toolSetModelInfo(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {
+	store, ok := s.aliases.(ModelInfoStore)
+	if !ok || store == nil {
+		return toolError("model info overlay not configured"), nil
+	}
+	var args struct {
+		ID               string   `json:"id"`
+		ContextLength    int      `json:"context_length"`
+		MaxOutputTokens  int      `json:"max_output_tokens"`
+		InputModalities  []string `json:"input_modalities"`
+		OutputModalities []string `json:"output_modalities"`
+	}
+	if err := json.Unmarshal(argsRaw, &args); err != nil {
+		return toolError("%v", err), nil
+	}
+	if args.ID == "" {
+		return toolError("id is required"), nil
+	}
+	listed := false
+	for _, id := range store.ListedIDs() {
+		if id == args.ID {
+			listed = true
+			break
+		}
+	}
+	if !listed {
+		return toolError("%q is not a listed model id", args.ID), nil
+	}
+	if args.ContextLength < 0 || args.MaxOutputTokens < 0 {
+		return toolError("context_length and max_output_tokens must be positive"), nil
+	}
+	if args.ContextLength == 0 && rawHasZero(argsRaw, "context_length") {
+		return toolError("context_length 0 is rejected; use clear_model_info"), nil
+	}
+	if args.MaxOutputTokens == 0 && rawHasZero(argsRaw, "max_output_tokens") {
+		return toolError("max_output_tokens 0 is rejected; use clear_model_info"), nil
+	}
+	if args.ContextLength == 0 && args.MaxOutputTokens == 0 && len(args.InputModalities) == 0 && len(args.OutputModalities) == 0 {
+		return toolError("overlay patch carries no window, output cap or modality"), nil
+	}
+	if args.InputModalities != nil && len(args.InputModalities) == 0 {
+		return toolError("input_modalities must not be empty"), nil
+	}
+	if args.OutputModalities != nil && len(args.OutputModalities) == 0 {
+		return toolError("output_modalities must not be empty"), nil
+	}
+	if err := modelmeta.ValidateModalities(args.InputModalities); err != nil {
+		return toolError("%v", err), nil
+	}
+	if err := modelmeta.ValidateModalities(args.OutputModalities); err != nil {
+		return toolError("%v", err), nil
+	}
+	patch := ModelMeta{
+		ID:               args.ID,
+		ContextLength:    args.ContextLength,
+		MaxOutput:        args.MaxOutputTokens,
+		InputModalities:  modelmeta.NormalizeModalities(args.InputModalities),
+		OutputModalities: modelmeta.NormalizeModalities(args.OutputModalities),
+		Source:           "mcp:set_model_info",
+	}
+	if err := store.MergeModelInfo(args.ID, patch); err != nil {
+		return toolError("%v", err), nil
+	}
+	b, _ := json.MarshalIndent(map[string]any{"ok": true, "id": args.ID}, "", "  ")
+	return &CallToolResult{Content: []ToolContent{{Type: "text", Text: string(b)}}}, nil
+}
+
+func rawHasZero(raw json.RawMessage, key string) bool {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil {
+		return false
+	}
+	v, ok := m[key]
+	if !ok {
+		return false
+	}
+	var n float64
+	if json.Unmarshal(v, &n) != nil {
+		return false
+	}
+	return n == 0
+}
+
+func (s *Server) toolClearModelInfo(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {
+	store, ok := s.aliases.(ModelInfoStore)
+	if !ok || store == nil {
+		return toolError("model info overlay not configured"), nil
+	}
+	var args struct {
+		ID     string   `json:"id"`
+		Fields []string `json:"fields"`
+	}
+	if err := json.Unmarshal(argsRaw, &args); err != nil {
+		return toolError("%v", err), nil
+	}
+	if args.ID == "" {
+		return toolError("id is required"), nil
+	}
+	if err := store.ClearModelInfo(args.ID, args.Fields); err != nil {
+		return toolError("%v", err), nil
+	}
+	b, _ := json.MarshalIndent(map[string]any{"ok": true, "id": args.ID}, "", "  ")
+	return &CallToolResult{Content: []ToolContent{{Type: "text", Text: string(b)}}}, nil
 }

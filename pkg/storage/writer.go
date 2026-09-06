@@ -162,6 +162,17 @@ func (w *Writer) DB() *sql.DB {
 	return w.db
 }
 
+// Ready reports whether the writer can still accept telemetry. A closed or
+// nil writer is not ready.
+func (w *Writer) Ready() bool {
+	if w == nil {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return !w.closed && w.db != nil
+}
+
 // enqueue admits one record without blocking. The whole admission - the closed
 // check and the channel send - happens under mu, and Close closes the queue
 // under the same mutex, so the two can never interleave into a send on a closed

@@ -256,6 +256,79 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func (s *Server) listedModelIDs() map[string]bool {
+	ids := map[string]bool{}
+	if s == nil {
+		return ids
+	}
+	for _, id := range collectListedIDs(s) {
+		ids[id] = true
+	}
+	return ids
+}
+
+func collectListedIDs(s *Server) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(id string) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	var snap *state.RuntimeSnapshot
+	if s.sm != nil {
+		snap = s.sm.Snapshot()
+	}
+	if snap != nil && snap.Models != nil {
+		for _, m := range snap.Models {
+			if m.Enabled {
+				add(m.ID)
+			}
+		}
+	}
+	if s.catalog != nil {
+		for _, alias := range s.catalog.Sorted() {
+			if snap != nil && snap.Models != nil {
+				if mr, ok := snap.Models[alias]; ok && !mr.Enabled {
+					continue
+				}
+			}
+			add(alias)
+		}
+	}
+	if s.registry != nil {
+		hideTest := hideTestLanes()
+		for _, name := range s.registry.Names() {
+			if hideTest && isTestLane(name) {
+				continue
+			}
+			bundle, ok := s.registry.Get(name)
+			if !ok || bundle.Inference == nil {
+				continue
+			}
+			if cacher, ok := bundle.Inference.(modelsCacheProvider); ok {
+				if meta, ok := bundle.Inference.(provider.ModelInfoCache); ok {
+					for _, m := range meta.CachedModelInfo() {
+						add(name + "/" + m.ID)
+					}
+				} else {
+					for _, m := range cacher.CachedModels() {
+						add(name + "/" + m)
+					}
+				}
+			}
+			if def, ok := bundle.Inference.(defaultModelProvider); ok {
+				if m := def.DefaultModel(); m != "" {
+					add(name + "/" + m)
+				}
+			}
+		}
+	}
+	return out
+}
+
 // ModelEntry is one row of GET /v1/models. OpenAI specifies only
 // id/object/created/owned_by; every extra field below is an ultiproxy
 // addition and is omitted when unknown - never 0, false or an empty array.
@@ -378,7 +451,28 @@ func (s *Server) resolveModelMeta(listedID, lane, upstream string, alias ModelAl
 			meta.outputModalities = entry.OutputModalities
 		}
 	}
+	if overlay, ok := s.overlayModelEntry(listedID); ok {
+		if overlay.ContextLength > 0 {
+			meta.contextLength = overlay.ContextLength
+		}
+		if overlay.MaxOutput > 0 {
+			meta.maxOutput = overlay.MaxOutput
+		}
+		if len(overlay.InputModalities) > 0 {
+			meta.inputModalities = overlay.InputModalities
+		}
+		if len(overlay.OutputModalities) > 0 {
+			meta.outputModalities = overlay.OutputModalities
+		}
+	}
 	return meta
+}
+
+func (s *Server) overlayModelEntry(listedID string) (modelmeta.Entry, bool) {
+	if s == nil || s.catalog == nil {
+		return modelmeta.Entry{}, false
+	}
+	return s.catalog.InfoEntry(listedID)
 }
 
 // staticModelEntry looks the cited catalog up for one listed id. See
@@ -424,6 +518,7 @@ func aliasUpstream(catalog *ModelCatalog, alias string) string {
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, `{"error":{"message":"failed to read request body"}}`, http.StatusBadRequest)
@@ -448,6 +543,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, `{"error":{"message":"failed to read request body"}}`, http.StatusBadRequest)
@@ -979,6 +1075,9 @@ func classifyUpstreamError(err error, fallbackMsg string) (statusCode int, errTy
 	}
 	if err != nil {
 		errMsg = err.Error()
+		if code, ok := httpStatusFromError(err); ok {
+			return classifyHTTPStatus(code, errMsg)
+		}
 		msgLower := strings.ToLower(errMsg)
 		if strings.Contains(msgLower, "status 429") || strings.Contains(msgLower, "http 429") || strings.Contains(msgLower, "429 too many") || strings.Contains(msgLower, "resource_exhausted") || strings.Contains(msgLower, "quota_exceeded") || strings.Contains(msgLower, "daily token limit") || strings.Contains(msgLower, "rate limit") {
 			return http.StatusTooManyRequests, "rate_limit_exceeded", errMsg
@@ -988,10 +1087,56 @@ func classifyUpstreamError(err error, fallbackMsg string) (statusCode int, errTy
 			return http.StatusForbidden, "permission_denied", errMsg
 		} else if strings.Contains(msgLower, "status 404") || strings.Contains(msgLower, "http 404") || strings.Contains(msgLower, "not found") {
 			return http.StatusNotFound, "not_found", errMsg
+		} else if strings.Contains(msgLower, "status 400") || strings.Contains(msgLower, "http 400") || strings.Contains(msgLower, "status 422") || strings.Contains(msgLower, "http 422") {
+			return http.StatusBadRequest, "bad_request", errMsg
 		}
 	}
 	return statusCode, errType, errMsg
 }
+
+// HTTPStatusError is an optional interface a lane error can implement so
+// classifyUpstreamError can read a real status instead of sniffing the message.
+type HTTPStatusError interface {
+	HTTPStatus() int
+}
+
+func httpStatusFromError(err error) (int, bool) {
+	var hs HTTPStatusError
+	if errors.As(err, &hs) {
+		if code := hs.HTTPStatus(); code > 0 {
+			return code, true
+		}
+	}
+	return 0, false
+}
+
+func classifyHTTPStatus(code int, errMsg string) (int, string, string) {
+	switch code {
+	case http.StatusTooManyRequests:
+		return http.StatusTooManyRequests, "rate_limit_exceeded", errMsg
+	case http.StatusUnauthorized:
+		return http.StatusUnauthorized, "authentication_error", errMsg
+	case http.StatusForbidden:
+		return http.StatusForbidden, "permission_denied", errMsg
+	case http.StatusNotFound:
+		return http.StatusNotFound, "not_found", errMsg
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		return http.StatusBadRequest, "bad_request", errMsg
+	default:
+		if code >= 400 && code < 500 {
+			return http.StatusBadRequest, "bad_request", errMsg
+		}
+		return http.StatusBadGateway, "bad_gateway", errMsg
+	}
+}
+
+type statusError struct {
+	code int
+	msg  string
+}
+
+func (e statusError) Error() string   { return e.msg }
+func (e statusError) HTTPStatus() int { return e.code }
 
 // errorClassFromError returns the machine-readable error class of a failed
 // dispatch (see classifyUpstreamError).

@@ -363,3 +363,66 @@ func TestDecodeMessagesRequest_CacheControlOnEveryBlockType(t *testing.T) {
 		t.Fatalf("block kinds = %v, want %v", kinds, want)
 	}
 }
+
+func extraBodyKeys(opts []provider.Option) map[string]bool {
+	cfg := provider.NewRequestConfig(opts...)
+	out := map[string]bool{}
+	for k := range cfg.ExtraBody {
+		out[k] = true
+	}
+	return out
+}
+
+func TestDecodeMessagesRequest_DropsAnthropicOnlyExtraFields(t *testing.T) {
+	raw := `{
+		"model": "glm-5.3",
+		"messages": [{"role": "user", "content": "hi"}],
+		"max_tokens": 16,
+		"metadata": {"user_id": "x"},
+		"output_config": {"effort": "max"},
+		"context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+		"thinking": {"type": "enabled", "budget_tokens": 128}
+	}`
+	decoded, err := DecodeMessagesRequest([]byte(raw))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	keys := extraBodyKeys(decoded.Options)
+	for _, banned := range []string{"metadata", "output_config", "context_management"} {
+		if keys[banned] {
+			t.Errorf("ExtraBody still has Anthropic-only key %q: %v", banned, keys)
+		}
+	}
+	if !keys["thinking"] {
+		t.Errorf("thinking was dropped; ExtraBody keys = %v", keys)
+	}
+}
+
+func TestAnthropicStreamEncoder_SecondStopIsNoOp(t *testing.T) {
+	var buf bytes.Buffer
+	enc := NewAnthropicStreamEncoder(&buf, "claude-sonnet-4-6")
+	events := []ir.Event{
+		ir.EventMessageStart{},
+		ir.EventTextDelta{Index: 0, Text: "ok"},
+		ir.EventMessageStop{FinishReason: "end_turn"},
+		ir.EventMessageStop{FinishReason: "stop"},
+	}
+	for _, ev := range events {
+		if err := enc.EncodeEvent(ev); err != nil {
+			t.Fatalf("encode %+v: %v", ev, err)
+		}
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "event: message_stop"); n != 1 {
+		t.Fatalf("message_stop count = %d, want 1\n%s", n, out)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if n := strings.Count(buf.String(), "event: message_stop"); n != 1 {
+		t.Fatalf("second Close emitted extra terminals: %s", buf.String())
+	}
+}

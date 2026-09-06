@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -72,6 +73,7 @@ type Server struct {
 	// requestIDSeq allocates the request ids that tie the request, attempt and
 	// usage telemetry rows of one dispatch together. See nextRequestID.
 	requestIDSeq atomic.Int64
+	startedAt    time.Time
 }
 
 // nextRequestID returns a unique positive request id.
@@ -155,6 +157,7 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		modelRefreshInterval: -1,
 		// Same convention for the credential refresher.
 		credentialRefreshInterval: -1,
+		startedAt:                 time.Now().UTC(),
 	}
 	s.requestIDSeq.Store(time.Now().UnixNano())
 
@@ -263,6 +266,7 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("GET /v1/models", s.handleModels)
 	// Health check
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
 	// LLMs.txt
 	s.mux.HandleFunc("GET /llms.txt", s.handleLLMsTxt)
 
@@ -286,8 +290,11 @@ func (s *Server) Handler() http.Handler {
 // Start begins listening on configured address.
 func (s *Server) Start() error {
 	s.httpServer = &http.Server{
-		Addr:    s.cfg.Server.Addr,
-		Handler: s.Handler(),
+		Addr:              s.cfg.Server.Addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	return s.httpServer.ListenAndServe()
 }
@@ -362,9 +369,28 @@ func (s *storageUsageSource) GetClientUsage(ctx context.Context, clientID, windo
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	uptime := 0
+	if !s.startedAt.IsZero() {
+		uptime = int(time.Since(s.startedAt).Seconds())
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":         "ok",
+		"version":        "0.1.0",
+		"uptime_seconds": uptime,
+	})
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.writer != nil && !s.writer.Ready() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "not_ready", "reason": "storage unavailable"})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ready"})
 }
 
 // handleLLMsTxt serves the agent-facing documentation. An llms.txt found at

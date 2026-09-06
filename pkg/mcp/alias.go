@@ -52,3 +52,12 @@ type ModelMetaSource interface {
 	// bare upstream id, in that order.
 	ModelMetaEntry(listedID, lane, upstream string) (ModelMeta, bool)
 }
+
+// ModelInfoStore is the MCP set_model_info overlay. The http server's catalog
+// bridge implements it so listing and the MCP tools share one persist-before-publish map.
+type ModelInfoStore interface {
+	ModelInfoEntry(listedID string) (ModelMeta, bool)
+	MergeModelInfo(id string, patch ModelMeta) error
+	ClearModelInfo(id string, fields []string) error
+	ListedIDs() []string
+}

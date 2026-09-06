@@ -103,6 +103,7 @@ func (s *Server) HandleSSE(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeJSONRPCError(w, nil, CodeParseError, "failed to read request body")

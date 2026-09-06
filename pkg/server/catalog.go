@@ -64,6 +64,9 @@ type ModelCatalog struct {
 	// data_dir/windows.json overlay). Immutable after construction, so reads
 	// need no lock.
 	meta *modelmeta.Catalog
+	// info is the MCP set_model_info overlay, keyed by listed id. Highest
+	// operator layer: wins per-field over alias, discovery, and the cited catalog.
+	info *modelmeta.InfoOverlay
 }
 
 // NewModelCatalog builds a catalog from config models, then overlays any
@@ -92,6 +95,16 @@ func NewModelCatalog(configModels map[string]ModelAlias, persistPath string) (*M
 	default:
 		c.meta = meta
 	}
+	infoPath := ""
+	if dir := filepath.Dir(persistPath); dir != "" && dir != "." {
+		infoPath = filepath.Join(dir, modelmeta.InfoFileName)
+	}
+	info, infoErr := modelmeta.NewInfoOverlay(infoPath)
+	if infoErr != nil {
+		log.Printf("[server] model info overlay ignored: %v", infoErr)
+		info, _ = modelmeta.NewInfoOverlay("")
+	}
+	c.info = info
 	if persistPath == "" {
 		return c, nil
 	}
@@ -271,9 +284,56 @@ func (c *ModelCatalog) MetaEntry(listedID, lane, upstream string) (modelmeta.Ent
 	return c.meta.Lookup(listedID, lane+"/"+upstream, upstream)
 }
 
+// InfoEntry returns the MCP overlay for a listed id, if any.
+func (c *ModelCatalog) InfoEntry(listedID string) (modelmeta.Entry, bool) {
+	if c == nil || c.info == nil {
+		return modelmeta.Entry{}, false
+	}
+	return c.info.Get(listedID)
+}
+
+// MergeModelInfo persist-before-publishes a partial overlay for a listed id.
+func (c *ModelCatalog) MergeModelInfo(id string, patch modelmeta.Entry) error {
+	if c == nil || c.info == nil {
+		return errors.New("model info overlay not configured")
+	}
+	return c.info.Merge(id, patch)
+}
+
+// ClearModelInfo drops overlay keys for a listed id.
+func (c *ModelCatalog) ClearModelInfo(id string, fields []string) error {
+	if c == nil || c.info == nil {
+		return errors.New("model info overlay not configured")
+	}
+	return c.info.Clear(id, fields)
+}
+
 // ModelMetaEntry adapts ModelCatalog.MetaEntry to the MCP surface
 // (mcp.ModelMetaSource), so list_models applies the same precedence chain as
 // GET /v1/models.
 func (b *catalogBridge) ModelMetaEntry(listedID, lane, upstream string) (mcp.ModelMeta, bool) {
 	return b.catalog.MetaEntry(listedID, lane, upstream)
+}
+
+func (b *catalogBridge) ModelInfoEntry(listedID string) (mcp.ModelMeta, bool) {
+	return b.catalog.InfoEntry(listedID)
+}
+
+func (b *catalogBridge) MergeModelInfo(id string, patch mcp.ModelMeta) error {
+	return b.catalog.MergeModelInfo(id, patch)
+}
+
+func (b *catalogBridge) ClearModelInfo(id string, fields []string) error {
+	return b.catalog.ClearModelInfo(id, fields)
+}
+
+func (b *catalogBridge) ListedIDs() []string {
+	if b.server == nil {
+		return nil
+	}
+	ids := make([]string, 0)
+	for id := range b.server.listedModelIDs() {
+		ids = append(ids, id)
+	}
+	return ids
 }

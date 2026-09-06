@@ -106,12 +106,19 @@ func (s *Server) buildQuotaResponse(ctx context.Context) QuotaDashboardResponse 
 			status := "ok"
 			gaugePct := 0.0
 			detail := "Operational"
+			updated := now
 			var windows []DashboardWindow
 			var bars []DashboardBar
 
-			if prov.Quota != nil {
+			if prov.Quota == nil {
+				status = "unmetered"
+				detail = "no quota mechanism"
+			} else {
 				qSnap, err := prov.Quota.Quota(ctx)
 				if err == nil && qSnap != nil {
+					if !qSnap.ObservedAt.IsZero() {
+						updated = qSnap.ObservedAt.UTC()
+					}
 					for _, w := range qSnap.Windows {
 						resetStr := ""
 						if !w.ResetAt.IsZero() {
@@ -149,6 +156,11 @@ func (s *Server) buildQuotaResponse(ctx context.Context) QuotaDashboardResponse 
 					}
 				} else {
 					status = "error"
+					if err != nil {
+						detail = err.Error()
+					} else {
+						detail = "quota query returned no snapshot"
+					}
 				}
 			}
 
@@ -181,13 +193,28 @@ func (s *Server) buildQuotaResponse(ctx context.Context) QuotaDashboardResponse 
 				GaugePct: gaugePct,
 				Windows:  windows,
 				Bars:     bars,
-				Updated:  now.Format(time.RFC3339),
+				Updated:  updated.Format(time.RFC3339),
 				Detail:   detail,
 				Extra:    make(map[string]any),
 			})
 		}
 	}
 
+	age := 0
+	stale := false
+	if len(summaries) > 0 {
+		oldest := now
+		for _, p := range summaries {
+			if t, err := time.Parse(time.RFC3339, p.Updated); err == nil && t.Before(oldest) {
+				oldest = t
+			}
+		}
+		age = int(now.Sub(oldest).Seconds())
+		if age < 0 {
+			age = 0
+		}
+		stale = age > 300
+	}
 	return QuotaDashboardResponse{
 		Providers: summaries,
 		Summary: DashboardSummary{
@@ -197,8 +224,8 @@ func (s *Server) buildQuotaResponse(ctx context.Context) QuotaDashboardResponse 
 			NextReset:          earliestReset,
 			FetchedAt:          now.Format("15:04:05"),
 			FetchedAtEpoch:     now.Unix(),
-			Stale:              false,
-			AgeSeconds:         0,
+			Stale:              stale,
+			AgeSeconds:         age,
 			Refreshing:         false,
 			RefreshMinInterval: 30,
 		},

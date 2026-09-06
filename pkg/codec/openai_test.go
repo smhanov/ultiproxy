@@ -303,3 +303,56 @@ func TestDecodeServerInputFixture(t *testing.T) {
 		t.Errorf("expected ToolsRequested=false")
 	}
 }
+
+func TestDecodeChatCompletionRequest_DropsAnthropicOnlyExtraFields(t *testing.T) {
+	raw := `{
+		"model": "glm-5.3",
+		"messages": [{"role": "user", "content": "hi"}],
+		"metadata": {"user_id": "x"},
+		"output_config": {"effort": "max"},
+		"context_management": {"edits": []},
+		"reasoning_effort": "high"
+	}`
+	decoded, err := DecodeChatCompletionRequest([]byte(raw))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	cfg := provider.NewRequestConfig(decoded.Options...)
+	for _, banned := range []string{"metadata", "output_config", "context_management"} {
+		if _, ok := cfg.ExtraBody[banned]; ok {
+			t.Errorf("ExtraBody still has %q: %+v", banned, cfg.ExtraBody)
+		}
+	}
+	if cfg.ReasoningEffort != "high" {
+		t.Errorf("reasoning_effort = %q, want high", cfg.ReasoningEffort)
+	}
+}
+
+func TestOpenAIStreamEncoder_SecondStopAndCloseAreNoOp(t *testing.T) {
+	var buf bytes.Buffer
+	enc := NewOpenAIStreamEncoder(&buf, "glm-5.3", false)
+	_ = enc.EncodeEvent(ir.EventMessageStart{})
+	_ = enc.EncodeEvent(ir.EventTextDelta{Index: 0, Text: "ok"})
+	_ = enc.EncodeEvent(ir.EventMessageStop{FinishReason: "length"})
+	_ = enc.EncodeEvent(ir.EventMessageStop{FinishReason: "stop"})
+	if err := enc.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	out := buf.String()
+	if n := strings.Count(out, `"finish_reason":"length"`); n != 1 {
+		t.Fatalf("length finish_reason count = %d, want 1\n%s", n, out)
+	}
+	if strings.Contains(out, `"finish_reason":"stop"`) {
+		t.Fatalf("second stop reason leaked:\n%s", out)
+	}
+	if n := strings.Count(out, "data: [DONE]"); n != 1 {
+		t.Fatalf("[DONE] count = %d, want 1\n%s", n, out)
+	}
+	before := buf.Len()
+	if err := enc.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if buf.Len() != before {
+		t.Fatalf("second Close emitted extra bytes")
+	}
+}
