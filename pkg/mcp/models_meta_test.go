@@ -172,25 +172,21 @@ func TestListModels_StaticCatalogAndAliasPrecedence(t *testing.T) {
 	srv := NewServer(registry, newStubStateSource(), WithAliasManager(am))
 	payload := callTool(t, srv, 1, "list_models", `{}`)
 
-	alias := listedEntry(t, payload, "glm-5.3")
-	if alias["context_length"] != float64(1000000) {
-		t.Errorf("alias context_length = %v, want 1000000 from the catalog", alias["context_length"])
+	// T041: the alias glm-5.3 maps to the lane's model, so it lists under the
+	// canonical zai/glm-5.3 (the same row discovery would produce). The alias's
+	// text-only modality wins over the catalog's image claim, and the cited
+	// catalog still fills the window.
+	row := listedEntry(t, payload, "zai/glm-5.3")
+	if row["context_length"] != float64(1000000) {
+		t.Errorf("context_length = %v, want 1000000 from the catalog", row["context_length"])
 	}
-	if arch, _ := alias["architecture"].(map[string]any); arch != nil {
+	if arch, _ := row["architecture"].(map[string]any); arch != nil {
 		if in, _ := arch["input_modalities"].([]any); len(in) != 1 || in[0] != "text" {
-			t.Errorf("alias input_modalities = %v, want [text] (alias wins)", arch["input_modalities"])
+			t.Errorf("input_modalities = %v, want [text] (alias wins)", arch["input_modalities"])
 		}
 	}
-	if _, ok := alias["supports_vision"]; ok {
-		t.Errorf("supports_vision emitted despite a text-only alias: %v", alias["supports_vision"])
-	}
-
-	discovered := listedEntry(t, payload, "zai/glm-5.3")
-	if discovered["context_length"] != float64(1000000) {
-		t.Errorf("discovered context_length = %v, want 1000000 from the catalog", discovered["context_length"])
-	}
-	if discovered["supports_vision"] != true {
-		t.Errorf("discovered supports_vision = %v, want true (catalog claims image)", discovered["supports_vision"])
+	if _, ok := row["supports_vision"]; ok {
+		t.Errorf("supports_vision emitted despite a text-only alias: %v", row["supports_vision"])
 	}
 }
 

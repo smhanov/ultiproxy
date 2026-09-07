@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -21,7 +22,14 @@ func (s *stubAliasManager) List() map[string]ModelAlias {
 	}
 	return out
 }
-func (s *stubAliasManager) Sorted() []string { return []string{"a"} }
+func (s *stubAliasManager) Sorted() []string {
+	names := make([]string, 0, len(s.aliases))
+	for k := range s.aliases {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
+}
 func (s *stubAliasManager) Set(alias string, e ModelAlias) error {
 	if s.aliases == nil {
 		s.aliases = map[string]ModelAlias{}

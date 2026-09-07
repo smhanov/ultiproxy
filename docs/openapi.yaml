@@ -375,7 +375,7 @@ components:
       properties:
         model:
           type: string
-          description: Model identifier (e.g. gpt-4o, claude-3-5-sonnet, deepseek-r1, copilot/gpt-4o)
+          description: Canonical model identifier with provider prefix (e.g. copilot/gpt-4o, anthropic/claude-3-5-sonnet, deepseek/deepseek-r1) or a user-configured alias
         messages:
           type: array
           items:

@@ -600,12 +600,24 @@ func isTestLane(name string) bool {
 	return false
 }
 
+// canonicalAliasID is the mcp-local mirror of server.canonicalAliasID: the
+// canonical <lane>/<model> id a catalog alias resolves to. The mcp package
+// cannot import server, so the two are kept in lockstep by the cross-surface
+// parity tests (pkg/server TestHandleModels_MatchesListModelsTool).
+func canonicalAliasID(entry ModelAlias) string {
+	if entry.Provider == "" || entry.Upstream == "" {
+		return ""
+	}
+	return entry.Provider + "/" + entry.Upstream
+}
+
 // listedModels builds the id -> entry map list_models returns, mirroring the
-// GET /v1/models filtering: aliases plus "<lane>/<model>" ids (discovered or
-// lane default), never a bare lane name, and never a test lane when
-// ULTIPROXY_HIDE_TEST_LANES is set. One deliberate difference: ids disabled at
-// runtime (toggle_model) stay listed with "enabled": false so an agent can see
-// them and switch them back on; /v1/models omits them entirely.
+// GET /v1/models id set: canonical "<lane>/<model>" ids (user aliases listed
+// under their canonical target, plus discovered/lane-default ids), never a
+// bare lane name and never a test lane when ULTIPROXY_HIDE_TEST_LANES is set.
+// One deliberate difference: ids disabled at runtime (toggle_model) stay
+// listed with "enabled": false so an agent can see them and switch them back
+// on; /v1/models omits them entirely.
 func (s *Server) listedModels() map[string]listedModel {
 	out := make(map[string]listedModel)
 	set := func(id string, e listedModel) {
@@ -623,9 +635,72 @@ func (s *Server) listedModels() map[string]listedModel {
 	if s.stateSource != nil {
 		snap = s.stateSource.Snapshot()
 	}
+	// disabled mirrors server.modelIsDisabled: a model is disabled when any
+	// of its related state rows (the id as given, and for a user alias its
+	// bare name and canonical form) is disabled.
+	disabled := func(model string) bool {
+		if snap == nil || snap.Models == nil {
+			return false
+		}
+		if mr, ok := snap.Models[model]; ok && !mr.Enabled {
+			return true
+		}
+		if s.aliases == nil {
+			return false
+		}
+		entries := s.aliases.List()
+		if entry, ok := entries[model]; ok {
+			if c := canonicalAliasID(entry); c != "" {
+				if mr, ok := snap.Models[c]; ok && !mr.Enabled {
+					return true
+				}
+			}
+			return false
+		}
+		for name, e := range entries {
+			if canonicalAliasID(e) == model {
+				if mr, ok := snap.Models[name]; ok && !mr.Enabled {
+					return true
+				}
+			}
+		}
+		return false
+	}
 
-	// 1. State snapshot model map (aliases synced from the catalog, plus any
-	//    runtime toggle_model entries), Enabled reported as-is.
+	// 1. Alias catalog as canonical <lane>/<model> ids. The bare alias name is
+	//    a request-path name, not a listed model id, so each alias is listed
+	//    under its canonical target. toggle_model(false) on the alias (by
+	//    either name) marks the canonical row disabled here.
+	if s.aliases != nil {
+		entries := s.aliases.List()
+		for _, alias := range s.aliases.Sorted() {
+			entry, ok := entries[alias]
+			if !ok {
+				continue
+			}
+			id := canonicalAliasID(entry)
+			if id == "" {
+				continue
+			}
+			disc, discOK := s.discoveredModelInfo(entry.Provider, entry.Upstream)
+			row := listedModel{
+				Provider:        entry.Provider,
+				Enabled:         !disabled(alias),
+				PricingTag:      entry.PricingTag,
+				BenchmarkScores: entry.BenchmarkScores,
+				Source:          "alias",
+			}
+			applyListedMeta(&row, s.resolveListedMeta(id, entry.Provider, entry.Upstream, entry, disc, discOK))
+			set(id, row)
+		}
+	}
+
+	// 2. State snapshot rows the alias catalog does not own: runtime
+	//    toggle_model entries and any other model rows, listed by key. A bare
+	//    alias name is listed by step 1 under its canonical target, so it is
+	//    skipped here. Enabled is reported as-is (a flag on any related name
+	//    is honored via disabled), so a disable toggled by a bare alias name
+	//    still lands here as "enabled": false.
 	if snap != nil && snap.Models != nil {
 		keys := make([]string, 0, len(snap.Models))
 		for k := range snap.Models {
@@ -634,59 +709,21 @@ func (s *Server) listedModels() map[string]listedModel {
 		sort.Strings(keys)
 		for _, k := range keys {
 			m := snap.Models[k]
-			upstream := ""
 			if s.aliases != nil {
-				if entries := s.aliases.List(); entries != nil {
-					if e, ok := entries[m.ID]; ok {
-						upstream = e.Upstream
-					}
+				if _, ok := s.aliases.List()[k]; ok {
+					continue // step 1 lists the alias's canonical target
 				}
 			}
-			alias := ModelAlias{ContextLimit: m.ContextLimit, MaxOutput: m.MaxOutput}
-			if s.aliases != nil {
-				if entries := s.aliases.List(); entries != nil {
-					if e, ok := entries[m.ID]; ok {
-						alias = e
-					}
-				}
-			}
-			disc, discOK := s.discoveredModelInfo(m.Provider, upstream)
+			disc, discOK := s.discoveredModelInfo(m.Provider, "")
 			entry := listedModel{
 				Provider:        m.Provider,
-				Enabled:         m.Enabled,
+				Enabled:         m.Enabled && !disabled(k),
 				PricingTag:      m.PricingTag,
 				BenchmarkScores: m.BenchmarkScores,
 				Source:          "alias",
 			}
-			applyListedMeta(&entry, s.resolveListedMeta(m.ID, m.Provider, upstream, alias, disc, discOK))
-			set(m.ID, entry)
-		}
-	}
-
-	// 2. Alias catalog (covers servers built without a state source).
-	if s.aliases != nil {
-		entries := s.aliases.List()
-		for _, alias := range s.aliases.Sorted() {
-			entry, ok := entries[alias]
-			if !ok {
-				continue
-			}
-			enabled := true
-			if snap != nil && snap.Models != nil {
-				if mr, ok := snap.Models[alias]; ok {
-					enabled = mr.Enabled
-				}
-			}
-			disc, discOK := s.discoveredModelInfo(entry.Provider, entry.Upstream)
-			row := listedModel{
-				Provider:        entry.Provider,
-				Enabled:         enabled,
-				PricingTag:      entry.PricingTag,
-				BenchmarkScores: entry.BenchmarkScores,
-				Source:          "alias",
-			}
-			applyListedMeta(&row, s.resolveListedMeta(alias, entry.Provider, entry.Upstream, entry, disc, discOK))
-			set(alias, row)
+			applyListedMeta(&entry, s.resolveListedMeta(k, m.Provider, "", ModelAlias{ContextLimit: m.ContextLimit, MaxOutput: m.MaxOutput}, disc, discOK))
+			set(k, entry)
 		}
 	}
 

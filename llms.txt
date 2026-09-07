@@ -26,7 +26,7 @@ Complete OpenAPI 3.1 specification is available in `docs/openapi.yaml`.
 - **Auth**: `Authorization: Bearer <api-key>` (an `x-api-key: <api-key>` header is accepted on every route as well)
 - **Description**: Standard OpenAI chat completions endpoint supporting text, multi-turn dialogue, tool calls, image payloads, and streaming SSE.
 - **Supported Parameters**:
-  - `model` (string, required): Model ID (e.g., `gpt-4o`, `claude-3-5-sonnet`, `deepseek-r1`, `copilot/gpt-4o`)
+  - `model` (string, required): Canonical model ID with provider prefix (e.g., `copilot/gpt-4o`, `anthropic/claude-3-5-sonnet`, `deepseek/deepseek-r1`) or user-configured alias
   - `messages` (array, required): Conversation turns with `role` (`system`, `user`, `assistant`, `tool`), `content`, and optional `tool_calls`
   - `stream` (boolean): When true, streams Server-Sent Events (`data: {"choices": [{"delta": ...}]}`)
   - `tools` (array): List of OpenAI function definitions
@@ -36,10 +36,10 @@ Complete OpenAPI 3.1 specification is available in `docs/openapi.yaml`.
 - **Sample Request**:
 ```bash
 curl -s http://localhost:9050/v1/chat/completions \
-  -H "Authorization: Bearer sk-up-local-agent-key" \
+  -H "Authorization: Bearer ***" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o",
+    "model": "copilot/gpt-4o",
     "messages": [{"role": "user", "content": "Ping"}],
     "stream": false
   }'
@@ -47,10 +47,10 @@ curl -s http://localhost:9050/v1/chat/completions \
 
 ### 2. Anthropic Messages Protocol
 - **Route**: `POST /v1/messages`
-- **Auth**: `x-api-key: <api-key>` or `Authorization: Bearer <api-key>`
+- **Auth**: `x-api-key: ***` or `Authorization: Bearer ***`
 - **Description**: Direct Anthropic Messages API compatibility for Claude Code, Hermes, and Anthropic clients.
 - **Supported Parameters**:
-  - `model` (string, required): e.g. `claude-3-5-sonnet-20241022`, `anthropic/claude-3-5-sonnet`
+  - `model` (string, required): e.g. `anthropic/claude-3-5-sonnet-20241022`, `copilot/claude-3-5-sonnet`
   - `messages` (array, required): List of input message objects (`role`, `content`)
   - `max_tokens` (integer, required): Maximum tokens to generate
   - `system` (string | array): System prompt instructions
@@ -59,11 +59,11 @@ curl -s http://localhost:9050/v1/chat/completions \
 - **Sample Request**:
 ```bash
 curl -s http://localhost:9050/v1/messages \
-  -H "x-api-key: sk-up-local-agent-key" \
+  -H "x-api-key: ***" \
   -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-3-5-sonnet-20241022",
+    "model": "anthropic/claude-3-5-sonnet-20241022",
     "max_tokens": 1024,
     "messages": [{"role": "user", "content": "Explain zero-marginal-cost proxying."}]
   }'
@@ -72,7 +72,7 @@ curl -s http://localhost:9050/v1/messages \
 ### 3. Model Catalog
 - **Route**: `GET /v1/models`
 - **Auth**: `Authorization: Bearer <api-key>`
-- **Description**: Enumerates only ids a client can put in `"model"`: catalog aliases (config + MCP `set_model_alias`), one entry per discovered upstream model on OpenAI-compatible lanes (model discovery is ON by default; `model_list_passthrough:false` opts out; the `anthropic` lane discovers its own list from `GET /v1/models` with the `anthropic-version` header) exposed as `<lane>/<model>` -- the exact id routing accepts -- and one `<lane>/<default>` entry for lanes that have a real default model (e.g. `antigravity/gemini-3.7-flash-high`), which keeps non-discoverable lanes advertised. Bare lane names are NOT listed: a lane name is a routing prefix, not a model; `"model": "<lane>"` (no slash) still routes only as a legacy form. A lane with an empty discovery cache and no default model lists nothing. Test lanes (`probe`, `fake`, ...) are dropped when `ULTIPROXY_HIDE_TEST_LANES=1`. Discovery runs when a lane is registered, again at startup for lanes whose cache is still empty, and every 6h afterwards; listing itself is served from that cache and never fans out to the upstreams. Each row advertises the metadata a source actually reported: the context window under both names (`context_length` and `max_model_len` carry the same integer), the output cap (`max_output_tokens`), and modalities (`architecture.input_modalities` / `architecture.output_modalities`, plus `supports_vision: true` exactly when image is an input). Precedence, per field: operator alias (`context_limit`, `max_output`, `input_modalities` / `output_modalities`) > live discovery > cited static catalog (`pkg/modelmeta`, extended with `data_dir/windows.json` -- every catalog row cites the vendor doc URL it came from) > the key is omitted. Unknown is omitted, never `0`, `false` or `[]`, and the ambiguous legacy `max_tokens` is never emitted. Windows are read from every upstream dialect: `max_model_len`, `context_length`, `top_provider.context_length`, `meta.context_length`, `meta.n_ctx` (served, preferred over `meta.n_ctx_train`), `context_window`, and Anthropic `max_input_tokens`; output caps from `top_provider.max_completion_tokens`, `max_output_tokens`, `max_completion_tokens` and Anthropic `max_tokens`; modalities from `architecture.input_modalities` / `output_modalities`, top-level modality arrays, `architecture.modality` (`"text+image->text"`) or `supports_vision`, normalized to `text|image|file|audio|video` (`pdf` -> `file`). Nothing is inferred from a model name and no lane capability is copied onto a listed id. `context_length` is advisory metadata; `max_output_tokens` is enforced (the request's `max_tokens` is clamped to it).
+- **Description**: Enumerates only canonical `<lane>/<model>` ids a client can put in `"model"`: one entry per discovered upstream model on OpenAI-compatible lanes (model discovery is ON by default; `model_list_passthrough:false` opts out; the `anthropic` lane discovers its own list from `GET /v1/models` with the `anthropic-version` header) exposed as `<lane>/<model>` -- the exact id routing accepts -- and one `<lane>/<default>` entry for lanes that have a real default model (e.g. `antigravity/gemini-3.7-flash-high`), which keeps non-discoverable lanes advertised. Catalog aliases (config + MCP `set_model_alias`) are also listed under their canonical `<lane>/<model>` target. Bare alias names and bare lane names are NOT listed: a lane name is a routing prefix, not a model. The request path accepts canonical `<lane>/<model>` ids and user-configured aliases from `aliases.json` (an unknown bare id returns HTTP 404 `unknown_model`). A lane with an empty discovery cache and no default model lists nothing. Test lanes (`probe`, `fake`, ...) are dropped when `ULTIPROXY_HIDE_TEST_LANES=1`. Discovery runs when a lane is registered, again at startup for lanes whose cache is still empty, and every 6h afterwards; listing itself is served from that cache and never fans out to the upstreams. Each row advertises the metadata a source actually reported: the context window under both names (`context_length` and `max_model_len` carry the same integer), the output cap (`max_output_tokens`), and modalities (`architecture.input_modalities` / `architecture.output_modalities`, plus `supports_vision: true` exactly when image is an input). Precedence, per field: operator alias (`context_limit`, `max_output`, `input_modalities` / `output_modalities`) > live discovery > cited static catalog (`pkg/modelmeta`, extended with `data_dir/windows.json` -- every catalog row cites the vendor doc URL it came from) > the key is omitted. Unknown is omitted, never `0`, `false` or `[]`, and the ambiguous legacy `max_tokens` is never emitted. Windows are read from every upstream dialect: `max_model_len`, `context_length`, `top_provider.context_length`, `meta.context_length`, `meta.n_ctx` (served, preferred over `meta.n_ctx_train`), `context_window`, and Anthropic `max_input_tokens`; output caps from `top_provider.max_completion_tokens`, `max_output_tokens`, `max_completion_tokens` and Anthropic `max_tokens`; modalities from `architecture.input_modalities` / `output_modalities`, top-level modality arrays, `architecture.modality` (`"text+image->text"`) or `supports_vision`, normalized to `text|image|file|audio|video` (`pdf` -> `file`). Nothing is inferred from a model name and no lane capability is copied onto a listed id. `context_length` is advisory metadata; `max_output_tokens` is enforced (the request's `max_tokens` is clamped to it).
 - **Response Structure**:
 ```json
 {
@@ -263,10 +263,10 @@ Add Ultiproxy to `~/.config/opencode/opencode.json`:
       "baseURL": "http://localhost:9050/v1",
       "apiKey": "sk-up-local-agent-key",
       "models": [
-        "gpt-4o",
-        "claude-3-5-sonnet",
-        "deepseek-r1",
-        "copilot/claude-3-5-sonnet"
+        "copilot/gpt-4o",
+        "anthropic/claude-3-5-sonnet",
+        "deepseek/deepseek-r1",
+        "vllm/qwenpoint-3.8"
       ]
     }
   }
@@ -280,8 +280,8 @@ Configure Hermes custom provider in your agent's config YAML:
 llm:
   provider: "custom"
   base_url: "http://localhost:9050/v1"
-  api_key: "sk-up-local-agent-key"
-  model: "claude-3-5-sonnet"
+  api_key: "«redacted:sk-…»"
+  model: "anthropic/claude-3-5-sonnet"
   max_tokens: 8192
   temperature: 0.2
   extra_headers:
@@ -293,7 +293,7 @@ Point Claude Code to the Anthropic compatibility endpoint using environment vari
 
 ```bash
 export ANTHROPIC_BASE_URL="http://localhost:9050"
-export ANTHROPIC_AUTH_TOKEN="sk-up-local-agent-key"
+export ANTHROPIC_AUTH_TOKEN="«redacted:sk-…»"
 
 # Run Claude Code directly against pooled subscriptions
 claude
@@ -307,11 +307,11 @@ import OpenAI from "openai";
 
 const client = new OpenAI({
   baseURL: "http://localhost:9050/v1",
-  apiKey: "sk-up-local-agent-key",
+  apiKey: "«reda...…»",
 });
 
 const response = await client.chat.completions.create({
-  model: "gpt-4o",
+  model: "copilot/gpt-4o",
   messages: [{ role: "user", content: "Optimize this algorithm." }],
   stream: true,
 });
@@ -323,18 +323,18 @@ const response = await client.chat.completions.create({
 
 | Provider | Supported Subscription | Default Models |
 | :--- | :--- | :--- |
-| **GitHub Copilot** | Pro, Business, Enterprise | `gpt-4o`, `claude-3-5-sonnet`, `o1-preview` |
-| **Google Antigravity** | Gemini Advanced / Vertex | `gemini-1.5-pro`, `gemini-1.5-flash` |
-| **OpenAI Codex / Plus** | ChatGPT Plus, Team, Enterprise | `gpt-4o`, `o1-preview`, `o1-mini` |
-| **Anthropic** | Claude Pro, Console Team | `claude-3-5-sonnet`, `claude-3-opus`, `haiku` |
-| **xAI Grok** | X Premium+, xAI Console | `grok-2`, `grok-beta` |
-| **DeepSeek** | DeepSeek Balance / VIP | `deepseek-v3`, `deepseek-r1` |
-| **Z.ai Coding Plan** | Z.ai Subscription | `glm-4`, `deepseek-coder` |
-| **Augure AI** | Augure Pro | `augure-code-v1` |
+| **GitHub Copilot** | Pro, Business, Enterprise | `copilot/gpt-4o`, `copilot/claude-3-5-sonnet`, `copilot/o1-preview` |
+| **Google Antigravity** | Gemini Advanced / Vertex | `antigravity/gemini-1.5-pro`, `antigravity/gemini-1.5-flash` |
+| **OpenAI Codex / Plus** | ChatGPT Plus, Team, Enterprise | `codex/gpt-4o`, `codex/o1-preview`, `codex/o1-mini` |
+| **Anthropic** | Claude Pro, Console Team | `anthropic/claude-3-5-sonnet`, `anthropic/claude-3-opus`, `anthropic/haiku` |
+| **xAI Grok** | X Premium+, xAI Console | `xai/grok-2`, `xai/grok-beta` |
+| **DeepSeek** | DeepSeek Balance / VIP | `deepseek/deepseek-v3`, `deepseek/deepseek-r1` |
+| **Z.ai Coding Plan** | Z.ai Subscription | `zai/glm-4`, `zai/deepseek-coder` |
+| **Augure AI** | Augure Pro | `augure/augure-code-v1` |
 | **OpenRouter** | OpenRouter Tier credits | Fallback gateway across 200+ models |
 | **Freebuff** | Freebuff Account | Mirror inference endpoints |
 | **OpenCode Go** | OpenCode Subscription | Coding optimized pipeline |
-| **Local vLLM** | None (Local GPU / CPU inference) | `llama-3.1-70b`, `qwen-2.5-coder` |
+| **Local vLLM** | None (Local GPU / CPU inference) | `vllm/llama-3.1-70b`, `vllm/qwen-2.5-coder` |
 
 ---
 

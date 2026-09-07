@@ -254,14 +254,20 @@ func TestHandleModels_CatalogAndAliasPrecedence(t *testing.T) {
 
 	raw := getModelsRaw(t, srv)
 
-	alias := rawByID(t, raw, "glm-5.3")
-	wantInt(t, alias, "context_length", 1000000)
-	wantInt(t, alias, "max_model_len", 1000000)
-	wantStrings(t, alias, "input_modalities", []string{"text"})
-	wantAbsent(t, alias, "supports_vision")
-
-	discovered := rawByID(t, raw, "zai/glm-5.3")
-	wantInt(t, discovered, "context_length", 1000000)
+	// T041: the user alias glm-5.3 maps to the lane's discovered model, so it
+	// collapses into the single canonical row zai/glm-5.3. That row carries
+	// the alias's modality (text, which wins over the catalog's image claim)
+	// and the cited-catalog window.
+	merged := rawByID(t, raw, "zai/glm-5.3")
+	wantInt(t, merged, "context_length", 1000000)
+	wantInt(t, merged, "max_model_len", 1000000)
+	wantStrings(t, merged, "input_modalities", []string{"text"})
+	wantAbsent(t, merged, "supports_vision")
+	for _, m := range raw {
+		if m["id"] == "glm-5.3" {
+			t.Errorf("bare alias id glm-5.3 still advertised (want only zai/glm-5.3)")
+		}
+	}
 
 	// A served vLLM window is never replaced by a catalog row.
 	vllm := rawByID(t, raw, "zai/Qwen/Qwen3")

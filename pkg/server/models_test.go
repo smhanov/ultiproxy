@@ -150,14 +150,20 @@ func TestHandleModels_IncludesRuntimeLanes(t *testing.T) {
 	resp := getModels(t, srv)
 	ids := resp.ids()
 
+	// Discovered upstream models are advertised as <lane>/<model>. The user
+	// alias qwenpoint-3.8 maps to vllm-local/Qwen/Qwen3.8-27B-Instruct, which
+	// is the same canonical id as the discovered row, so it collapses into it
+	// and is not advertised separately (T041: aliases are request-path names).
 	for _, want := range []string{
-		"vllm-local/Qwen/Qwen3.8-27B-Instruct", // discovered upstream models
+		"vllm-local/Qwen/Qwen3.8-27B-Instruct", // discovered + alias target
 		"vllm-local/meta-llama/Llama-3-8B",
-		"qwenpoint-3.8", // catalog alias
 	} {
 		if _, ok := ids[want]; !ok {
 			t.Errorf("model %q missing from /v1/models: %v", want, ids)
 		}
+	}
+	if _, ok := ids["qwenpoint-3.8"]; ok {
+		t.Errorf("bare alias name qwenpoint-3.8 advertised (want only canonical ids): %v", ids)
 	}
 	// The bare lane name is a routing prefix, not a model: it must not be
 	// advertised, neither for the discovery lane nor for the lane that has no
@@ -288,7 +294,9 @@ func waitForModelRequests(t *testing.T, upstream *fakeModelUpstream, want int32)
 }
 
 // TestHandleModels_AliasLimits: catalog alias ContextLimit/MaxOutput are
-// surfaced on the alias entry (ContextLimit is advisory metadata only).
+// surfaced on the alias's canonical <lane>/<model> entry (ContextLimit is
+// advisory metadata only). T041: the alias is listed under its canonical
+// target, not its bare name.
 func TestHandleModels_AliasLimits(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig()
@@ -305,8 +313,8 @@ func TestHandleModels_AliasLimits(t *testing.T) {
 	srv := NewServer(cfg, provider.NewRegistry(), WithStateManager(state.NewStateManager()))
 
 	resp := getModels(t, srv)
-	if len(resp.Data) != 1 || resp.Data[0].ID != "qwenpoint-3.8" {
-		t.Fatalf("expected the alias entry only, got %+v", resp.Data)
+	if len(resp.Data) != 1 || resp.Data[0].ID != "vllm/Qwen/Qwen3.8-27B-Instruct" {
+		t.Fatalf("expected the alias's canonical entry only, got %+v", resp.Data)
 	}
 	if resp.Data[0].ContextLength != 200000 {
 		t.Errorf("context_length = %d, want 200000", resp.Data[0].ContextLength)
@@ -417,12 +425,15 @@ type fakeListableLane struct {
 func (f *fakeListableLane) CachedModels() []string { return f.cached }
 func (f *fakeListableLane) DefaultModel() string   { return f.def }
 
-// TestHandleModels_AdvertisesOnlyRoutableIDs is the core T031 contract:
+// TestHandleModels_AdvertisesOnlyRoutableIDs is the T041 advertisement
+// contract:
 //
-//   - AC1: no id equals a registered lane name (a lane name is a routing
-//     prefix, not a model);
-//   - AC2: every id is either a catalog alias or a "<lane>/<model>" id;
-//   - AC3: a lane with discovery lists "<lane>/<discovered>", a lane with a
+//   - every advertised id is a canonical "<lane>/<model>" id whose lane
+//     segment names a registered lane (the bare user-alias name is a
+//     request-path name, not a listed id);
+//   - no id equals a registered lane name (a lane name is a routing prefix,
+//     not a model);
+//   - a lane with discovery lists "<lane>/<discovered>", a lane with a
 //     default model lists "<lane>/<default>", a lane with neither lists
 //     nothing at all.
 func TestHandleModels_AdvertisesOnlyRoutableIDs(t *testing.T) {
@@ -447,28 +458,38 @@ func TestHandleModels_AdvertisesOnlyRoutableIDs(t *testing.T) {
 	resp := getModels(t, srv)
 	ids := resp.ids()
 
-	// AC3: the routable ids that must be advertised.
-	for _, want := range []string{"myalias", "discovered/m1", "discovered/m2", "defaultonly/tofino-3"} {
+	// The canonical ids that must be advertised. myalias maps to
+	// discovered/m1, so it folds into that discovered row rather than being
+	// advertised as a bare id.
+	for _, want := range []string{"discovered/m1", "discovered/m2", "defaultonly/tofino-3"} {
 		if _, ok := ids[want]; !ok {
 			t.Errorf("model %q missing from /v1/models: %v", want, ids)
 		}
 	}
+	if _, ok := ids["myalias"]; ok {
+		t.Errorf("bare alias name myalias advertised (want only canonical ids): %v", ids)
+	}
 
-	// AC1: zero bare lane names.
+	// No bare lane names.
 	for _, lane := range registry.Names() {
 		if _, ok := ids[lane]; ok {
-			t.Errorf("AC1 violated: bare lane name %q is advertised as a model id", lane)
+			t.Errorf("bare lane name %q is advertised as a model id", lane)
 		}
 	}
 
-	// AC2: every advertised id is an alias or a "<lane>/<model>" id.
-	aliases := map[string]bool{"myalias": true}
+	// Every advertised id is a canonical "<registered-lane>/<model>" id.
+	registrySet := map[string]bool{}
+	for _, lane := range registry.Names() {
+		registrySet[lane] = true
+	}
 	for id := range ids {
-		if aliases[id] {
+		idx := strings.Index(id, "/")
+		if idx <= 0 {
+			t.Errorf("id %q is not a canonical <lane>/<model> id", id)
 			continue
 		}
-		if !strings.Contains(id, "/") {
-			t.Errorf("AC2 violated: id %q is neither an alias nor a <lane>/<model> id", id)
+		if !registrySet[id[:idx]] {
+			t.Errorf("id %q names unregistered lane %q", id, id[:idx])
 		}
 	}
 
@@ -626,8 +647,10 @@ func TestHandleModels_MatchesListModelsTool(t *testing.T) {
 		env  string
 		want []string
 	}{
-		{name: "default", env: "", want: []string{"defaultonly/tofino-3", "discovered/m1", "discovered/m2", "myalias", "probe/m1"}},
-		{name: "hide test lanes", env: "1", want: []string{"defaultonly/tofino-3", "discovered/m1", "discovered/m2", "myalias"}},
+		// myalias maps to discovered/m1, so it folds into that discovered
+		// canonical id rather than appearing as a bare id (T041).
+		{name: "default", env: "", want: []string{"defaultonly/tofino-3", "discovered/m1", "discovered/m2", "probe/m1"}},
+		{name: "hide test lanes", env: "1", want: []string{"defaultonly/tofino-3", "discovered/m1", "discovered/m2"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("ULTIPROXY_HIDE_TEST_LANES", tc.env)
@@ -778,9 +801,11 @@ func TestHandleModels_AliasContextLimitWins(t *testing.T) {
 		t.Fatalf("add: %v", err)
 	}
 	srv := NewServer(cfg, provider.NewRegistry(), WithStateManager(state.NewStateManager()), WithRuntimeProviderStore(store))
-	cl, ml, ok := findModel(getModels(t, srv), "qwen")
+	// The alias qwen maps to vllm/Qwen/Qwen3 (the discovered row), so its
+	// ContextLimit is surfaced on that canonical id (T041).
+	cl, ml, ok := findModel(getModels(t, srv), "vllm/Qwen/Qwen3")
 	if !ok {
-		t.Fatal("missing alias qwen")
+		t.Fatal("missing alias canonical id vllm/Qwen/Qwen3")
 	}
 	if cl != 200000 || ml != 200000 {
 		t.Errorf("alias window context_length=%d max_model_len=%d, want 200000", cl, ml)
@@ -805,9 +830,12 @@ func TestHandleModels_AliasInheritsDiscoveredWindow(t *testing.T) {
 		t.Fatalf("add: %v", err)
 	}
 	srv := NewServer(cfg, provider.NewRegistry(), WithStateManager(state.NewStateManager()), WithRuntimeProviderStore(store))
-	cl, ml, ok := findModel(getModels(t, srv), "heapster-7b")
+	// The alias heapster-7b maps to vllm/Qwen/Qwen3 (the discovered row) and
+	// carries no limit, so the canonical id inherits the discovered window
+	// (T041: aliases are request-path names, listed under the canonical id).
+	cl, ml, ok := findModel(getModels(t, srv), "vllm/Qwen/Qwen3")
 	if !ok {
-		t.Fatal("missing alias heapster-7b")
+		t.Fatal("missing canonical id vllm/Qwen/Qwen3")
 	}
 	if cl != 131072 || ml != 131072 {
 		t.Errorf("inherited window context_length=%d max_model_len=%d, want 131072", cl, ml)

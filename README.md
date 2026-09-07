@@ -222,9 +222,9 @@ Add to `~/.config/opencode/opencode.json`:
       "baseURL": "http://localhost:9050/v1",
       "apiKey": "sk-up-local-agent-key",
       "models": [
-        "gpt-4o",
-        "claude-3-5-sonnet",
-        "deepseek-r1",
+        "copilot/gpt-4o",
+        "anthropic/claude-3-5-sonnet",
+        "deepseek/deepseek-r1",
         "vllm/qwenpoint-3.8"
       ]
     }
@@ -242,7 +242,7 @@ Give Hermes the OpenAI-compatible base URL and a model id that exists on the pro
     "provider": "custom",
     "base_url": "http://localhost:9050/v1",
     "api_key": "sk-up-local-agent-key",
-    "model": "claude-3-5-sonnet",
+    "model": "anthropic/claude-3-5-sonnet",
     "max_tokens": 8192,
     "temperature": 0.2,
     "extra_headers": { "X-Client-Id": "hermes-agent-primary" }
@@ -280,7 +280,7 @@ const openai = new OpenAI({
 });
 
 const response = await openai.chat.completions.create({
-  model: "gpt-4o",
+  model: "copilot/gpt-4o",
   messages: [{ role: "user", content: "Implement quota-aware load balancer in Go." }],
   stream: true,
 });
@@ -290,7 +290,7 @@ const response = await openai.chat.completions.create({
 curl -s http://localhost:9050/v1/chat/completions \
   -H "Authorization: Bearer sk-up-local-agent-key" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Ping"}]}'
+  -d '{"model":"copilot/gpt-4o","messages":[{"role":"user","content":"Ping"}]}'
 ```
 
 ---
@@ -301,7 +301,7 @@ curl -s http://localhost:9050/v1/chat/completions \
 | :--- | :--- |
 | `POST /v1/chat/completions` | OpenAI chat completions (text, tools, images, SSE streaming). |
 | `POST /v1/messages` | Anthropic Messages API (Claude Code and friends). |
-| `GET /v1/models` | Only routable model ids: aliases, `<lane>/<model>` per discovered upstream model, and `<lane>/<default>` for lanes with a default model (e.g. `antigravity/gemini-3.7-flash-high`). Each row carries the metadata a client needs to pick a model, when a source actually reported it: `context_length` and `max_model_len` (the same window under the OpenRouter/LiteLLM and vLLM names), `max_output_tokens`, and `architecture.input_modalities` / `architecture.output_modalities` plus `supports_vision: true` when image is an input. Precedence, per field: operator alias (`context_limit`, `max_output`, `input_modalities` / `output_modalities` via `set_model_alias`) > live discovery > cited static catalog (`pkg/modelmeta`, extendable with `data_dir/windows.json`) > omit. Unknown keys are omitted -- never `0`, `false`, `[]` -- and the legacy `max_tokens` name is never emitted. Windows are read from every dialect the upstreams speak (`max_model_len`, `context_length`, `top_provider.context_length`, `meta.context_length`, `meta.n_ctx`, `context_window`, `meta.n_ctx_train`; Anthropic `max_input_tokens`), output caps from `top_provider.max_completion_tokens`, `max_output_tokens`, `max_completion_tokens` (Anthropic `max_tokens`), and modalities from `architecture.input_modalities` / `output_modalities`, top-level modality arrays, `architecture.modality` (`"text+image->text"`) or `supports_vision`, normalized to `text|image|file|audio|video` (`pdf` -> `file`). Nothing is inferred from a model name. No bare lane names -- a lane name is a routing prefix, not a model (`"model": "<lane>"` still routes, as a legacy form). A lane with an empty discovery cache and no default lists nothing. Served from the discovery cache only -- listing never fans out to an upstream; set `ULTIPROXY_HIDE_TEST_LANES=1` to keep test lanes (`probe`, `fake`) out. |
+| `GET /v1/models` | Only routable canonical model ids: `<lane>/<model>` per discovered upstream model, and `<lane>/<default>` for lanes with a default model (e.g. `antigravity/gemini-3.7-flash-high`). User aliases from `set_model_alias` are listed under their canonical target. Each row carries the metadata a client needs to pick a model, when a source actually reported it: `context_length` and `max_model_len` (the same window under the OpenRouter/LiteLLM and vLLM names), `max_output_tokens`, and `architecture.input_modalities` / `architecture.output_modalities` plus `supports_vision: true` when image is an input. Precedence, per field: operator alias (`context_limit`, `max_output`, `input_modalities` / `output_modalities` via `set_model_alias`) > live discovery > cited static catalog (`pkg/modelmeta`, extendable with `data_dir/windows.json`) > omit. Unknown keys are omitted -- never `0`, `false`, `[]` -- and the legacy `max_tokens` name is never emitted. Windows are read from every dialect the upstreams speak (`max_model_len`, `context_length`, `top_provider.context_length`, `meta.context_length`, `meta.n_ctx`, `context_window`, `meta.n_ctx_train`; Anthropic `max_input_tokens`), output caps from `top_provider.max_completion_tokens`, `max_output_tokens`, `max_completion_tokens` (Anthropic `max_tokens`), and modalities from `architecture.input_modalities` / `output_modalities`, top-level modality arrays, `architecture.modality` (`"text+image->text"`) or `supports_vision`, normalized to `text|image|file|audio|video` (`pdf` -> `file`). Nothing is inferred from a model name. No bare lane names and no bare alias names. A lane with an empty discovery cache and no default lists nothing. Served from the discovery cache only -- listing never fans out to an upstream; set `ULTIPROXY_HIDE_TEST_LANES=1` to keep test lanes (`probe`, `fake`) out. |
 | `POST /mcp`, `GET /mcp` | Streamable HTTP MCP server (JSON-RPC 2.0). |
 | `GET /mcp/sse` | Legacy SSE MCP transport. |
 | `GET /api/quota`, `/quota.txt`, `/quota.md` | Live quota dashboard, plain-text and Markdown views. Authenticated like every other route when client keys are configured. |

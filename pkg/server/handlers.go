@@ -171,7 +171,32 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		snap = s.sm.Snapshot()
 	}
 
-	// 1. State snapshot models (aliases as synced, plus runtime toggles).
+	// 1. Alias catalog as canonical <lane>/<model> ids. The bare alias name is
+	//    a request-path name, not a listed model id, so each alias is listed
+	//    under its canonical target. A lane-prefixed alias target is left
+	//    as-is. A toggle_model(false) on the alias (by either name) hides it.
+	if s.catalog != nil {
+		for _, alias := range s.catalog.Sorted() {
+			entry, ok := s.catalog.Get(alias)
+			if !ok {
+				continue
+			}
+			id := canonicalAliasID(entry)
+			if id == "" {
+				continue // no upstream id: not a listed model
+			}
+			if snap != nil && modelIsDisabled(snap.Models, alias, s.catalog) {
+				continue
+			}
+			add(id, entry.Provider, s.resolveModelMeta(id, entry.Provider, entry.Upstream, entry))
+		}
+	}
+
+	// 2. State snapshot rows the alias catalog does not own: runtime
+	//    toggle_model entries and any other model rows. A bare alias name is
+	//    listed by step 1 under its canonical target, so it is skipped here;
+	//    a disabled row (a flag on any related name) is omitted. This mirrors
+	//    the pre-T041 behavior of listing every enabled, non-alias state row.
 	if snap != nil && snap.Models != nil {
 		keys := make([]string, 0, len(snap.Models))
 		for k := range snap.Models {
@@ -180,34 +205,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		sort.Strings(keys)
 		for _, k := range keys {
 			m := snap.Models[k]
-			if !m.Enabled {
+			if _, ok := s.aliasEntry(k); ok {
+				continue // step 1 lists the alias's canonical target
+			}
+			if modelIsDisabled(snap.Models, k, s.catalog) {
 				continue
 			}
-			// The catalog entry is authoritative for alias metadata; state
-			// rows that are not aliases (lane-prefixed toggles) keep their
-			// own limits.
-			alias := ModelAlias{ContextLimit: m.ContextLimit, MaxOutput: m.MaxOutput}
-			upstream := aliasUpstream(s.catalog, m.ID)
-			if entry, ok := s.aliasEntry(m.ID); ok {
-				alias = entry
-			}
-			add(m.ID, m.Provider, s.resolveModelMeta(m.ID, m.Provider, upstream, alias))
-		}
-	}
-
-	// 2. Alias catalog (covers servers built without a state manager).
-	if s.catalog != nil {
-		for _, alias := range s.catalog.Sorted() {
-			entry, ok := s.catalog.Get(alias)
-			if !ok {
-				continue
-			}
-			if snap != nil && snap.Models != nil {
-				if mr, ok := snap.Models[alias]; ok && !mr.Enabled {
-					continue
-				}
-			}
-			add(alias, entry.Provider, s.resolveModelMeta(alias, entry.Provider, entry.Upstream, entry))
+			add(m.ID, m.Provider, s.resolveModelMeta(m.ID, m.Provider, aliasUpstream(s.catalog, m.ID),
+				ModelAlias{ContextLimit: m.ContextLimit, MaxOutput: m.MaxOutput}))
 		}
 	}
 
@@ -281,21 +286,34 @@ func collectListedIDs(s *Server) []string {
 	if s.sm != nil {
 		snap = s.sm.Snapshot()
 	}
-	if snap != nil && snap.Models != nil {
-		for _, m := range snap.Models {
-			if m.Enabled {
-				add(m.ID)
-			}
-		}
-	}
+	// Alias catalog as canonical <lane>/<model> ids (mirrors handleModels).
 	if s.catalog != nil {
 		for _, alias := range s.catalog.Sorted() {
-			if snap != nil && snap.Models != nil {
-				if mr, ok := snap.Models[alias]; ok && !mr.Enabled {
-					continue
-				}
+			entry, ok := s.catalog.Get(alias)
+			if !ok {
+				continue
 			}
-			add(alias)
+			id := canonicalAliasID(entry)
+			if id == "" {
+				continue
+			}
+			if snap != nil && modelIsDisabled(snap.Models, alias, s.catalog) {
+				continue
+			}
+			add(id)
+		}
+	}
+	// State rows the catalog does not own (runtime toggle_model entries and
+	// any other model rows), listed by key — mirrors handleModels.
+	if snap != nil && snap.Models != nil {
+		for k := range snap.Models {
+			if _, ok := s.catalog.Get(k); ok {
+				continue // catalog step lists the alias's canonical target
+			}
+			if modelIsDisabled(snap.Models, k, s.catalog) {
+				continue
+			}
+			add(k)
 		}
 	}
 	if s.registry != nil {

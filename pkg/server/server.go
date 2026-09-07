@@ -453,6 +453,56 @@ func (a *stateManagerSourceAdapter) ToggleModel(modelID string, enabled bool) er
 	return nil
 }
 
+// canonicalAliasID returns the canonical <lane>/<model> id a catalog alias
+// resolves to, or "" when the alias has no upstream id. An alias names a
+// lane's model, so its client-visible canonical id is "<provider>/<upstream>".
+// The bare alias name is a request-path name the router resolves to this
+// canonical target; it is itself never a listed model id.
+func canonicalAliasID(entry ModelAlias) string {
+	if entry.Provider == "" || entry.Upstream == "" {
+		return ""
+	}
+	return entry.Provider + "/" + entry.Upstream
+}
+
+// modelIsDisabled reports whether a client-visible id is disabled in the state
+// snapshot. A toggle_model(false) can land on any of the id's related names —
+// the bare alias name and/or its canonical <lane>/<model> form — so the model
+// is disabled when any related state row is disabled: the id as given, and, for
+// a user alias, both its bare name and its canonical target (in either
+// direction). A bare lane name or an unknown bare id has no related rows, so
+// only its own row is consulted.
+func modelIsDisabled(models map[string]state.ModelRuntime, model string, catalog *ModelCatalog) bool {
+	if models == nil {
+		return false
+	}
+	if mr, ok := models[model]; ok && !mr.Enabled {
+		return true
+	}
+	if catalog == nil {
+		return false
+	}
+	if entry, ok := catalog.Get(model); ok {
+		// model is a bare alias name: also honor a flag set on its canonical form.
+		if c := canonicalAliasID(entry); c != "" {
+			if mr, ok := models[c]; ok && !mr.Enabled {
+				return true
+			}
+		}
+		return false
+	}
+	// model is not a bare alias name (a canonical id or other): honor a flag
+	// set on a bare alias name that maps to this canonical id.
+	for name, e := range catalog.List() {
+		if canonicalAliasID(e) == model {
+			if mr, ok := models[name]; ok && !mr.Enabled {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // syncCatalogToState reconciles the state manager's Models map with the alias
 // catalog so routing and /v1/models resolve the same table the catalog owns.
 //

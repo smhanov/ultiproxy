@@ -445,18 +445,10 @@ func TestServer_Upstream429ErrorPreserved(t *testing.T) {
 	registry := provider.NewRegistry()
 	registry.Register(provider.Provider{Inference: provA})
 
-	sm := state.NewStateManager()
-	sm.Update(func(snap *state.RuntimeSnapshot) {
-		snap.Models["tofino-3"] = state.ModelRuntime{
-			ID:       "tofino-3",
-			Provider: "augure",
-			Enabled:  true,
-		}
-	})
+	srv := NewServer(nil, registry)
 
-	srv := NewServer(nil, registry, WithStateManager(sm))
-
-	body := `{"model":"tofino-3","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	// T041: the request path routes via the canonical <lane>/<model> prefix.
+	body := `{"model":"augure/tofino-3","messages":[{"role":"user","content":"Hi"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 

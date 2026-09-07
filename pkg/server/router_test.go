@@ -305,15 +305,17 @@ func TestRouter_LaneMatchIsExactOrPrefix(t *testing.T) {
 		model string
 		want  string // "" = expect unknown_model
 	}{
-		{model: "zai", want: "zai"},                         // exact lane id
 		{model: "zai/glm-5.3-flash", want: "zai"},           // genuine prefix
 		{model: "ZAI/glm-5.3-flash", want: "zai"},           // case-insensitive prefix
-		{model: "vllm", want: "vllm"},                       // exact lane id
 		{model: "vllm/Qwen/Qwen3.8-Instruct", want: "vllm"}, // nested upstream id
 		{model: "amazai-gpt-4o", want: ""},                  // substring of "zai", not a prefix
 		{model: "prevllm/qwen", want: ""},                   // substring of "vllm", not a prefix
 		{model: "xaizai", want: ""},                         // contains "zai" twice, still no prefix
 		{model: "zai-model", want: ""},                      // dash is not a separator
+		// T041: a bare lane name is a routing prefix, not a model id: with no
+		// catalog alias it is unknown_model.
+		{model: "zai", want: ""},
+		{model: "vllm", want: ""},
 	}
 
 	for _, tc := range cases {

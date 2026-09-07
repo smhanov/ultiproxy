@@ -49,32 +49,31 @@ func NewRegistryRouter(registry *provider.Registry, sm *state.StateManager, cata
 }
 
 // Route resolves a model name to an available provider bundle name.
+//
+// The request path accepts exactly two id shapes:
+//   - a user-defined alias from the alias catalog (an explicit name the
+//     operator mapped to a lane + upstream), resolved by the catalog; and
+//   - a canonical "<lane>/<model>" id, resolved by the "<lane>/" prefix.
+//
+// Everything else is unknown_model. A bare lane name is a routing prefix, not
+// a model, so an exact lane-name match routes nothing. A bare id that is not a
+// registered user alias (the old "implicit catalog alias" form) is likewise
+// unknown_model. A disabled state row is a terminal kill switch checked before
+// either resolution path.
 func (r *RegistryRouter) Route(ctx context.Context, model string) (string, error) {
 	excluded := ExcludedProvidersFromContext(ctx)
 
-	// 1. Check state snapshot for explicit model mapping
+	// 1. Kill switch: a disabled state row is terminal. toggle_model(false) is
+	// a kill switch, not a discovery hint: refuse here instead of falling
+	// through to the alias catalog or a lane prefix, either of which would
+	// happily route the very model the operator just disabled. A model is
+	// disabled when any of its related state rows is disabled: the id as
+	// given, plus, for a user alias, its bare name and canonical <lane>/<model>
+	// form both. So disabling either name disables the model by either name.
 	if r.sm != nil {
-		snap := r.sm.Snapshot()
-		if snap != nil && snap.Models != nil {
-			if mr, ok := snap.Models[model]; ok {
-				// A disabled model is terminal: toggle_model(false) is a kill
-				// switch, not a discovery hint. Refuse here instead of falling
-				// through to the catalog or a provider-name prefix, either of
-				// which would happily route the very model the operator just
-				// disabled.
-				if !mr.Enabled {
-					return "", &DisabledModelError{Model: model}
-				}
-				if !excluded[mr.Provider] {
-					if pr, ok := snap.Providers[mr.Provider]; ok {
-						if pr.IsAvailable() {
-							return mr.Provider, nil
-						}
-					} else {
-						return mr.Provider, nil
-					}
-				}
-				return "", fmt.Errorf("provider %q for model %q is unavailable or failed", mr.Provider, model)
+		if snap := r.sm.Snapshot(); snap != nil && snap.Models != nil {
+			if modelIsDisabled(snap.Models, model, r.catalog) {
+				return "", &DisabledModelError{Model: model}
 			}
 		}
 	}
@@ -86,7 +85,9 @@ func (r *RegistryRouter) Route(ctx context.Context, model string) (string, error
 
 	names := r.registry.Names()
 
-	// 3. Catalog mapping (alias -> provider) when the state snapshot missed it.
+	// 3. User-defined alias (catalog): an explicit name mapped to a lane.
+	// Aliases resolve before prefix routing and are the only bare ids that
+	// route; everything else bare is unknown_model.
 	if r.catalog != nil {
 		if entry, ok := r.catalog.Get(model); ok && entry.Provider != "" {
 			if !excluded[entry.Provider] {
@@ -98,15 +99,14 @@ func (r *RegistryRouter) Route(ctx context.Context, model string) (string, error
 		}
 	}
 
-	// 4. Direct or prefix match with provider name (e.g. "zai/glm-5.3-flash").
-	// The match is the lane id itself or a genuine "<lane>/" prefix - never a
-	// substring: a model id that merely embeds a lane name ("amazai-gpt-4o")
-	// belongs to no lane, and routing it would both misroute and hand the
-	// upstream an unstripped model name.
+	// 4. "<lane>/" prefix match (e.g. "zai/glm-5.3-flash"). The match is a
+	// genuine "<lane>/" prefix - never a substring and never the bare lane id
+	// itself: a model id that merely embeds a lane name ("amazai-gpt-4o")
+	// belongs to no lane, and a bare lane name is a routing prefix, not a
+	// model, so both fall through to unknown_model.
 	lowerModel := strings.ToLower(model)
 	for _, name := range names {
-		lowerName := strings.ToLower(name)
-		if lowerModel != lowerName && !strings.HasPrefix(lowerModel, lowerName+"/") {
+		if !strings.HasPrefix(lowerModel, strings.ToLower(name)+"/") {
 			continue
 		}
 		if !excluded[name] {
@@ -119,6 +119,13 @@ func (r *RegistryRouter) Route(ctx context.Context, model string) (string, error
 	// routing to the first registered provider (which produced the
 	// "all candidate providers failed" 10-lane walk).
 	return "", &UnknownModelError{Model: model}
+}
+
+// disabledStateRow reports whether the state snapshot carries a row for id
+// (or its canonical form) with Enabled=false.
+func disabledStateRow(models map[string]state.ModelRuntime, id string) bool {
+	mr, ok := models[id]
+	return ok && !mr.Enabled
 }
 
 // UnknownModelError indicates the requested model has no mapping to any lane.
