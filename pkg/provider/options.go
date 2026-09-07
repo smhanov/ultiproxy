@@ -86,6 +86,18 @@ func WithExtraBody(kv map[string]any) Option {
 	}
 }
 
+// WithoutExtraKey deletes keys from ExtraBody.
+func WithoutExtraKey(keys ...string) Option {
+	return func(c *RequestConfig) {
+		if c.ExtraBody == nil {
+			return
+		}
+		for _, k := range keys {
+			delete(c.ExtraBody, k)
+		}
+	}
+}
+
 // WithCost sets per-million-token pricing (input and output, US dollars) so
 // usage accounting can attribute a cost to the request. A cost reported by the
 // upstream always takes precedence over these rates.

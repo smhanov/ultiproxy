@@ -299,16 +299,16 @@ func TestWire_FreebuffQuirk(t *testing.T) {
 		t.Errorf("expected Buffy system prompt, got %q", first.ContentString())
 	}
 
-	// read_files default tool injected (request carried no tools).
+	// The CLI's 15-tool set injected (request carried no tools).
 	if !rec.HasTool("read_files") {
-		t.Errorf("expected default read_files tool on the wire, got %+v", rec.Tools)
+		t.Errorf("expected read_files tool on the wire, got %+v", rec.Tools)
 	}
-	if len(rec.Tools) != 1 {
-		t.Errorf("expected exactly 1 injected tool, got %d: %+v", len(rec.Tools), rec.Tools)
+	if len(rec.Tools) != 15 {
+		t.Errorf("expected the CLI's 15 tools, got %d: %+v", len(rec.Tools), rec.Tools)
 	}
 
-	// codebuff_metadata injected — binary-identical shape (no instance id in
-	// metadata; instance rides session API calls only).
+	// codebuff_metadata injected — 2026-09-06 CLI capture: instance id +
+	// trace id + repo_snapshot ride the metadata.
 	meta, ok := rec.JSON["codebuff_metadata"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected codebuff_metadata in upstream body, got %v", rec.JSON["codebuff_metadata"])
@@ -319,26 +319,32 @@ func TestWire_FreebuffQuirk(t *testing.T) {
 	if meta["cost_mode"] != "free" {
 		t.Errorf("expected cost_mode free, got %v", meta["cost_mode"])
 	}
-	if _, ok := meta["freebuff_instance_id"]; ok {
-		t.Errorf("freebuff_instance_id must be absent from metadata (binary omits it)")
+	if got, _ := meta["freebuff_instance_id"].(string); got == "" {
+		t.Error("freebuff_instance_id missing from metadata (CLI sends it)")
+	}
+	if got, _ := meta["trace_session_id"].(string); got == "" {
+		t.Error("trace_session_id missing from metadata (CLI sends it)")
 	}
 	if cid, _ := meta["client_id"].(string); cid == "" || strings.HasPrefix(cid, "cli-") || strings.Contains(cid, "-") {
 		t.Errorf("client_id = %v, want base36 random per run (no cli- prefix)", meta["client_id"])
 	}
 
-	// provider block: allow_fallbacks=false for official models.
+	// provider block: {data_collection:deny} — the CLI's shape.
 	prov, ok := rec.JSON["provider"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected provider object in upstream body, got %v", rec.JSON["provider"])
 	}
-	if prov["allow_fallbacks"] != false {
-		t.Errorf("expected provider.allow_fallbacks false, got %v", prov["allow_fallbacks"])
+	if prov["data_collection"] != "deny" {
+		t.Errorf("expected provider.data_collection deny, got %v", prov["data_collection"])
+	}
+	if _, ok := prov["allow_fallbacks"]; ok {
+		t.Error("provider.allow_fallbacks must be absent (CLI sends data_collection only)")
 	}
 
-	// Instance header IS present on chat (upstream keys the free session to
-	// it — without it chat 428s even with an active session; verified live).
-	if got := rec.GetHeader("x-freebuff-instance-id"); got == "" {
-		t.Error("expected x-freebuff-instance-id on chat (session keying), got none")
+	// NO instance header on chat — metadata carries the instance (2026-09-06
+	// CLI capture).
+	if got := rec.GetHeader("x-freebuff-instance-id"); got != "" {
+		t.Errorf("x-freebuff-instance-id on chat = %q, want absent (metadata carries it)", got)
 	}
 	if got := rec.GetHeader("x-freebuff-acting-user-id"); got != "usr-wire" {
 		t.Errorf("expected x-freebuff-acting-user-id usr-wire, got %q", got)

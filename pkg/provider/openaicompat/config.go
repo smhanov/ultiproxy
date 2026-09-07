@@ -47,6 +47,7 @@ type Quirks struct {
 	AuthViaSupabaseRefresh bool           // augure: token file + Supabase refresh
 	FreebuffActor          any            // injected *spikesfreebuff.FreebuffAccountActor (avoid import cycle: use an interface or any with a small interface type asserted at runtime; document it)
 	FreebuffDefaultTool    bool           // freebuff: prepend default tool + Buffy system prompt + codebuff_metadata
+	FreebuffValidate       bool           // freebuff: fire the CLI's best-effort POST /api/agents/validate pre-chat (off in unit tests; on in wired lanes)
 	DefaultModel           string         // augure: "tofino-3"; empty otherwise
 }
 
@@ -80,4 +81,14 @@ type freebuffTokenSetter interface {
 // imported instance ID during login.
 type freebuffInstanceIDSetter interface {
 	SetInstanceID(id string)
+}
+
+// freebuffRunFinisher is implemented by freebuff actors that can finish an agent run.
+type freebuffRunFinisher interface {
+	FinishRun(ctx context.Context, runID, status string, err error) error
+}
+
+// freebuffHeartbeatStarter is implemented by freebuff actors with an active heartbeat loop.
+type freebuffHeartbeatStarter interface {
+	StartHeartbeat()
 }

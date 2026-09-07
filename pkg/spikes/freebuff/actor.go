@@ -82,6 +82,13 @@ func WithInstanceID(id string) Option {
 	}
 }
 
+// WithHeartbeatInterval sets the background session heartbeat interval.
+func WithHeartbeatInterval(d time.Duration) Option {
+	return func(a *FreebuffAccountActor) {
+		a.heartbeatInterval = d
+	}
+}
+
 // FreebuffAccountActor is a single-owner serialized actor for the Freebuff session.
 type FreebuffAccountActor struct {
 	lockPath   string
@@ -104,6 +111,11 @@ type FreebuffAccountActor struct {
 	stopCh     chan struct{}
 	workerDone chan struct{}
 	closed     bool
+
+	heartbeatInterval time.Duration
+	hbStopCh          chan struct{}
+	hbDone            chan struct{}
+	hbRunning         bool
 }
 
 // NewFreebuffAccountActor creates a new FreebuffAccountActor.
@@ -557,6 +569,166 @@ func (a *FreebuffAccountActor) StartRun(ctxOrAgentID any, optionalAgentID ...str
 	return &run, nil
 }
 
+// FinishRun marks an upstream agent run as finished via POST /agent-runs.
+func (a *FreebuffAccountActor) FinishRun(ctx context.Context, runID, status string, err error) error {
+	if runID == "" {
+		return nil
+	}
+	if status == "" {
+		status = "completed"
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	a.mu.Lock()
+	tok := a.token
+	client := a.httpClient
+	instID := a.instanceID
+	a.mu.Unlock()
+
+	var errMsg string
+	if err != nil {
+		errMsg = err.Error()
+	}
+
+	payloadMap := map[string]any{
+		"action":        "FINISH",
+		"runId":         runID,
+		"status":        status,
+		"totalSteps":    1,
+		"directCredits": 0,
+		"totalCredits":  0,
+		"steps":         []any{},
+	}
+	if errMsg != "" {
+		payloadMap["errorMessage"] = errMsg
+	}
+
+	payload, marshalErr := json.Marshal(payloadMap)
+	if marshalErr != nil {
+		return marshalErr
+	}
+
+	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/agent-runs", bytes.NewReader(payload))
+	if reqErr != nil {
+		return reqErr
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	if instID != "" {
+		req.Header.Set("x-freebuff-instance-id", instID)
+	}
+	if userID := a.ActingUserID(ctx); userID != "" {
+		req.Header.Set("x-freebuff-acting-user-id", userID)
+	}
+
+	resp, doErr := client.Do(req)
+	if doErr != nil {
+		return doErr
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("finish agent run failed with status: %d", resp.StatusCode)
+	}
+
+	a.mu.Lock()
+	if a.currentRun != nil && a.currentRun.GetRunID() == runID {
+		a.currentRun = nil
+	}
+	a.mu.Unlock()
+
+	return nil
+}
+
+// StartHeartbeat starts the background session heartbeat if not already running.
+func (a *FreebuffAccountActor) StartHeartbeat() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed || a.hbRunning {
+		return
+	}
+	a.hbRunning = true
+	a.hbStopCh = make(chan struct{})
+	a.hbDone = make(chan struct{})
+	go a.heartbeatLoop(a.hbStopCh, a.hbDone)
+}
+
+// StopHeartbeat stops the background session heartbeat.
+func (a *FreebuffAccountActor) StopHeartbeat() {
+	a.mu.Lock()
+	if !a.hbRunning {
+		a.mu.Unlock()
+		return
+	}
+	a.hbRunning = false
+	stopCh := a.hbStopCh
+	doneCh := a.hbDone
+	close(stopCh)
+	a.mu.Unlock()
+
+	<-doneCh
+}
+
+func (a *FreebuffAccountActor) heartbeatLoop(stopCh, doneCh chan struct{}) {
+	defer close(doneCh)
+
+	interval := a.heartbeatInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-time.After(interval):
+		}
+
+		a.mu.Lock()
+		tok := a.token
+		instID := a.instanceID
+		client := a.httpClient
+		isClosed := a.closed
+		a.mu.Unlock()
+
+		if isClosed || tok == "" {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.baseURL+"/freebuff/session", nil)
+		if err == nil {
+			req.Header.Set("Authorization", "Bearer "+tok)
+			if instID != "" {
+				req.Header.Set("x-freebuff-instance-id", instID)
+			}
+			req.Header.Set("x-freebuff-compact-session", "1")
+			resp, doErr := client.Do(req)
+			if doErr == nil {
+				if resp.StatusCode == http.StatusOK {
+					var sess Session
+					if decodeErr := json.NewDecoder(resp.Body).Decode(&sess); decodeErr == nil {
+						a.mu.Lock()
+						if sess.InstanceID != "" {
+							a.instanceID = sess.InstanceID
+						}
+						if sess.Model != "" {
+							a.boundModel = sess.Model
+						}
+						a.mu.Unlock()
+					}
+				}
+				resp.Body.Close()
+			}
+		}
+		cancel()
+	}
+}
+
 // FetchUsage calls POST /usage with fingerprintId via the actor.
 func (a *FreebuffAccountActor) FetchUsage(ctx context.Context, fingerprintID string) ([]byte, error) {
 	if fingerprintID == "" {
@@ -792,7 +964,19 @@ func (a *FreebuffAccountActor) Close() error {
 	}
 	a.closed = true
 	close(a.stopCh)
+	hbRunning := a.hbRunning
+	var hbStopCh, hbDone chan struct{}
+	if hbRunning {
+		a.hbRunning = false
+		hbStopCh = a.hbStopCh
+		hbDone = a.hbDone
+		close(hbStopCh)
+	}
 	a.mu.Unlock()
+
+	if hbRunning && hbDone != nil {
+		<-hbDone
+	}
 
 	// Drain queue with errors
 	for {

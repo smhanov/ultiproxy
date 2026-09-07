@@ -67,6 +67,12 @@ type Provider struct {
 	mu        sync.RWMutex
 	models    []string
 	modelInfo []provider.ModelInfo
+	// freebuffToolsSig remembers the toolset fingerprint of the last chat on
+	// the active upstream session. Upstream retains per-instance conversation
+	// state: a tools-bearing turn leaves tool expectations on the instance, so
+	// when the caller's toolset changes the lane must end and re-bind the
+	// session (same mechanism as a model switch).
+	freebuffToolsSig string
 	// pendingXAI holds the in-flight device authorization for a two-phase
 	// MCP-driven login. Guarded by mu.
 	pendingXAI *xaiPendingFlow
@@ -433,8 +439,9 @@ var freebuffAgentByModel = map[string]string{
 	"gemini-3.8-flash":           "base3-free-gemini-3-8-flash",
 }
 
-func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Message, opts []provider.Option) (context.Context, []*ir.Message, []provider.Option, error) {
+func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Message, opts []provider.Option) (context.Context, []*ir.Message, []provider.Option, string, error) {
 	reqConfig := provider.NewRequestConfig(opts...)
+	var runID string
 
 	// 1. Model resolution
 	model := p.resolveModel(reqConfig.Model)
@@ -456,9 +463,36 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 	// 3. Reasoning sanitization (EchoReasoning)
 	msgs = sanitizeReasoning(msgs, p.cfg.Quirks.EchoReasoning)
 
-	// 4+5. Freebuff session lifecycle BEFORE header construction, then the
+	// Tools: the CLI's 15-tool set is the base (upstream's free-mode
+		// router matches endpoints against it — replacing it wholesale 404s
+		// "No endpoints found"); caller tools are APPENDED after the base so
+		// arbitrary tools survive the lane. Live-verified 2026-09-06.
+		finalTools, err := freebuffToolsForRequest(reqConfig)
+		if err != nil {
+			return nil, nil, nil, "", err
+		}
+
+		// Pre-chat agent validation — the CLI calls POST /api/agents/validate
+		// with the full agentDefinition before START/chat. Best-effort, opt-in
+		// via Quirks.FreebuffValidate (off in unit tests): a failure is logged;
+		// chat surfaces any real rejection itself.
+		if p.cfg.Quirks.FreebuffValidate {
+			if tok := p.cfg.APIKey; tok != "" {
+				if err := freebuffValidatePreChat(ctx, p.httpClient, p.cfg.BaseURL, tok, model); err != nil {
+					log.Printf("[freebuff] agents/validate (best-effort) failed: %v", err)
+				}
+			}
+		}
+
+
+// 4+5. Freebuff session lifecycle BEFORE header construction, then the
 	// freebuff headers and default tool/codebuff_metadata transform.
 	if p.cfg.Quirks.FreebuffActor != nil {
+		// Ensure background heartbeat is running once the actor is active
+		if hb, ok := p.cfg.Quirks.FreebuffActor.(freebuffHeartbeatStarter); ok {
+			hb.StartHeartbeat()
+		}
+
 		// Lifecycle first: reconcile, bind to the canonical publisher model
 		// when unbound (fresh account), delete+re-bind on model switch. Bind
 		// may adopt an upstream-minted instance id, so this must run before
@@ -472,37 +506,39 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 			}); ok {
 				canonical := freebuffCanonicalModel(model)
 				if err := sm.Reconcile(ctx); err != nil {
-					return nil, nil, nil, fmt.Errorf("freebuff session check: %w", err)
+					return nil, nil, nil, "", fmt.Errorf("freebuff session check: %w", err)
 				}
+				// Toolset change => upstream instance carries stale tool
+				// state; end and re-bind (same treatment as model switch).
+				toolsSig := freebuffToolsSig(finalTools)
+				p.mu.Lock()
+				sigChanged := p.freebuffToolsSig != "" && p.freebuffToolsSig != toolsSig
+				p.freebuffToolsSig = toolsSig
+				p.mu.Unlock()
 				switch bound := sm.BoundModel(); {
 				case bound == "":
 					if err := sm.Bind(ctx, canonical); err != nil {
-						return nil, nil, nil, err
+						return nil, nil, nil, "", err
 					}
-				case bound != canonical:
+				case bound != canonical || sigChanged:
 					if err := sm.DeleteSession(ctx); err != nil {
-						return nil, nil, nil, fmt.Errorf("freebuff session switch: %w", err)
+						return nil, nil, nil, "", fmt.Errorf("freebuff session switch: %w", err)
 					}
 					if err := sm.Bind(ctx, canonical); err != nil {
-						return nil, nil, nil, err
+						return nil, nil, nil, "", err
 					}
 				}
 			}
 		}
-		// Headers, binary-aligned: Authorization, version-interpolated UA,
-		// runtime acting-user id (no hardcoded ids). The instance header is
-		// kept on chat: upstream keys the free session to it (empirically
-		// required; without it chat 428s waiting_room_required even with an
-		// active session), and the working CLI-era bridge sent it too.
-		opts = append(opts, provider.WithHeader("User-Agent", "ai-sdk/openai-compatible/0.0.167/codebuff"))
+		// Headers, binary-aligned: Authorization + the CLI's current ai-sdk
+		// composite UA + runtime acting-user id. NOTE: no
+		// x-freebuff-instance-id header on chat — the current CLI carries the
+		// instance in codebuff_metadata instead (the header made sense only
+		// against the old pre-2026-09-06 body shape).
+		opts = append(opts, provider.WithHeader("User-Agent", freebuffCLIUserAgent))
 		if au, ok := p.cfg.Quirks.FreebuffActor.(interface{ ActingUserID(context.Context) string }); ok {
 			if id := au.ActingUserID(ctx); id != "" {
 				opts = append(opts, provider.WithHeader("x-freebuff-acting-user-id", id))
-			}
-		}
-		if inst, ok := p.cfg.Quirks.FreebuffActor.(freebuffInstanceIDer); ok {
-			if id := inst.InstanceID(); id != "" {
-				opts = append(opts, provider.WithHeader("x-freebuff-instance-id", id))
 			}
 		}
 		tok := p.cfg.APIKey
@@ -518,7 +554,7 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 		}
 	}
 
-	// 6. FreebuffDefaultTool (Buffy system prompt + default tool + codebuff_metadata)
+	// 6. FreebuffDefaultTool (Buffy system prompt + CLI toolset + codebuff_metadata)
 	if p.cfg.Quirks.FreebuffDefaultTool {
 		hasSystem := false
 		for _, m := range msgs {
@@ -530,40 +566,12 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 		if !hasSystem {
 			sysMsg := &ir.Message{
 				Role:   "system",
-				Blocks: []ir.Block{ir.TextBlock{Text: "You are Buffy, the coding agent behind Codebuff."}},
+				Blocks: []ir.Block{ir.TextBlock{Text: cliSystemPrompt}},
 			}
 			msgs = append([]*ir.Message{sysMsg}, msgs...)
 		}
 
-		defaultTool := map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name":        "read_files",
-				"description": "Read files from project",
-				"parameters": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"paths": map[string]any{
-							"type":  "array",
-							"items": map[string]any{"type": "string"},
-						},
-					},
-				},
-			},
-		}
-
-		var finalTools []any
-		if reqConfig.ExtraBody != nil {
-			if tools, ok := reqConfig.ExtraBody["tools"].([]any); ok && len(tools) > 0 {
-				finalTools = append(finalTools, defaultTool)
-				finalTools = append(finalTools, tools...)
-			}
-		}
-		if len(finalTools) == 0 {
-			finalTools = []any{defaultTool}
-		}
-
-		runID := "run-default"
+				runID = "run-default"
 		if rp, ok := p.cfg.Quirks.FreebuffActor.(interface {
 			StartRun(context.Context, string) (any, error)
 		}); ok {
@@ -582,30 +590,51 @@ func (p *Provider) applyRequestTransforms(ctx context.Context, msgs []*ir.Messag
 			}
 		}
 
-		// codebuff_metadata + provider, binary-identical to the shipped
-		// client: run_id from START, client_id = base36 random per run (the
-		// CLI's Math.random().toString(36).substring(2,15)), stringified step
-		// number, free cost mode. No freebuff_instance_id (the instance rides
-		// the session API), and provider.allow_fallbacks=false for official
-		// models (inverted vs the old bridge).
+		// codebuff_metadata + provider + stop/stream/tool_choice, matching the
+		// captured CLI chat body exactly (see freebuff_cli_shape.go): instance
+		// id + trace id + repo_snapshot ride the metadata; provider is
+		// {data_collection:deny}; the cb_easp stop token; stream:true;
+		// tool_choice auto; no temperature. Upstream 428s bodies that deviate.
+		traceID := freebuffClientSessionID()
+		if traceID == "" {
+			traceID = "trace-" + runID
+		}
 		meta := map[string]any{
-			"run_id":          runID,
-			"cost_mode":       "free",
-			"client_id":       freebuffClientSessionID(),
-			"llm_step_number": "1",
+			"freebuff_instance_id": actorInstanceID(p),
+			"trace_session_id":     traceID,
+			"repo_snapshot":        freebuffRepoSnapshot,
+			"llm_step_number":      "1",
+			"run_id":               runID,
+			"client_id":            freebuffClientSessionID(),
+			"cost_mode":            "free",
 		}
 
 		extraBody := make(map[string]any)
 		for k, v := range reqConfig.ExtraBody {
+			// Never pass stream_options to upstream Freebuff / Codebuff
+			if k == "stream_options" {
+				continue
+			}
 			extraBody[k] = v
 		}
 		extraBody["tools"] = finalTools
+		extraBody["tool_choice"] = "auto"
+		// NOTE: no stream:true. The CLI streams, but llmhub auto-adds
+		// stream_options.include_usage on streaming requests, which the CLI
+		// never sends; upstream accepts the non-stream body when the metadata
+		// shape is correct (live-verified 2026-09-06: 200 FLORB via curl).
+		// no stop token either in the proven minimal non-stream variant.
 		extraBody["codebuff_metadata"] = meta
-		extraBody["provider"] = map[string]any{"allow_fallbacks": false}
-		opts = append(opts, provider.WithExtraBody(extraBody))
+		extraBody["provider"] = map[string]any{"data_collection": "deny"}
+		// The CLI sends NO temperature. llmhub defaults to 0.7, so pin 0 —
+		// llmhub's omitempty then drops the field from the JSON entirely.
+		opts = append(opts,
+			provider.WithTemperature(0),
+			provider.WithoutExtraKey("stream_options", "temperature"),
+			provider.WithExtraBody(extraBody))
 	}
 
-	return ctx, msgs, opts, nil
+	return ctx, msgs, opts, runID, nil
 }
 
 // hubTokenSource narrows a lane token source down to plain Token() for the
@@ -706,15 +735,17 @@ func (p *Provider) TokenExpiresAt() (time.Time, bool) {
 
 // Generate implements provider.InferenceProvider.
 func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (*ir.Response, error) {
+	// Freebuff: single Acquire here; Generate calls adapter.Generate directly
+	// (never p.Stream), so the single-slot lock cannot deadlock.
 	if actor := p.freebuffActor(); actor != nil {
 		if err := actor.Acquire(ctx); err != nil {
 			return nil, err
 		}
 		defer actor.Release()
 	}
-
 	var err error
-	ctx, msgs, opts, err = p.applyRequestTransforms(ctx, msgs, opts)
+	var runID string
+	ctx, msgs, opts, runID, err = p.applyRequestTransforms(ctx, msgs, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -728,12 +759,20 @@ func (p *Provider) Generate(ctx context.Context, msgs []*ir.Message, opts ...pro
 			resp, err = p.adapter.Generate(ctx, msgs, opts...)
 		}
 		if err != nil {
+			if rf, ok := p.cfg.Quirks.FreebuffActor.(freebuffRunFinisher); ok && runID != "" {
+				_ = rf.FinishRun(ctx, runID, "failed", err)
+			}
 			return nil, err
 		}
 	}
 
+	if rf, ok := p.cfg.Quirks.FreebuffActor.(freebuffRunFinisher); ok && runID != "" {
+		_ = rf.FinishRun(ctx, runID, "completed", nil)
+	}
+
 	return filterReasoningResponse(resp, p.cfg.Quirks.EchoReasoning), nil
 }
+
 
 // Stream implements provider.InferenceProvider.
 func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provider.Option) (<-chan ir.Event, error) {
@@ -745,7 +784,8 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 	}
 
 	var err error
-	ctx, msgs, opts, err = p.applyRequestTransforms(ctx, msgs, opts)
+	var runID string
+	ctx, msgs, opts, runID, err = p.applyRequestTransforms(ctx, msgs, opts)
 	if err != nil {
 		if actor != nil {
 			actor.Release()
@@ -775,13 +815,29 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 		go func() {
 			defer close(actorCh)
 			defer actor.Release()
+			var streamErr error
+			defer func() {
+				if rf, ok := p.cfg.Quirks.FreebuffActor.(freebuffRunFinisher); ok && runID != "" {
+					finalStatus := "completed"
+					if streamErr != nil {
+						finalStatus = "failed"
+					}
+					_ = rf.FinishRun(context.Background(), runID, finalStatus, streamErr)
+				}
+			}()
 			for {
 				select {
 				case <-ctx.Done():
+					streamErr = ctx.Err()
 					return
 				case ev, ok := <-inCh:
 					if !ok {
 						return
+					}
+					if errEv, ok := ev.(ir.EventUpstreamError); ok {
+						streamErr = fmt.Errorf("%s: %s", errEv.Kind, errEv.Message)
+					} else if errEvPtr, ok := ev.(*ir.EventUpstreamError); ok && errEvPtr != nil {
+						streamErr = fmt.Errorf("%s: %s", errEvPtr.Kind, errEvPtr.Message)
 					}
 					// The send must stay cancellable: a caller that stops
 					// draining the stream (client disconnect, failover) would
@@ -789,6 +845,7 @@ func (p *Provider) Stream(ctx context.Context, msgs []*ir.Message, opts ...provi
 					// hold the actor's single-slot lock forever.
 					select {
 					case <-ctx.Done():
+						streamErr = ctx.Err()
 						return
 					case actorCh <- ev:
 					}

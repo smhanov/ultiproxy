@@ -749,8 +749,10 @@ func TestOpenAICompat_FreebuffInstanceHeaderAfterBind(t *testing.T) {
 	mu.Lock()
 	got := chatInstHeader
 	mu.Unlock()
-	if got != "fb-minted-42" {
-		t.Errorf("chat x-freebuff-instance-id = %q, want the post-bind minted id (session keying)", got)
+	// 2026-09-06 CLI capture: NO instance header on chat; the instance rides
+	// codebuff_metadata.freebuff_instance_id instead.
+	if got != "" {
+		t.Errorf("chat x-freebuff-instance-id = %q, want ABSENT (metadata carries the instance)", got)
 	}
 }
 
@@ -977,11 +979,13 @@ func TestOpenAICompat_FreebuffActorLock(t *testing.T) {
 
 	firstPayload := payloads[0]
 
-	// Check Buffy system prompt injected at message 0
+	// Check the CLI's Buffy system prompt injected at message 0 (starts with
+	// the captured 4KB prompt; ends with the current-date placeholder fill).
 	rawMsgs := firstPayload["messages"].([]any)
 	sysMsg := rawMsgs[0].(map[string]any)
-	if sysMsg["role"] != "system" || sysMsg["content"] != "You are Buffy, the coding agent behind Codebuff." {
-		t.Errorf("expected Buffy system prompt, got %+v", sysMsg)
+	sysContent, _ := sysMsg["content"].(string)
+	if sysMsg["role"] != "system" || !strings.HasPrefix(sysContent, "You are Buffy, the coding agent behind Codebuff.") {
+		t.Errorf("expected Buffy system prompt, got %.80s", sysContent)
 	}
 
 	// Check default tool injected
@@ -1003,12 +1007,9 @@ func TestOpenAICompat_FreebuffActorLock(t *testing.T) {
 	if meta["cost_mode"] != "free" {
 		t.Errorf("expected cost_mode 'free', got %v", meta["cost_mode"])
 	}
-	if _, present := meta["freebuff_instance_id"]; present {
-		t.Errorf("freebuff_instance_id must be absent from metadata (binary omits it), got %v", meta["freebuff_instance_id"])
-	}
-	// The instance id rides session calls, not the chat request.
-	if inst := actor.InstanceID(); inst != "fb-inst-007" {
-		t.Errorf("actor instance id = %q, want fb-inst-007 (retained for session API)", inst)
+	// 2026-09-06 CLI capture: the instance id rides the chat metadata.
+	if got, _ := meta["freebuff_instance_id"].(string); got != "fb-inst-007" {
+		t.Errorf("freebuff_instance_id = %v, want the actor's instance fb-inst-007", meta["freebuff_instance_id"])
 	}
 }
 

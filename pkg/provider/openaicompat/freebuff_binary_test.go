@@ -94,20 +94,20 @@ func TestFreebuff_BinaryIdenticalChatRequest(t *testing.T) {
 		t.Fatal("chat request not observed")
 	}
 
-	// Headers: authorization, interpolated-version UA, acting user id. No
-	// instance header on chat (binary truth).
+	// Headers: authorization, CLI composite UA, acting user id. The instance
+	// header is ABSENT on chat (the current CLI carries the instance in
+	// codebuff_metadata instead; captured 2026-09-06).
 	if got := h.Get("Authorization"); got != "Bearer tok-1" {
 		t.Errorf("Authorization = %q", got)
 	}
-	if got := h.Get("User-Agent"); got != "ai-sdk/openai-compatible/0.0.167/codebuff" {
-		t.Errorf("User-Agent = %q, want the version-interpolated official format", got)
+	if got := h.Get("User-Agent"); got != freebuffCLIUserAgent {
+		t.Errorf("User-Agent = %q, want the CLI composite UA", got)
 	}
 	if got := h.Get("x-freebuff-acting-user-id"); got != "usr-2222" {
 		t.Errorf("x-freebuff-acting-user-id = %q, want the runtime /me id", got)
 	}
-	// Instance header present (session keying — without it chat 428s).
-	if got := h.Get("x-freebuff-instance-id"); got != "fb-inst-1" {
-		t.Errorf("x-freebuff-instance-id on chat = %q, want the actor's session instance", got)
+	if got := h.Get("x-freebuff-instance-id"); got != "" {
+		t.Errorf("x-freebuff-instance-id on chat = %q, want ABSENT (metadata carries it)", got)
 	}
 
 	// Body model: canonical publisher id.
@@ -132,20 +132,27 @@ func TestFreebuff_BinaryIdenticalChatRequest(t *testing.T) {
 	if got, _ := meta["cost_mode"].(string); got != "free" {
 		t.Errorf("cost_mode = %q", got)
 	}
-	if _, ok := meta["freebuff_instance_id"]; ok {
-		t.Errorf("freebuff_instance_id must NOT be in metadata (binary omits it)")
+	// The instance id now rides the metadata (captured CLI truth).
+	if got, _ := meta["freebuff_instance_id"].(string); got != "fb-inst-1" {
+		t.Errorf("freebuff_instance_id = %q, want the actor's instance (metadata carries it)", got)
+	}
+	if got, _ := meta["trace_session_id"].(string); got == "" {
+		t.Error("trace_session_id missing; CLI sends it")
+	}
+	if got, _ := meta["repo_snapshot"].(string); !strings.Contains(got, "gitAvailable") {
+		t.Errorf("repo_snapshot = %q, want the CLI's stringified repo stats JSON", got)
 	}
 
-	// provider: allow_fallbacks false for official models, no order key.
+	// provider: {data_collection:deny} — the CLI's shape (captured).
 	prov, _ := body["provider"].(map[string]any)
 	if prov == nil {
 		t.Fatal("missing provider object")
 	}
-	if got, ok := prov["allow_fallbacks"].(bool); !ok || got {
-		t.Errorf("provider.allow_fallbacks = %v, want false for official models", prov["allow_fallbacks"])
+	if got, _ := prov["data_collection"].(string); got != "deny" {
+		t.Errorf("provider.data_collection = %v, want \"deny\"", prov["data_collection"])
 	}
-	if _, ok := prov["order"]; ok {
-		t.Errorf("provider.order must be absent for non-openrouter-claude models")
+	if _, ok := prov["allow_fallbacks"]; ok {
+		t.Error("provider.allow_fallbacks must be absent (CLI sends data_collection only)")
 	}
 
 	// Tools: at least the read_files fallback.

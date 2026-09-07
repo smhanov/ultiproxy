@@ -45,6 +45,18 @@ func (a *freebuffActorAdapter) StartRun(ctx context.Context, model string) (any,
 	return a.actor.StartRun(ctx, model)
 }
 
+func (a *freebuffActorAdapter) FinishRun(ctx context.Context, runID, status string, err error) error {
+	return a.actor.FinishRun(ctx, runID, status, err)
+}
+
+func (a *freebuffActorAdapter) StartHeartbeat() {
+	a.actor.StartHeartbeat()
+}
+
+func (a *freebuffActorAdapter) StopHeartbeat() {
+	a.actor.StopHeartbeat()
+}
+
 // SetToken pushes a token into the actor (used by the freebuff login flow).
 func (a *freebuffActorAdapter) SetToken(tok string) {
 	a.actor.SetToken(tok)
@@ -369,12 +381,13 @@ func registerProviders(registry *provider.Registry) {
 			} else {
 				if p, err := openaicompat.New(openaicompat.Config{
 					Name:    "freebuff",
-					BaseURL: "https://www.codebuff.com/api/v1",
+					BaseURL: fbLaneBaseURL(),
 					APIKey:  fbTok,
 					DataDir: stateDir,
 					Quirks: openaicompat.Quirks{
 						FreebuffActor:       fbActor,
 						FreebuffDefaultTool: true,
+						FreebuffValidate:    true,
 					},
 				}); err == nil {
 					add("freebuff", p.Provider())
@@ -384,6 +397,16 @@ func registerProviders(registry *provider.Registry) {
 			}
 		}
 	}
+}
+
+// fbLaneBaseURL returns the freebuff lane's upstream base URL. Overridable via
+// ULTIPROXY_FREEBUFF_BASE_URL for local capture/debug builds; production
+// default is the Codebuff API.
+func fbLaneBaseURL() string {
+	if u := firstEnv("ULTIPROXY_FREEBUFF_BASE_URL"); u != "" {
+		return u
+	}
+	return "https://www.codebuff.com/api/v1"
 }
 
 // freebuffToken discovers the Codebuff/Freebuff token from ultiproxy-owned
