@@ -335,6 +335,12 @@ Any other OpenAI-compatible upstream (OpenRouter-style gateways, llama.cpp, TGI,
 
 ---
 
+## Troubleshooting
+
+**`bind: address already in use` on startup.** The daemon exits non-zero when its listen address is taken and prints a hint naming `ULTIPROXY_ADDR`. The usual collision is the default port: `127.0.0.1:9050` is also Tor's SOCKS port, so on a machine running Tor (or a second ultiproxy) bind something else instead — e.g. `ULTIPROXY_ADDR=127.0.0.1:9051 ultiproxy serve`. The default stays `127.0.0.1:9050` everywhere else in these docs. A client pointed at a port owned by another service gets that service's answer (Tor replies with an HTML "This is a SOCKS proxy" page), so if responses look alien, check what actually owns the port before debugging the proxy.
+
+---
+
 ## Contributing
 
 Pull requests are welcome! Ensure you adhere to the project standards:

@@ -2,15 +2,42 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 	"github.com/smhanov/ultiproxy/pkg/server"
 )
+
+// TestIsAddrInUse classifies bind-conflict errors for the startup hint (T005):
+// raw EADDRINUSE, wrapped EADDRINUSE, wrapped other error, nil.
+func TestIsAddrInUse(t *testing.T) {
+	if !isAddrInUse(syscall.EADDRINUSE) {
+		t.Error("isAddrInUse(raw EADDRINUSE) = false, want true")
+	}
+	if !isAddrInUse(fmt.Errorf("listen: %w", syscall.EADDRINUSE)) {
+		t.Error("isAddrInUse(wrapped EADDRINUSE) = false, want true")
+	}
+	// Portable fallback: a non-errno error carrying the bind-conflict text
+	// (e.g. from a platform without syscall.EADDRINUSE) still counts.
+	if !isAddrInUse(fmt.Errorf("listen tcp 127.0.0.1:9050: bind: address already in use")) {
+		t.Error("isAddrInUse(substring fallback) = false, want true")
+	}
+	if isAddrInUse(fmt.Errorf("listen: %w", syscall.EACCES)) {
+		t.Error("isAddrInUse(wrapped EACCES) = true, want false")
+	}
+	if isAddrInUse(fmt.Errorf("tls: certificate invalid")) {
+		t.Error("isAddrInUse(non-bind error) = true, want false")
+	}
+	if isAddrInUse(nil) {
+		t.Error("isAddrInUse(nil) = true, want false")
+	}
+}
 
 func TestExampleConfigValid(t *testing.T) {
 	cfg, err := server.LoadConfig("config.example.yaml")

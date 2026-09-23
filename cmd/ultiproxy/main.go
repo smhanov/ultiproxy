@@ -61,6 +61,20 @@ func main() {
 	}
 }
 
+// isAddrInUse reports whether err is a bind conflict (T005). It matches
+// errors.Is(err, syscall.EADDRINUSE) — which unwraps net.OpError chains —
+// with a portable "address already in use" substring fallback for platforms
+// whose errno does not map to syscall.EADDRINUSE.
+func isAddrInUse(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "address already in use")
+}
+
 func runServe(configPath, dataDir string) {
 	cfg, err := server.LoadConfig(configPath)
 	if err != nil {
@@ -117,6 +131,9 @@ func runServe(configPath, dataDir string) {
 	go func() {
 		log.Printf("Ultiproxy v%s starting on %s", version, cfg.Server.Addr)
 		if err := srv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if isAddrInUse(err) {
+				log.Fatalf("HTTP server error: %v\nHint: the address is already in use — another process (e.g. Tor's SOCKS port or a second ultiproxy) may own %s; set ULTIPROXY_ADDR=127.0.0.1:<free port> to bind elsewhere", err, cfg.Server.Addr)
+			}
 			log.Fatalf("HTTP server error: %v", err)
 		}
 	}()
