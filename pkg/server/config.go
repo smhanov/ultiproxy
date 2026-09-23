@@ -2,7 +2,9 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -56,6 +58,10 @@ func DefaultConfig() *Config {
 }
 
 // LoadConfig loads configuration from a YAML file. If path is empty, DefaultConfig is returned.
+// If path names a file that does not exist, DefaultConfig is returned with a
+// nil error: a declared-but-missing config file means "zero-config run with
+// defaults". All other read failures (permission denied, path is a
+// directory) and all parse failures still return a non-nil error.
 // Unknown YAML keys are rejected, so a config written for an older schema
 // fails loudly instead of partially applying.
 func LoadConfig(path string) (*Config, error) {
@@ -66,6 +72,9 @@ func LoadConfig(path string) (*Config, error) {
 
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return cfg, nil
+		}
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
 

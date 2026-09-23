@@ -118,6 +118,50 @@ func TestLoadConfig_ZeroConfigDefaults(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_MissingFileFallsBackToDefaults pins the T001 contract: a
+// declared-but-missing --config path behaves like the zero-config path
+// (defaults are used and startup proceeds) instead of failing startup.
+func TestLoadConfig_MissingFileFallsBackToDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "absent.yaml")
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig(missing) = %v, want nil error", err)
+	}
+	if cfg == nil {
+		t.Fatal("LoadConfig(missing) returned nil config, want defaults")
+	}
+	if cfg.Server.Addr == "" {
+		t.Error("expected default addr to be filled in for missing file")
+	}
+	if cfg.Storage.DBPath == "" {
+		t.Error("expected default db_path to be filled in for missing file")
+	}
+}
+
+// TestLoadConfig_DirectoryPathFails pins AC2: a path that is a directory must
+// still fail loudly — only fs.ErrNotExist is tolerated.
+func TestLoadConfig_DirectoryPathFails(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := LoadConfig(dir); err == nil {
+		t.Fatalf("LoadConfig(dir %q) = nil error, want non-nil", dir)
+	}
+}
+
+// TestLoadConfig_UnreadableFileFails pins AC2: a file that exists but cannot
+// be read must still fail loudly — only fs.ErrNotExist is tolerated.
+func TestLoadConfig_UnreadableFileFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: chmod 000 does not block reads")
+	}
+	path := writeTempConfig(t, "server:\n  addr: \"127.0.0.1:9050\"\n")
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatalf("LoadConfig(unreadable %q) = nil error, want non-nil", path)
+	}
+}
+
 // TestLLMsTxtServedFromEmbedWhenFileMissing reproduces the packaged-binary
 // case: there is no llms.txt next to the process, so GET /llms.txt must be
 // served from the copy embedded at build time instead of 404ing.

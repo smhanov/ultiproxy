@@ -66,6 +66,11 @@ func runServe(configPath, dataDir string) {
 	if err != nil {
 		log.Fatalf("failed to load configuration: %v", err)
 	}
+	if configPath != "" {
+		if _, statErr := os.Stat(configPath); statErr != nil && errors.Is(statErr, os.ErrNotExist) {
+			log.Printf("config file %s not found; using defaults", configPath)
+		}
+	}
 
 	if dataDir != "" {
 		cfg.DataDir = dataDir
