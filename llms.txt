@@ -205,12 +205,12 @@ curl -s http://localhost:9050/v1/messages \
 Install the precompiled binary to `~/.local/bin`; it is immediately runnable with zero configuration:
 
 ```bash
-curl -fsSL https://ultiproxy.dev/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/smhanov/ultiproxy/main/dist/install.sh | bash
 ```
 
 To review operations prior to execution:
 ```bash
-curl -fsSL https://ultiproxy.dev/install.sh | bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/smhanov/ultiproxy/main/dist/install.sh | bash -s -- --dry-run
 ```
 
 ### Systemd User Service Setup

@@ -40,7 +40,7 @@ Ultiproxy starts with **zero configuration**: nothing to author, nothing to relo
 
 ```bash
 # Precompiled binary into ~/.local/bin (no root required):
-curl -fsSL https://ultiproxy.dev/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/smhanov/ultiproxy/main/dist/install.sh | sh
 
 # ...or build from source (see the sibling-checkout note below):
 git clone https://github.com/smhanov/ultiproxy
