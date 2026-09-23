@@ -42,7 +42,7 @@ Ultiproxy starts with **zero configuration**: nothing to author, nothing to relo
 # Precompiled binary into ~/.local/bin (no root required):
 curl -fsSL https://raw.githubusercontent.com/smhanov/ultiproxy/main/dist/install.sh | sh
 
-# ...or build from source (see the sibling-checkout note below):
+# ...or build from source (this repo only):
 git clone https://github.com/smhanov/ultiproxy
 cd ultiproxy
 go build -o ultiproxy ./cmd/ultiproxy
@@ -50,27 +50,16 @@ go build -o ultiproxy ./cmd/ultiproxy
 
 The installer also installs a hardened systemd user unit on Linux. Review it first with `bash dist/install.sh --dry-run` if you prefer.
 
-<details>
-<summary><strong>Building from source: the <code>../llmhub</code> sibling checkout</strong></summary>
-
-`go.mod` resolves the provider library through a local replace:
-
-```
-replace github.com/smhanov/llmhub => ../llmhub
-```
-
-A source build therefore **requires a sibling `llmhub` checkout next to this repository** -- `go build ./cmd/ultiproxy` fails with a module-resolution error if `../llmhub` is missing:
+Building from source needs only this repository and Go **1.25** or newer
+(`go.mod` declares `go 1.25.0`). The provider library
+`github.com/smhanov/llmhub` is consumed as a normal published Go module
+pinned in `go.mod` -- no extra checkouts required:
 
 ```bash
 git clone https://github.com/smhanov/ultiproxy
-git clone https://github.com/smhanov/llmhub      # must sit beside ultiproxy
 cd ultiproxy
 go build -o ultiproxy ./cmd/ultiproxy
 ```
-
-Keep the sibling `llmhub` on its `origin/main`; upstream changes go through PRs (see `AGENTS.md`). Building Go **1.25** or newer is required (`go.mod` declares `go 1.25.0`). Release binaries have no such dependency.
-
-</details>
 
 ### 1. Start the daemon
 

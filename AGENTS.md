@@ -1,10 +1,10 @@
 # Agent notes — ultiproxy
 
-## llmhub changes MUST go through PRs
+## llmhub is a published module dependency
 
-- ultiproxy depends on `github.com/smhanov/llmhub` via a local `replace` (`go.mod`: `replace github.com/smhanov/llmhub => ../llmhub`).
-- **Never push llmhub commits to llmhub's `main` directly.** Anything needed upstream (options, fixes, provider tweaks) goes through a GitHub PR: branch off `origin/main`, `gh pr create` with the rationale, then after the maintainer merges/reviews, **pull the merged result and adapt ultiproxy to whatever API shape actually landed** — do not assume your proposed API survived.
-- llmhub's local `main` should stay in sync with `origin/main`; work on a PR branch so this `replace` keeps resolving.
+- ultiproxy consumes `github.com/smhanov/llmhub` as a normal published Go module pinned in `go.mod` (pseudo-version or tag). No extra checkouts, no `replace` directive.
+- **Never push llmhub commits to llmhub's `main` directly.** Anything needed upstream (options, fixes, provider tweaks) goes through a GitHub PR: branch off `origin/main`, `gh pr create` with the rationale, then after the maintainer merges/reviews, bump the pin here (`go get github.com/smhanov/llmhub@<version>` + `go mod tidy`) and **adapt ultiproxy to whatever API shape actually landed** — do not assume your proposed API survived.
+- Integration notes: `pkg/provider/openaicompat/openaicompat.go` builds its llmhub client with `llmhub.WithRetryOnStatus(http.StatusTooManyRequests, false)` so upstream 429s surface to clients honestly instead of being retried inside the HTTP layer (freebuff lanes additionally opt into 428 waiting-room retries). Preserve this honest-429 posture when bumping the module.
 
 ## Architecture summary (post-migration)
 
