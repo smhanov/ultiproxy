@@ -162,6 +162,90 @@ func TestLoadConfig_UnreadableFileFails(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_ExpandsTildePaths pins the T002 contract: a leading ~/ (and
+// bare ~) in path-valued keys expands to the user's home directory at load
+// time, so the example config works as printed.
+func TestLoadConfig_ExpandsTildePaths(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	body := `
+server:
+  addr: "127.0.0.1:19050"
+  llms_txt_path: "~/up-test/llms.txt"
+data_dir: "~/up-test"
+storage:
+  db_path: "~/up-test/ultiproxy.db"
+`
+	cfg, err := LoadConfig(writeTempConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if want := filepath.Join(fakeHome, "up-test"); cfg.DataDir != want {
+		t.Errorf("DataDir = %q, want %q", cfg.DataDir, want)
+	}
+	if want := filepath.Join(fakeHome, "up-test", "ultiproxy.db"); cfg.Storage.DBPath != want {
+		t.Errorf("Storage.DBPath = %q, want %q", cfg.Storage.DBPath, want)
+	}
+	if want := filepath.Join(fakeHome, "up-test", "llms.txt"); cfg.Server.LLMsTxtPath != want {
+		t.Errorf("Server.LLMsTxtPath = %q, want %q", cfg.Server.LLMsTxtPath, want)
+	}
+
+	// Bare "~" expands to the home directory itself.
+	bareBody := `
+server:
+  addr: "127.0.0.1:19050"
+data_dir: "~"
+storage:
+  db_path: "~"
+`
+	bareCfg, err := LoadConfig(writeTempConfig(t, bareBody))
+	if err != nil {
+		t.Fatalf("LoadConfig(bare ~): %v", err)
+	}
+	if bareCfg.DataDir != fakeHome {
+		t.Errorf("DataDir(bare ~) = %q, want %q", bareCfg.DataDir, fakeHome)
+	}
+	if bareCfg.Storage.DBPath != fakeHome {
+		t.Errorf("Storage.DBPath(bare ~) = %q, want %q", bareCfg.Storage.DBPath, fakeHome)
+	}
+}
+
+// TestLoadConfig_LeavesNonTildePathsAlone pins the T002 exclusions:
+// absolute and relative paths pass through unchanged, and ~user/ (other-user)
+// expansion is out of scope so it is left unexpanded rather than erroring.
+func TestLoadConfig_LeavesNonTildePathsAlone(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	cases := map[string]string{
+		"absolute":   "/var/lib/ulti/ulti.db",
+		"relative":   "ultiproxy.db",
+		"other-user": "~foo/bar",
+	}
+	for name, dbPath := range cases {
+		t.Run(name, func(t *testing.T) {
+			body := `
+server:
+  addr: "127.0.0.1:19050"
+data_dir: "` + dbPath + `"
+storage:
+  db_path: "` + dbPath + `"
+`
+			cfg, err := LoadConfig(writeTempConfig(t, body))
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			if cfg.Storage.DBPath != dbPath {
+				t.Errorf("Storage.DBPath = %q, want %q unchanged", cfg.Storage.DBPath, dbPath)
+			}
+			if cfg.DataDir != dbPath {
+				t.Errorf("DataDir = %q, want %q unchanged", cfg.DataDir, dbPath)
+			}
+		})
+	}
+}
+
 // TestLLMsTxtServedFromEmbedWhenFileMissing reproduces the packaged-binary
 // case: there is no llms.txt next to the process, so GET /llms.txt must be
 // served from the copy embedded at build time instead of 404ing.

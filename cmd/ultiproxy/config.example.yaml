@@ -149,6 +149,8 @@ server:
     vllm: "10m"
 
 storage:
+  # A leading ~/ (or bare ~) is expanded to your home directory at load time.
   db_path: "~/.local/state/ultiproxy/ultiproxy.db"
 
+# A leading ~/ (or bare ~) is expanded to your home directory at load time.
 data_dir: "~/.local/state/ultiproxy"

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -57,6 +58,24 @@ func DefaultConfig() *Config {
 	return cfg
 }
 
+// expandPath expands a leading "~" (bare home) or "~/" to the current
+// user's home directory. "~user/" (other-user) expansion is out of scope
+// and is left untouched, as are absolute and relative paths. If the home
+// directory cannot be determined, the value is returned unchanged.
+func expandPath(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return p
+	}
+	if p == "~" {
+		return home
+	}
+	return home + p[1:]
+}
+
 // LoadConfig loads configuration from a YAML file. If path is empty, DefaultConfig is returned.
 // If path names a file that does not exist, DefaultConfig is returned with a
 // nil error: a declared-but-missing config file means "zero-config run with
@@ -103,6 +122,9 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Server.ClientKeys == nil {
 		cfg.Server.ClientKeys = make(map[string]string)
 	}
+	cfg.Storage.DBPath = expandPath(cfg.Storage.DBPath)
+	cfg.DataDir = expandPath(cfg.DataDir)
+	cfg.Server.LLMsTxtPath = expandPath(cfg.Server.LLMsTxtPath)
 
 	return cfg, nil
 }
