@@ -119,13 +119,15 @@ func TestMCPRefreshModels_UpstreamError(t *testing.T) {
 }
 
 // TestMCPRefreshModels_MissingArgument: no lane name is a tool error.
+// T006 AC3: provider is required going forward, name stays as a deprecated
+// alias — the error names provider while still accepting name.
 func TestMCPRefreshModels_MissingArgument(t *testing.T) {
 	srv := NewServer(provider.NewRegistry(), newStubStateSource())
 	res := callMCPTool(t, srv, 5, "refresh_models", `{}`)
 	if !res.IsError {
 		t.Fatalf("expected an error result, got %+v", res)
 	}
-	if !strings.Contains(res.Content[0].Text, "name argument is required") {
-		t.Errorf("message = %q, want a missing-argument error", res.Content[0].Text)
+	if !strings.Contains(res.Content[0].Text, "provider argument is required") {
+		t.Errorf("message = %q, want a missing-argument error naming provider", res.Content[0].Text)
 	}
 }

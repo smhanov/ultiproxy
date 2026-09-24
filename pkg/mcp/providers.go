@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 )
@@ -36,6 +37,30 @@ type ProviderStore interface {
 	Remove(name string) error
 	// List returns the stored lane configs keyed by lane name.
 	List() map[string]openaicompat.Config
+}
+
+// xaiOAuthClientID mirrors openaicompat's compiled-in xAI OAuth client id (the
+// credential key the OAuth manager token source uses). It is duplicated here
+// because the constant is unexported; the value is public knowledge (the xAI
+// CLI ships it). Keep in lockstep with
+// pkg/provider/openaicompat/quirks_auth.go defaultXAIClientID and
+// pkg/server/credential_refresh_test.go xaiClientID.
+const xaiOAuthClientID = "b1a00492-073a-47ea-816f-4c329264a828"
+
+// oauthCredentialMissing reports whether an OAuth lane has no stored credential
+// to discover with. It is the non-minting Peek probe (probing must never mint
+// a token): true only when the lane wants OAuth and the store is present but
+// holds nothing for the lane's credential key. A missing store returns false
+// so the caller omits auth fields rather than lying.
+func oauthCredentialMissing(cfg openaicompat.Config, creds auth.CredentialStore) bool {
+	if !cfg.Quirks.AuthViaOAuthManager {
+		return false
+	}
+	if creds == nil {
+		return false
+	}
+	_, ok := creds.Peek(xaiOAuthClientID)
+	return !ok
 }
 
 // laneRebuilder is implemented by the real RuntimeProviderStore
@@ -389,6 +414,25 @@ func (s *Server) toolAddProvider(ctx context.Context, argsRaw json.RawMessage) (
 	// Synchronous model discovery, BEFORE replying: the reply then states what
 	// the lane serves (its "<lane>/<model>" ids are already routable and
 	// already on /v1/models) and the caller needs no refresh_models follow-up.
+	// T006 AC1: an OAuth lane with no stored credential skips the doomed
+	// upstream 401 entirely and reports the actionable truth instead: the
+	// lane IS registered, but login is required. The Peek probe never mints
+	// a token. Keys match T004's completedLoginReply (discovered_models,
+	// note) plus login_required / next_action.
+	if oauthCredentialMissing(cfg, s.creds) {
+		note := fmt.Sprintf("login required — call initiate_oauth_login for %q", cfg.Name)
+		summary := fmt.Sprintf("discovered 0 models (%s)", note)
+		return toolJSON(map[string]any{
+			"registered":        true,
+			"name":              cfg.Name,
+			"lane":              cfg.Name,
+			"discovered_models": 0,
+			"summary":           summary,
+			"note":              note,
+			"login_required":    true,
+			"next_action":       "initiate_oauth_login",
+		}), nil
+	}
 	discovered, note := discoverModelsForReply(ctx, cfg.Name, p.Provider())
 	summary := fmt.Sprintf("discovered %d models", discovered)
 	if note != "" {
@@ -518,7 +562,7 @@ func (s *Server) toolListProviders(ctx context.Context) (*CallToolResult, *JSONR
 	lanes := make([]map[string]any, 0, len(stored))
 	for _, name := range names {
 		cfg := stored[name]
-		lanes = append(lanes, map[string]any{
+		row := map[string]any{
 			"name":           name,
 			"base_url":       cfg.BaseURL,
 			"has_api_key":    cfg.APIKey != "",
@@ -535,7 +579,22 @@ func (s *Server) toolListProviders(ctx context.Context) (*CallToolResult, *JSONR
 				"default_model":             cfg.Quirks.DefaultModel,
 				"max_tokens_by_model":       cfg.Quirks.MaxTokensByModel,
 			},
-		})
+		}
+		// T006 AC2: OAuth lanes report logged_in + token_expires_at via the
+		// non-minting Peek probe. No token material ever leaves the store:
+		// only a presence boolean and an RFC3339 expiry. A missing store or
+		// a non-OAuth lane omits both fields rather than lying.
+		if cfg.Quirks.AuthViaOAuthManager && s.creds != nil {
+			if cred, ok := s.creds.Peek(xaiOAuthClientID); ok {
+				row["logged_in"] = true
+				if !cred.ExpiresAt.IsZero() {
+					row["token_expires_at"] = cred.ExpiresAt.UTC().Format(time.RFC3339)
+				}
+			} else {
+				row["logged_in"] = false
+			}
+		}
+		lanes = append(lanes, row)
 	}
 
 	registryLanes := []string{}

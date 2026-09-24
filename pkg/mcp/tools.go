@@ -252,6 +252,7 @@ Parameters:
 - base_url: upstream base URL, required for OpenAI-compatible lanes, e.g. "https://api.deepseek.com/v1". Custom-wire lanes ignore it - they know their endpoints.
 - api_key: static key. Required for kind=anthropic; optional elsewhere (public or local lanes work without one).
 - the reply reports how many upstream models the new lane serves ("discovered N models"); discovery runs automatically, so no follow-up call is needed
+- reply JSON keys: registered, name, lane, discovered_models, summary; an OAuth lane (quirks.auth_via_oauth_manager) with no stored credential yet skips the doomed upstream 401 and instead replies login_required:true with next_action:"initiate_oauth_login" plus note:"login required — call initiate_oauth_login for <lane>" (same discovered_models/note keys as check_oauth_login/submit_oauth_code)
 - quirks (object, OpenAI-compatible lanes only): vendor behaviour switches
   - coding_plan_path: route through a coding-plan path (zai-style coding subscriptions)
   - max_tokens_by_model: map of upstream model id -> max_tokens that upstream accepts, e.g. {"glm-4.6":8192}
@@ -301,25 +302,26 @@ Aliases pointing at the lane are left in place but stop resolving - repoint them
 		Name: "list_providers",
 		Description: `List every provider lane the proxy knows about, in two groups:
 
-- providers[]: lanes registered at runtime through add_provider, each with name, base_url, has_api_key (a boolean - the key itself is never returned), auth_via_oauth and the full quirks set
+- providers[]: lanes registered at runtime through add_provider, each with name, base_url, has_api_key (a boolean - the key itself is never returned), auth_via_oauth and the full quirks set; OAuth lanes (quirks.auth_via_oauth_manager) additionally carry logged_in (bool, via a non-minting credential peek) and token_expires_at (RFC3339, omitted when not applicable - no credential, no expiry, non-OAuth lane, or no credential store). No token material is ever returned.
 - registry_lanes[]: every lane in the live registry, including compiled/in-memory lanes that live only in the process (env-credential or OAuth-credential lanes)
 
-Secrets are always redacted. Use this to discover valid provider names before calling add_provider / set_model_alias / get_quota_status / set_provider_timeout, and to confirm a lane you just added is actually live. Per-lane health and quota live in get_quota_status.`,
+Secrets are always redacted. Use this to discover valid provider names before calling add_provider / set_model_alias / get_quota_status / set_provider_timeout, and to confirm a lane you just added is actually live. When the credential store is not wired, logged_in/token_expires_at are omitted rather than guessed. Per-lane health and quota live in get_quota_status.`,
 		InputSchema: &InputSchema{Type: "object", Properties: map[string]PropertyDef{}},
 	},
 	{
 		Name: "refresh_models",
 		Description: `Re-fetch and cache a lane's upstream model list (GET <base_url>/v1/models) so those ids show up as "<lane>/<model>" on GET /v1/models and can be routed directly or aliased.
 
-name: the lane to refresh, e.g. "opencode", "vllm", "deepseek".
+provider: the lane to refresh, e.g. "opencode", "vllm", "deepseek" (required going forward). name is accepted as a deprecated alias for back-compat; behavior is identical either way.
 
-Discovery is automatic: every OpenAI-compatible lane discovers when it is registered (add_provider reports the count), lanes whose cache is still empty are re-discovered at daemon startup, and every discovery lane is refreshed every 6h (model_list_passthrough:false opts a lane out of all of it). This tool is the manual override on top of that schedule (10s budget): use it to pick up an upstream change right now instead of waiting for the next tick. It answers "N models cached for lane <name>". Lanes without model discovery (custom-wire lanes such as antigravity, codex, anthropic) answer "does not support model discovery", though prefix routing "<lane>/<model>" still works for them.`,
+Discovery is automatic: every OpenAI-compatible lane discovers when it is registered (add_provider reports the count), lanes whose cache is still empty are re-discovered at daemon startup, and every discovery lane is refreshed every 6h (model_list_passthrough:false opts a lane out of all of it). This tool is the manual override on top of that schedule (10s budget): use it to pick up an upstream change right now instead of waiting for the next tick. It answers "N models cached for lane <provider>". Lanes without model discovery (custom-wire lanes such as antigravity, codex, anthropic) answer "does not support model discovery", though prefix routing "<lane>/<model>" still works for them.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
-				"name": {Type: "string", Description: "Provider lane name to re-discover models for, e.g. opencode, vllm"},
+				"provider": {Type: "string", Description: "Provider lane name to re-discover models for, e.g. opencode, vllm (required going forward)"},
+				"name":     {Type: "string", Description: "Deprecated alias for provider; accepted for back-compat"},
 			},
-			Required: []string{"name"},
+			Required: []string{"provider"},
 		},
 	},
 	{
@@ -1345,28 +1347,36 @@ type modelsFetcher interface {
 // registered before startup model discovery existed have an empty cache, so
 // the aggregated /v1/models handler only lists the bare "<lane>" id. This tool
 // re-runs discovery on demand instead of forcing the lane to be re-added.
+//
+// T006 AC3: accepts provider (required going forward) with name as a
+// deprecated alias for back-compat; behavior is identical either way.
 func (s *Server) toolRefreshModels(ctx context.Context, argsRaw json.RawMessage) (*CallToolResult, *JSONRPCError) {
 	var args struct {
-		Name string `json:"name"`
+		Provider string `json:"provider"`
+		Name     string `json:"name"`
 	}
 	_ = json.Unmarshal(argsRaw, &args)
-	if args.Name == "" {
+	lane := args.Provider
+	if lane == "" {
+		lane = args.Name
+	}
+	if lane == "" {
 		return &CallToolResult{
-			Content: []ToolContent{{Type: "text", Text: "error: name argument is required"}},
+			Content: []ToolContent{{Type: "text", Text: "error: provider argument is required (name is a deprecated alias)"}},
 			IsError: true,
 		}, nil
 	}
 
 	notFound := func() *CallToolResult {
 		return &CallToolResult{
-			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: lane %s not found", args.Name)}},
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: lane %s not found", lane)}},
 			IsError: true,
 		}
 	}
 	if s.registry == nil {
 		return notFound(), nil
 	}
-	bundle, ok := s.registry.Get(args.Name)
+	bundle, ok := s.registry.Get(lane)
 	if !ok {
 		return notFound(), nil
 	}
@@ -1375,7 +1385,7 @@ func (s *Server) toolRefreshModels(ctx context.Context, argsRaw json.RawMessage)
 	fetcher, ok := bundle.Inference.(modelsFetcher)
 	if !ok {
 		return &CallToolResult{
-			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: lane %s does not support model discovery", args.Name)}},
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: lane %s does not support model discovery", lane)}},
 			IsError: true,
 		}, nil
 	}
@@ -1385,13 +1395,13 @@ func (s *Server) toolRefreshModels(ctx context.Context, argsRaw json.RawMessage)
 	models, err := fetcher.FetchModels(fetchCtx)
 	if err != nil {
 		return &CallToolResult{
-			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: fetching models for lane %s: %v", args.Name, err)}},
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("error: fetching models for lane %s: %v", lane, err)}},
 			IsError: true,
 		}, nil
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "%d models cached for lane %s\n", len(models), args.Name)
+	fmt.Fprintf(&sb, "%d models cached for lane %s\n", len(models), lane)
 	for _, m := range models {
 		sb.WriteString(m)
 		sb.WriteByte('\n')
