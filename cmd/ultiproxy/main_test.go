@@ -12,6 +12,7 @@ import (
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 	"github.com/smhanov/ultiproxy/pkg/server"
+	"github.com/smhanov/ultiproxy/pkg/storage"
 )
 
 // TestIsAddrInUse classifies bind-conflict errors for the startup hint (T005):
@@ -81,6 +82,79 @@ func TestExampleConfigValid(t *testing.T) {
 	}
 	if cfg.Storage.DBPath == "" {
 		t.Errorf("expected DBPath set, got empty")
+	}
+}
+
+// TestEnsureServeDirsNestedParent (T007): a hand-written config pointing at
+// fresh nested paths must start — the helper creates the SQLite parent and
+// the data dir so storage.NewWriter then succeeds.
+func TestEnsureServeDirsNestedParent(t *testing.T) {
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "fresh", "nested", "ultiproxy.db")
+	dataDir := filepath.Join(base, "fresh", "state")
+
+	if err := ensureServeDirs(dbPath, dataDir); err != nil {
+		t.Fatalf("ensureServeDirs: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "fresh", "nested")); err != nil {
+		t.Fatalf("DB parent not created: %v", err)
+	}
+	if _, err := os.Stat(dataDir); err != nil {
+		t.Fatalf("data dir not created: %v", err)
+	}
+
+	w, err := storage.NewWriter(dbPath)
+	if err != nil {
+		t.Fatalf("NewWriter after ensureServeDirs: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("DB file not created at %s: %v", dbPath, err)
+	}
+}
+
+// TestEnsureServeDirsNewWriterAloneFails documents why the helper exists:
+// storage.NewWriter opens the path directly (SQLite creates the file, never
+// missing parents), so without the serve-layer MkdirAll a fresh nested path
+// fails. Storage semantics are intentionally unchanged by T007.
+func TestEnsureServeDirsNewWriterAloneFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "no-such-parent", "ultiproxy.db")
+	w, err := storage.NewWriter(dbPath)
+	if err == nil {
+		w.Close()
+		t.Fatalf("NewWriter(%s) succeeded without the parent dir, want failure", dbPath)
+	}
+}
+
+// TestEnsureServeDirsNoops covers the default/relative case: a bare filename
+// (parent ".") and "."/empty data dir perform no filesystem writes and never
+// fail.
+func TestEnsureServeDirsNoops(t *testing.T) {
+	for _, dataDir := range []string{".", ""} {
+		if err := ensureServeDirs("just-a-file.db", dataDir); err != nil {
+			t.Errorf("ensureServeDirs(just-a-file.db, %q) = %v, want nil", dataDir, err)
+		}
+	}
+}
+
+// TestEnsureServeDirsFileInTheWay covers the fail-loud path (AC2): a regular
+// file where a directory should be makes MkdirAll fail with ENOTDIR —
+// effective even when running as root, unlike permission-bit tricks — and the
+// error names the offending path so the runServe log.Fatalf line is actionable.
+func TestEnsureServeDirsFileInTheWay(t *testing.T) {
+	base := t.TempDir()
+	blocker := filepath.Join(base, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker file: %v", err)
+	}
+	err := ensureServeDirs(filepath.Join(blocker, "ultiproxy.db"), filepath.Join(base, "state"))
+	if err == nil {
+		t.Fatal("ensureServeDirs with a file in place of the parent = nil, want error")
+	}
+	if !strings.Contains(err.Error(), blocker) {
+		t.Errorf("error %q does not name the offending path %q", err, blocker)
 	}
 }
 

@@ -75,6 +75,29 @@ func isAddrInUse(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "address already in use")
 }
 
+// ensureServeDirs creates the SQLite parent directory and the data directory
+// (T007) so a hand-written config pointing at fresh paths works without the
+// installer having pre-created them. SQLite creates the database file but
+// never missing parents, and only catalog JSON writes MkdirAll — so without
+// this, serve would die with "unable to open database file". A bare filename
+// (parent ".") and an empty data dir are no-ops. Mode 0o755 mirrors what
+// dist/install.sh `mkdir -p` produces for STATE_DIR. Errors (permission
+// denied, a regular file in place of a directory, ...) are returned for the
+// caller to fail loudly; nothing outside these two roots is touched.
+func ensureServeDirs(dbPath, dataDir string) error {
+	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create SQLite parent dir %s: %w", dir, err)
+		}
+	}
+	if dataDir != "" && dataDir != "." {
+		if err := os.MkdirAll(dataDir, 0o755); err != nil {
+			return fmt.Errorf("create data dir %s: %w", dataDir, err)
+		}
+	}
+	return nil
+}
+
 func runServe(configPath, dataDir string) {
 	cfg, err := server.LoadConfig(configPath)
 	if err != nil {
@@ -91,6 +114,14 @@ func runServe(configPath, dataDir string) {
 		if !filepath.IsAbs(cfg.Storage.DBPath) {
 			cfg.Storage.DBPath = filepath.Join(dataDir, cfg.Storage.DBPath)
 		}
+	}
+
+	// T007: a hand-written config may point at fresh paths the installer
+	// never created (SQLite creates the file, not missing parents), so
+	// create the DB parent and the data dir here. Failures abort startup
+	// loudly instead of dying later inside storage init.
+	if err := ensureServeDirs(cfg.Storage.DBPath, cfg.DataDir); err != nil {
+		log.Fatalf("failed to create serve directories: %v", err)
 	}
 
 	// Initialize storage writer
