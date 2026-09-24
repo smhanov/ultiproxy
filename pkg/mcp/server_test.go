@@ -426,7 +426,7 @@ func (s *fileProviderStore) Add(cfg openaicompat.Config) error {
 }
 
 // Enrich mirrors RuntimeProviderStore.Enrich for the discovery flag (the test
-// double has no DataDir, Creds store or actor builder to inject).
+// double has no TokenFile derivation, Creds store or actor builder to inject).
 func (s *fileProviderStore) Enrich(cfg openaicompat.Config) openaicompat.Config {
 	cfg.Quirks.ModelListPassthrough = openaicompat.ModelListPassthroughEnabled(cfg)
 	return cfg

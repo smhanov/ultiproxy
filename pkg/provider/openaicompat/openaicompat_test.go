@@ -1512,13 +1512,10 @@ func TestOpenAICompat_Login_ErrNotImplemented(t *testing.T) {
 }
 
 func TestOpenAICompat_Login_Freebuff(t *testing.T) {
-	tempDir := t.TempDir()
-
 	actor := &fakeActor{instanceID: "fb-inst-007"}
 	p, err := New(Config{
 		BaseURL:    "https://codebuff.invalid",
 		APIKey:     "secret-freebuff-tok",
-		DataDir:    tempDir,
 		HTTPClient: http.DefaultClient,
 		Quirks: Quirks{
 			FreebuffActor:       actor,
@@ -1538,14 +1535,9 @@ func TestOpenAICompat_Login_Freebuff(t *testing.T) {
 		t.Errorf("expected actor token secret-freebuff-tok, got %q", actor.Token())
 	}
 
-	// Verify token was persisted to freebuff_token
-	persistedTok, err := os.ReadFile(filepath.Join(tempDir, "freebuff_token"))
-	if err != nil {
-		t.Fatalf("failed to read persisted token: %v", err)
-	}
-	if strings.TrimSpace(string(persistedTok)) != "secret-freebuff-tok" {
-		t.Errorf("persisted token = %q, want secret-freebuff-tok", strings.TrimSpace(string(persistedTok)))
-	}
+	// Token persistence on disk is daemon-owned (cmd/ultiproxy persists on
+	// lane build, T010): Login only adopts the token into the actor and the
+	// in-memory key, never writing files itself.
 
 	// Verify Token() returns the imported token
 	tok, err := p.Token(context.Background())

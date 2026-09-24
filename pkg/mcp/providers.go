@@ -307,7 +307,7 @@ func laneConfigsDrifted(built, stored openaicompat.Config) bool {
 	if built.Name != stored.Name ||
 		built.BaseURL != stored.BaseURL ||
 		built.APIKey != stored.APIKey ||
-		built.DataDir != stored.DataDir ||
+		built.TokenFile != stored.TokenFile ||
 		built.OptOutModelListPassthrough != stored.OptOutModelListPassthrough {
 		return true
 	}

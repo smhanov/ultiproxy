@@ -441,10 +441,20 @@ func TestNewFreebuffActorExplicitToken(t *testing.T) {
 		t.Errorf("freebuff_token = %q, want the first key fb-key-1", got)
 	}
 
-	// The runtime hook hands the lane's own key to the builder.
+	// The runtime hook hands the lane's own key to the builder and resolves
+	// the lane state dir daemon-side (<fallback>/credentials/<lane>, T010):
+	// no per-lane directory crosses the lane config.
 	hook := runtimeFreebuffActorBuilder(dir)
-	if got := hook(openaicompat.Config{APIKey: "fb-key-3", DataDir: t.TempDir()}); got == nil {
+	if got := hook(openaicompat.Config{Name: "fblane", APIKey: "fb-key-3"}); got == nil {
 		t.Fatal("runtimeFreebuffActorBuilder returned nil for a lane with an api_key")
+	}
+	// The explicit key is persisted under the lane's daemon-derived subdir.
+	hooked, err := os.ReadFile(filepath.Join(dir, "credentials", "fblane", "freebuff_token"))
+	if err != nil {
+		t.Fatalf("lane freebuff_token not written: %v", err)
+	}
+	if got := strings.TrimSpace(string(hooked)); got != "fb-key-3" {
+		t.Errorf("lane freebuff_token = %q, want fb-key-3", got)
 	}
 	if got := hook(openaicompat.Config{}); got == nil {
 		t.Fatal("runtimeFreebuffActorBuilder returned nil for a lane falling back to the state token")

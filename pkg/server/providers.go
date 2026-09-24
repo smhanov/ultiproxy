@@ -23,8 +23,9 @@
 //     actor once a builder exists, without ever turning an ordinary lane into a
 //     freebuff lane.
 //   - TokenSource is never persisted. openaicompat.New rebuilds token sources
-//     from compiled-in vendor defaults plus the server's DataDir (credential
-//     state lives under <DefaultDataDir>/credentials/<lane>), exactly the way
+//     from compiled-in vendor defaults plus the daemon-owned TokenFile
+//     (augure: <DefaultDataDir>/credentials/<lane>/augure-auth.json, assigned
+//     by injectCreds) and the shared credential store, exactly the way
 //     cmd/ultiproxy/providers.go builds them today.
 package server
 
@@ -170,8 +171,8 @@ type RuntimeProviderStore struct {
 	// DefaultDataDir is the server's general data directory. Runtime lanes do
 	// NOT carry their own data dir; credential state lives in the daemon-owned
 	// store (Creds, rooted at <DefaultDataDir>/credentials), exactly like
-	// compile-time lanes. DataDir is still assigned per lane for the remaining
-	// file-backed quirks (freebuff token, augure token file).
+	// compile-time lanes. The remaining file-backed quirk (augure token file)
+	// is assigned per lane as an explicit TokenFile by injectCreds.
 	DefaultDataDir string
 	// Creds is the daemon-owned credential store injected into every runtime
 	// lane that authenticates via AuthViaOAuthManager (T002). It is never
@@ -333,14 +334,16 @@ func (s *RuntimeProviderStore) Get(name string) (openaicompat.Config, bool) {
 }
 
 // injectCreds assigns a lane's daemon-owned dependencies from the server's
-// general DataDir and shared credential store. Runtime lanes never carry their
-// own data dir or store: restored lanes get the same Creds as a freshly added
-// one (T002), so a restart keeps serving the same credential; the persisted
-// DTO holds neither. DataDir is still assigned per lane for the remaining
-// file-backed quirks (freebuff token, augure token file).
+// general data dir and shared credential store. Runtime lanes never carry
+// their own data dir or store: restored lanes get the same Creds as a freshly
+// added one (T002), so a restart keeps serving the same credential; the
+// persisted DTO holds neither. File-backed quirk state is assigned as explicit
+// values, never as a directory: augure lanes (AuthViaSupabaseRefresh) get
+// TokenFile under <DefaultDataDir>/credentials/<lane> (T010), exactly the
+// path openaicompat.New used to derive from the removed Config.DataDir.
 func (s *RuntimeProviderStore) injectCreds(cfg openaicompat.Config) openaicompat.Config {
-	if cfg.DataDir == "" && s != nil && s.DefaultDataDir != "" {
-		cfg.DataDir = filepath.Join(s.DefaultDataDir, "credentials", cfg.Name)
+	if cfg.Quirks.AuthViaSupabaseRefresh && cfg.TokenFile == "" && s != nil && s.DefaultDataDir != "" {
+		cfg.TokenFile = filepath.Join(s.DefaultDataDir, "credentials", cfg.Name, "augure-auth.json")
 	}
 	if cfg.Creds == nil && s != nil && s.Creds != nil {
 		cfg.Creds = s.Creds
@@ -356,9 +359,9 @@ func (s *RuntimeProviderStore) credentialDir(cfg openaicompat.Config) openaicomp
 }
 
 // Enrich returns the lane config a restart would restore: daemon-owned
-// credential injection (DataDir + Creds), the resolved model-discovery flag
+// credential injection (TokenFile + Creds), the resolved model-discovery flag
 // and the real freebuff actor. It is idempotent: enriching an already-enriched
-// config is a no-op (DataDir/Creds only fill when empty, the flag resolves to
+// config is a no-op (TokenFile/Creds only fill when empty, the flag resolves to
 // the same value, and a real actor is never rebuilt).
 func (s *RuntimeProviderStore) Enrich(cfg openaicompat.Config) openaicompat.Config {
 	cfg = s.injectCreds(cfg)

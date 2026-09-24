@@ -286,19 +286,19 @@ func TestMCPAddProviderPersistFailureRegistersNothing(t *testing.T) {
 // do.
 func TestLaneConfigsDrifted(t *testing.T) {
 	base := openaicompat.Config{
-		Name:    "x",
-		BaseURL: "http://127.0.0.1:1/v1",
-		APIKey:  "sk",
-		DataDir: "/data/credentials/x",
-		Quirks:  openaicompat.Quirks{ModelListPassthrough: true},
+		Name:      "x",
+		BaseURL:   "http://127.0.0.1:1/v1",
+		APIKey:    "sk",
+		TokenFile: "/data/credentials/x/augure-auth.json",
+		Quirks:    openaicompat.Quirks{ModelListPassthrough: true},
 	}
 	if laneConfigsDrifted(base, base) {
 		t.Fatal("identical configs reported as drifted")
 	}
 	other := base
-	other.DataDir = "/other"
+	other.TokenFile = "/other"
 	if !laneConfigsDrifted(base, other) {
-		t.Error("DataDir change not detected as drift")
+		t.Error("TokenFile change not detected as drift")
 	}
 	other = base
 	other.Quirks.ModelListPassthrough = false

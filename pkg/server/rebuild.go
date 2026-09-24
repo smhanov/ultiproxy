@@ -13,7 +13,7 @@ import (
 // restart.
 //
 // It loads the enriched config a restart would restore (Enrich: daemon-owned
-// DataDir + Creds, resolved discovery flag, real freebuff actor), builds a
+// TokenFile + Creds, resolved discovery flag, real freebuff actor), builds a
 // fresh lane with openaicompat.New (which closes over the injected credential
 // store, so the new TokenSource reads the just-stored credential), runs one
 // bounded discovery pass and swaps it into the registry.

@@ -16,12 +16,7 @@ type Config struct {
 	TokenSource llmauth.TokenSource  // xai OAuth, augure refresh (set by the daemon, never by MCP)
 	Creds       auth.CredentialStore // xai OAuth credential store (injected by the daemon, never by MCP)
 	HTTPClient  *http.Client
-	// DataDir is deprecated daemon plumbing (not client-facing): only the
-	// augure TokenFile derivation still reads it (see New). xai OAuth lanes
-	// must use Creds instead — a missing store is a hard error, never a
-	// TempDir fallback. Runtime lanes never carry their own data dir.
-	DataDir string // deprecated: augure token file only; xai uses Creds
-	Quirks  Quirks
+	Quirks      Quirks
 
 	// OptOutModelListPassthrough explicitly disables upstream model discovery
 	// for this lane. Discovery is ON by default for OpenAI-compatible lanes

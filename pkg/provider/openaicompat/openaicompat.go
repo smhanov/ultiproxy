@@ -9,7 +9,6 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -109,9 +108,6 @@ func New(cfg Config) (*Provider, error) {
 			}
 		}
 		tokenFile := cfg.TokenFile
-		if tokenFile == "" && cfg.DataDir != "" {
-			tokenFile = filepath.Join(cfg.DataDir, "augure-auth.json")
-		}
 		cfg.TokenSource = NewSupabaseTokenSource(client, refreshURL, tokenFile, cfg.APIKey, "")
 	}
 
@@ -1132,9 +1128,11 @@ func (p *Provider) Quota(ctx context.Context) (*provider.QuotaSnapshot, error) {
 //
 // Quirk-routed (ported from the pre-F2 xai and freebuff lanes):
 //   - AuthViaOAuthManager: xai device-OAuth flow (RequestDeviceCode -> PollToken ->
-//     persist via auth.Manager under DataDir so Token() can serve it later).
-//   - FreebuffActor != nil: persist the configured/web token (env or api_key)
-//     into ultraproxy state and push it into the actor.
+//     persist via the injected daemon-owned credential store so Token() can
+//     serve it later).
+//   - FreebuffActor != nil: adopt the configured token (env or api_key) into
+//     the session actor and the in-memory key. Token persistence on disk is
+//     daemon-owned (cmd/ultiproxy persists on lane build), never lane-owned.
 //   - otherwise: provider.ErrNotImplemented (plain openai endpoint needs no login).
 func (p *Provider) Login(ctx context.Context) error {
 	if p.cfg.Quirks.AuthViaOAuthManager {
@@ -1254,17 +1252,6 @@ func (p *Provider) loginFreebuff(ctx context.Context) error {
 	}
 	p.apiKey = tok
 	p.cfg.APIKey = tok
-
-	dataDir := p.cfg.DataDir
-	if dataDir != "" {
-		if err := os.MkdirAll(dataDir, 0755); err != nil {
-			return fmt.Errorf("freebuff: create data dir: %w", err)
-		}
-		tokenFile := filepath.Join(dataDir, "freebuff_token")
-		if err := os.WriteFile(tokenFile, []byte(tok+"\n"), 0600); err != nil {
-			return fmt.Errorf("freebuff: persist token: %w", err)
-		}
-	}
 	return nil
 }
 

@@ -272,7 +272,6 @@ func runtimeLaneBuilder(name, kind, dataDir, apiKey string) (provider.Provider, 
 			Name:    name,
 			BaseURL: "https://www.codebuff.com/api/v1",
 			APIKey:  apiKey,
-			DataDir: dataDir,
 			Quirks: openaicompat.Quirks{
 				FreebuffActor:       fbActor,
 				FreebuffDefaultTool: true,

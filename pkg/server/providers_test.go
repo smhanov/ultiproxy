@@ -183,8 +183,8 @@ func TestRuntimeProviderStore_LegacyFieldsIgnored(t *testing.T) {
 	if !got.Quirks.ModelListPassthrough {
 		t.Errorf("model_list_passthrough did not survive the legacy load: %+v", got.Quirks)
 	}
-	if want := filepath.Join(dir, "credentials", "opencode"); got.DataDir != want {
-		t.Errorf("credential dir = %q, want %q (legacy data_dir must not win)", got.DataDir, want)
+	if want := ""; got.TokenFile != want {
+		t.Errorf("credential file = %q, want %q (legacy data_dir must not win; non-augure lanes carry no TokenFile)", got.TokenFile, want)
 	}
 
 	// Re-persisting (add_provider is how a lane is rotated) drops the legacy keys.
@@ -365,7 +365,7 @@ func (fakeFreebuffActor) Acquire(ctx context.Context) error { return nil }
 func (fakeFreebuffActor) Release()                          {}
 
 // TestRuntimeProviderStore_EnrichIsIdempotent (T003 AC1): Enrich injects the
-// daemon-owned DataDir/Creds, resolves the discovery flag and builds the
+// daemon-owned Creds, resolves the discovery flag and builds the
 // freebuff actor once; a second Enrich and Add are no-ops so live == stored.
 func TestRuntimeProviderStore_EnrichIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
@@ -396,8 +396,8 @@ func TestRuntimeProviderStore_EnrichIsIdempotent(t *testing.T) {
 		},
 	}
 	first := s.Enrich(raw)
-	if first.DataDir != filepath.Join(dir, "credentials", "xai") {
-		t.Fatalf("enriched DataDir = %q", first.DataDir)
+	if first.TokenFile != "" {
+		t.Fatalf("non-augure lane got TokenFile = %q, want empty", first.TokenFile)
 	}
 	if first.Creds == nil {
 		t.Fatal("enriched config has no Creds")
@@ -413,8 +413,8 @@ func TestRuntimeProviderStore_EnrichIsIdempotent(t *testing.T) {
 	}
 
 	second := s.Enrich(first)
-	if second.DataDir != first.DataDir {
-		t.Errorf("second Enrich changed DataDir: %q -> %q", first.DataDir, second.DataDir)
+	if second.TokenFile != first.TokenFile {
+		t.Errorf("second Enrich changed TokenFile: %q -> %q", first.TokenFile, second.TokenFile)
 	}
 	if second.Creds != first.Creds {
 		t.Error("second Enrich changed the injected Creds handle")
@@ -436,7 +436,7 @@ func TestRuntimeProviderStore_EnrichIsIdempotent(t *testing.T) {
 	if !ok {
 		t.Fatal("xai not stored after Add")
 	}
-	if stored.DataDir != first.DataDir || stored.Creds != first.Creds {
+	if stored.TokenFile != first.TokenFile || stored.Creds != first.Creds {
 		t.Error("Add did not store the enriched credential injection")
 	}
 	if stored.Quirks.ModelListPassthrough != first.Quirks.ModelListPassthrough {
@@ -465,6 +465,58 @@ func sameActorValue(a, b any) bool {
 	// equality if a future actor becomes non-comparable.
 	defer func() { _ = recover() }()
 	return a == b
+}
+
+// TestRuntimeProviderStore_EnrichAssignsAugureTokenFile (T010 AC1): a runtime
+// augure lane (AuthViaSupabaseRefresh, no explicit TokenFile) gets the exact
+// nested token file openaicompat.New used to derive from the removed
+// Config.DataDir (<DefaultDataDir>/credentials/<lane>/augure-auth.json); the
+// assignment is idempotent, an explicit TokenFile wins, and the value
+// survives an Add/Load round-trip.
+func TestRuntimeProviderStore_EnrichAssignsAugureTokenFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.json")
+
+	s := NewRuntimeProviderStore(path)
+	s.DefaultDataDir = dir
+
+	raw := openaicompat.Config{
+		Name:    "augure",
+		BaseURL: "https://api.augureai.ca/v1",
+		APIKey:  "aug-key",
+		Quirks:  openaicompat.Quirks{AuthViaSupabaseRefresh: true},
+	}
+	want := filepath.Join(dir, "credentials", "augure", "augure-auth.json")
+
+	first := s.Enrich(raw)
+	if first.TokenFile != want {
+		t.Fatalf("enriched TokenFile = %q, want %q", first.TokenFile, want)
+	}
+	second := s.Enrich(first)
+	if second.TokenFile != want {
+		t.Fatalf("second Enrich TokenFile = %q, want %q", second.TokenFile, want)
+	}
+
+	explicit := raw
+	explicit.TokenFile = filepath.Join(dir, "custom-augure.json")
+	if got := s.Enrich(explicit); got.TokenFile != explicit.TokenFile {
+		t.Fatalf("explicit TokenFile = %q, want it preserved", got.TokenFile)
+	}
+
+	if err := s.Add(raw); err != nil {
+		t.Fatalf("Add augure: %v", err)
+	}
+	loaded, err := s.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, ok := loaded["augure"]
+	if !ok {
+		t.Fatal("augure lane missing after Load")
+	}
+	if got.TokenFile != want {
+		t.Errorf("round-trip TokenFile = %q, want %q", got.TokenFile, want)
+	}
 }
 
 // TestRuntimeProviderStore_FreebuffActorEnrichment covers a freebuff lane

@@ -461,7 +461,6 @@ func registerProviders(registry *provider.Registry, configuredDataDir string) *a
 			BaseURL:   "https://api.augureai.ca/v1",
 			APIKey:    augTok,
 			TokenFile: augTokenFile,
-			DataDir:   stateDir,
 			Quirks: openaicompat.Quirks{
 				AuthViaSupabaseRefresh: true,
 				DefaultModel:           "tofino-3",
@@ -501,7 +500,6 @@ func registerProviders(registry *provider.Registry, configuredDataDir string) *a
 					Name:    "freebuff",
 					BaseURL: fbLaneBaseURL(),
 					APIKey:  fbTok,
-					DataDir: stateDir,
 					Quirks: openaicompat.Quirks{
 						FreebuffActor:       fbActor,
 						FreebuffDefaultTool: true,
@@ -606,13 +604,14 @@ func persistFreebuffToken(stateDir, token string) {
 
 // runtimeFreebuffActorBuilder adapts newFreebuffActor to the runtime provider
 // store hook: the lane's own key (cfg.APIKey, e.g. an add_provider api_key)
-// wins, the lane's own DataDir comes next, otherwise fall back to the daemon
-// state dir.
+// wins, and the lane's state dir is derived daemon-side as
+// <fallbackStateDir>/credentials/<lane> — the same nested value Enrich used
+// to assign per lane before T010. Lanes never carry their own directory.
 func runtimeFreebuffActorBuilder(fallbackStateDir string) func(openaicompat.Config) any {
 	return func(cfg openaicompat.Config) any {
-		dir := cfg.DataDir
-		if dir == "" {
-			dir = fallbackStateDir
+		dir := fallbackStateDir
+		if dir != "" && cfg.Name != "" {
+			dir = filepath.Join(dir, "credentials", cfg.Name)
 		}
 		return newFreebuffActor(dir, cfg.APIKey)
 	}
