@@ -26,9 +26,9 @@ import (
 )
 
 // version is the release version reported by `ultiproxy version`, the
-// startup log line and /healthz (via server.WithVersion). Release builds
-// stamp the tag with -ldflags "-X main.version=vX.Y.Z" (see
-// .github/workflows/release.yml, T008); the default is the dev version.
+// startup log line and /healthz (via server.WithVersion). It can be
+// stamped at build time with -ldflags "-X main.version=vX.Y.Z"; the
+// default is the dev version.
 var version = "0.1.0"
 
 func main() {
