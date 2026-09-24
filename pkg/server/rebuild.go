@@ -9,14 +9,22 @@ import (
 )
 
 // RebuildLane rebuilds one runtime lane from its stored config after a
-// credential change (T004: post-login), so "completed" means usable without a
-// restart.
+// credential change (T004: post-login; T011: custom-wire parity), so
+// "completed" means usable without a restart.
 //
-// It loads the enriched config a restart would restore (Enrich: daemon-owned
-// TokenFile + Creds, resolved discovery flag, real freebuff actor), builds a
-// fresh lane with openaicompat.New (which closes over the injected credential
-// store, so the new TokenSource reads the just-stored credential), runs one
-// bounded discovery pass and swaps it into the registry.
+// OpenAI-compatible lanes load the enriched config a restart would restore
+// (Enrich: daemon-owned TokenFile + Creds, resolved discovery flag, real
+// freebuff actor), build a fresh lane with openaicompat.New (which closes
+// over the injected credential store, so the new TokenSource reads the
+// just-stored credential), run one bounded discovery pass and swap it into
+// the registry.
+//
+// Custom-wire lanes (kind != openaicompat, e.g. antigravity) have no
+// openaicompat config and no model discovery. "Rebuild" for them means
+// re-resolve through the store's LaneBuilder — the same kind-specific
+// builder Restore uses (antigravity: NewFromState over the server's general
+// DataDir, ProviderBundle) — and re-register. It reports discovered 0;
+// models stay addressed as <lane>/<model> (plus the lane's default id).
 //
 // Ordering and failure semantics:
 //   - Registry.Register replaces in place preserving order, so the swap is a
@@ -26,9 +34,13 @@ import (
 //     compile-time lane) is NOT an error for the caller to hide: it returns
 //     ErrProviderNotStored so the MCP completion branch can report
 //     "credential stored; lane not registered — call add_provider".
-//   - A custom-wire lane (kind != openaicompat) cannot be rebuilt through this
-//     path; it returns an explicit error so the caller reports honestly
-//     instead of a false "usable".
+//   - A custom-wire lane with no LaneBuilder cannot be rebuilt; it returns an
+//     explicit "custom-wire lane" error so the caller reports honestly
+//     instead of a false "usable". A custom builder failure is a different
+//     error ("rebuild lane %q via kind %q builder ... (previous lane
+//     preserved)") — it deliberately omits the "custom-wire lane" substring
+//     so the MCP completion branch maps it to the failure note, not the
+//     honest no-builder note.
 //   - Discovery runs synchronously under modelDiscoveryBudget (the same budget
 //     registration, startup and the schedule use). A discovery failure
 //     preserves the previous lane and is returned as an error.
@@ -47,9 +59,23 @@ func (s *RuntimeProviderStore) RebuildLane(registry *provider.Registry, name str
 	if !ok {
 		s.mu.RLock()
 		sp, custom := s.custom[name]
+		builder := s.LaneBuilder
+		dataDir := s.DefaultDataDir
 		s.mu.RUnlock()
 		if custom {
-			return 0, fmt.Errorf("lane %q is a custom-wire lane (kind %q): rebuild not supported via the OpenAI-compatible path", name, sp.Kind)
+			if builder == nil {
+				return 0, fmt.Errorf("lane %q is a custom-wire lane (kind %q): no LaneBuilder to rebuild it", name, sp.Kind)
+			}
+			// T011: re-resolve through the kind-specific builder (the same
+			// constructor Restore uses) without holding the store lock, then
+			// swap in place. Only success reaches Register, so a builder
+			// failure preserves the previous lane.
+			bundle, berr := builder(name, sp.Kind, dataDir, sp.APIKey)
+			if berr != nil {
+				return 0, fmt.Errorf("rebuild lane %q via kind %q builder: %w (previous lane preserved)", name, sp.Kind, berr)
+			}
+			registry.RegisterWithSource(bundle, "rebuild")
+			return 0, nil
 		}
 		return 0, fmt.Errorf("%w: %q", ErrProviderNotStored, name)
 	}

@@ -96,16 +96,22 @@ func hasLane(store ProviderStore, name string) bool {
 // clean rebuild) and whether the lane is not held by the runtime store. The
 // three outcomes map to the T004 acceptance criteria:
 //   - success: (n, "", false) — registry serves the rebuilt lane, list_models
-//     is fresh without a restart (AC1, AC2);
+//     is fresh without a restart (AC1, AC2). T011: a registered custom-wire
+//     lane (e.g. antigravity) with a LaneBuilder also succeeds here as
+//     (0, "", false) — re-resolved from the state dir and re-registered, no
+//     model discovery (models addressed as <lane>/<model>);
 //   - not in store: (0, "", true) — the caller reports "credential stored;
 //     lane not registered — call add_provider" (AC3), not an error and not a
 //     false "usable";
 //   - rebuild failure: (0, "lane rebuild failed: ... (previous lane
-//     preserved)", false) — the previous lane is untouched (AC4).
+//     preserved)", false) — the previous lane is untouched (AC4). A stored
+//     custom lane with no LaneBuilder keeps the honest "custom-wire lane has
+//     no post-login rebuild" note (not a failure, not "usable").
 //
 // The preferred path delegates to the daemon store's RebuildLane (the same
-// Enrich helper and discovery budget T003 established). Test doubles that do
-// not implement it fall back to the identical path built from the
+// Enrich helper and discovery budget T003 established; T011: custom kinds via
+// the store's LaneBuilder, the same constructor Restore uses). Test doubles
+// that do not implement it fall back to the identical path built from the
 // ProviderStore interface.
 func (s *Server) rebuildLaneAfterLogin(ctx context.Context, name string) (int, string, bool) {
 	if s == nil || s.registry == nil || s.providers == nil {

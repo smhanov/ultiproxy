@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -146,9 +147,10 @@ func TestRebuildLanePreservesOldOnFailure(t *testing.T) {
 	}
 }
 
-// TestRebuildLaneCustomKind is the antigravity-parity guard: custom-wire lanes
-// are reported explicitly instead of rebuilt through the openaicompat path.
-func TestRebuildLaneCustomKind(t *testing.T) {
+// TestRebuildLaneCustomKindWithoutBuilder is the builder-less guard: a stored
+// custom-wire lane with no LaneBuilder keeps the explicit honest error so the
+// MCP layer reports "no post-login rebuild" instead of a false "usable".
+func TestRebuildLaneCustomKindWithoutBuilder(t *testing.T) {
 	dir := t.TempDir()
 	store := NewRuntimeProviderStore(filepath.Join(dir, "providers.json"))
 	store.DefaultDataDir = dir
@@ -157,9 +159,86 @@ func TestRebuildLaneCustomKind(t *testing.T) {
 	}
 	registry := provider.NewRegistry()
 	if _, err := store.RebuildLane(registry, "antigravity"); err == nil {
-		t.Fatal("expected error for custom-wire lane")
+		t.Fatal("expected error for custom-wire lane without LaneBuilder")
 	} else if !strings.Contains(err.Error(), "custom-wire lane") {
 		t.Fatalf("error = %q, want custom-wire explanation", err)
+	}
+}
+
+// TestRebuildLaneAntigravityViaLaneBuilder (T011 AC1+AC4): a registered
+// antigravity lane with a LaneBuilder re-resolves from the state dir and
+// re-registers without a restart. No model discovery runs (discovered 0) and
+// no openaicompat construction is involved.
+func TestRebuildLaneAntigravityViaLaneBuilder(t *testing.T) {
+	dir := t.TempDir()
+	store := NewRuntimeProviderStore(filepath.Join(dir, "providers.json"))
+	store.DefaultDataDir = dir
+	if err := store.AddCustom("antigravity", "antigravity", ""); err != nil {
+		t.Fatalf("AddCustom: %v", err)
+	}
+	var gotName, gotKind, gotDataDir, gotAPIKey string
+	calls := 0
+	fresh := &fakeInferenceProvider{name: "antigravity"}
+	store.LaneBuilder = func(name, kind, dataDir, apiKey string) (provider.Provider, error) {
+		calls++
+		gotName, gotKind, gotDataDir, gotAPIKey = name, kind, dataDir, apiKey
+		return provider.Provider{Inference: fresh}, nil
+	}
+	registry := provider.NewRegistry()
+	stale := &fakeInferenceProvider{name: "antigravity"}
+	registry.Register(provider.Provider{Inference: stale})
+
+	discovered, err := store.RebuildLane(registry, "antigravity")
+	if err != nil {
+		t.Fatalf("RebuildLane: %v", err)
+	}
+	if discovered != 0 {
+		t.Fatalf("discovered = %d, want 0 (custom-wire lanes have no model discovery)", discovered)
+	}
+	if calls != 1 {
+		t.Fatalf("LaneBuilder calls = %d, want 1", calls)
+	}
+	if gotName != "antigravity" || gotKind != "antigravity" || gotDataDir != dir || gotAPIKey != "" {
+		t.Fatalf("LaneBuilder args = (%q,%q,%q,%q), want (antigravity,antigravity,%q,\"\")", gotName, gotKind, gotDataDir, gotAPIKey, dir)
+	}
+	bundle, ok := registry.Get("antigravity")
+	if !ok {
+		t.Fatal("antigravity not in registry after rebuild")
+	}
+	live, ok := bundle.Inference.(*fakeInferenceProvider)
+	if !ok || live != fresh {
+		t.Fatalf("registry holds stale lane after rebuild (live=%v, want fresh)", bundle.Inference)
+	}
+}
+
+// TestRebuildLaneAntigravityPreservesOldOnFailure (T011 AC3): when the custom
+// builder fails, the previously registered bundle stays untouched.
+func TestRebuildLaneAntigravityPreservesOldOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	store := NewRuntimeProviderStore(filepath.Join(dir, "providers.json"))
+	store.DefaultDataDir = dir
+	if err := store.AddCustom("antigravity", "antigravity", ""); err != nil {
+		t.Fatalf("AddCustom: %v", err)
+	}
+	store.LaneBuilder = func(name, kind, dataDir, apiKey string) (provider.Provider, error) {
+		return provider.Provider{}, errors.New("boom: state dir unreadable")
+	}
+	registry := provider.NewRegistry()
+	keep := &fakeInferenceProvider{name: "antigravity"}
+	registry.Register(provider.Provider{Inference: keep})
+
+	if _, err := store.RebuildLane(registry, "antigravity"); err == nil {
+		t.Fatal("expected rebuild failure from the custom builder")
+	} else if !strings.Contains(err.Error(), "previous lane preserved") {
+		t.Fatalf("error = %q, want previous-lane-preserved explanation", err)
+	}
+	bundle, ok := registry.Get("antigravity")
+	if !ok {
+		t.Fatal("antigravity missing from registry after failed rebuild (old not preserved)")
+	}
+	live, ok := bundle.Inference.(*fakeInferenceProvider)
+	if !ok || live != keep {
+		t.Fatalf("registry lane replaced on failed rebuild (live=%v, want the preserved lane)", bundle.Inference)
 	}
 }
 

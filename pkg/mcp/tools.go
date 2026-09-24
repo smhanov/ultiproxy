@@ -1004,12 +1004,16 @@ func (s *Server) toolInitiateOAuthLogin(ctx context.Context, argsRaw json.RawMes
 
 // completedLoginReply builds the post-login reply after CompleteLogin (or the
 // legacy Login) stored a fresh credential. It rebuilds the lane from its
-// stored config so "completed" means usable without a restart (T004):
+// stored config so "completed" means usable without a restart (T004; T011
+// extends this to registered custom-wire lanes such as antigravity, which
+// re-resolve from the state dir and re-register with discovered_models 0):
 //   - rebuilt: status/completed + discovered_models count (AC1, AC2);
+//     custom-wire success reports 0 with models addressed as <lane>/<model>;
 //   - lane not in the runtime store: credential stored; lane not registered —
 //     call add_provider (AC3), not an error and not a false "usable";
 //   - rebuild failure: honest note with the failure reason; the previous lane
-//     is preserved (AC4).
+//     is preserved (AC4). A stored custom lane with no LaneBuilder keeps the
+//     honest no-rebuild note.
 func (s *Server) completedLoginReply(ctx context.Context, lane, status string) map[string]any {
 	res := map[string]any{
 		"status":   status,
