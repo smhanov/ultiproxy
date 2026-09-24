@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	llmauth "github.com/smhanov/llmhub/auth"
 	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/ir"
 	"github.com/smhanov/ultiproxy/pkg/provider"
@@ -1134,6 +1135,163 @@ func TestOpenAICompat_OAuthManagerAuth(t *testing.T) {
 
 	if capturedAuth != "Bearer xai-oauth-token-val" {
 		t.Errorf("expected Bearer xai-oauth-token-val, got %q", capturedAuth)
+	}
+}
+
+// stubTokenSource is a fake auth.TokenSource for the FetchModels auth tests:
+// it hands back a fixed access token (or a fixed error) without touching disk.
+type stubTokenSource struct {
+	tok string
+	err error
+}
+
+func (s stubTokenSource) Token(context.Context) (*llmauth.Token, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &llmauth.Token{AccessToken: s.tok}, nil
+}
+
+// newFetchModelsAuthUpstream serves one /v1/models document and records every
+// Authorization header it sees, so tests can prove which credential (if any)
+// FetchModels attached — including the construction-time discovery inside New.
+func newFetchModelsAuthUpstream(t *testing.T, headers *[]string, hits *int32) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		*hits++
+		*headers = append(*headers, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data":   []map[string]any{{"id": "m1"}},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// AC1 (T001): a provider built with a TokenSource and empty api_key sends
+// Authorization: Bearer <token-source-token> on GET <base>/models.
+func TestFetchModels_TokenSourceBearer(t *testing.T) {
+	var headers []string
+	var hits int32
+	srv := newFetchModelsAuthUpstream(t, &headers, &hits)
+
+	p, err := New(Config{
+		BaseURL:     srv.URL,
+		TokenSource: stubTokenSource{tok: "ts-token-123"},
+		HTTPClient:  srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	models, err := p.FetchModels(context.Background())
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+	if len(models) != 1 || models[0] != "m1" {
+		t.Errorf("models = %v, want [m1]", models)
+	}
+	if hits != 2 {
+		t.Errorf("upstream /v1/models hits = %d, want 2 (construction discovery + explicit FetchModels)", hits)
+	}
+	for i, h := range headers {
+		if h != "Bearer ts-token-123" {
+			t.Errorf("request %d Authorization = %q, want %q", i, h, "Bearer ts-token-123")
+		}
+	}
+}
+
+// AC3 (T001 static-key twin): static-key lanes still send Bearer <api_key> on
+// GET <base>/models.
+func TestFetchModels_StaticKeyBearer(t *testing.T) {
+	var headers []string
+	var hits int32
+	srv := newFetchModelsAuthUpstream(t, &headers, &hits)
+
+	p, err := New(Config{
+		BaseURL:    srv.URL,
+		APIKey:     "sk-static-1",
+		HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := p.FetchModels(context.Background()); err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+	if hits != 2 {
+		t.Errorf("upstream /v1/models hits = %d, want 2 (construction discovery + explicit FetchModels)", hits)
+	}
+	for i, h := range headers {
+		if h != "Bearer sk-static-1" {
+			t.Errorf("request %d Authorization = %q, want %q", i, h, "Bearer sk-static-1")
+		}
+	}
+}
+
+// AC3 (T001 keyless twin): keyless public lanes still send no header and
+// discovery still succeeds.
+func TestFetchModels_KeylessSendsNoHeader(t *testing.T) {
+	var headers []string
+	var hits int32
+	srv := newFetchModelsAuthUpstream(t, &headers, &hits)
+
+	p, err := New(Config{
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	models, err := p.FetchModels(context.Background())
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+	if len(models) != 1 || models[0] != "m1" {
+		t.Errorf("models = %v, want [m1]", models)
+	}
+	if hits != 2 {
+		t.Errorf("upstream /v1/models hits = %d, want 2 (construction discovery + explicit FetchModels)", hits)
+	}
+	for i, h := range headers {
+		if h != "" {
+			t.Errorf("request %d Authorization = %q, want no header", i, h)
+		}
+	}
+}
+
+// AC2 (T001): a TokenSource error surfaces as a discovery error naming the
+// cause, and no request goes out with a partial/empty Bearer header.
+func TestFetchModels_TokenSourceError(t *testing.T) {
+	var headers []string
+	var hits int32
+	srv := newFetchModelsAuthUpstream(t, &headers, &hits)
+
+	p, err := New(Config{
+		BaseURL:     srv.URL,
+		TokenSource: stubTokenSource{err: errors.New("token boom")},
+		HTTPClient:  srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = p.FetchModels(context.Background())
+	if err == nil {
+		t.Fatal("FetchModels with a failing TokenSource: expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "models auth") || !strings.Contains(err.Error(), "token boom") {
+		t.Errorf("FetchModels error = %q, want it to name 'models auth' and the cause 'token boom'", err.Error())
+	}
+	if hits != 0 {
+		t.Errorf("upstream /v1/models hits = %d, want 0 (no request must go out on token error)", hits)
+	}
+	if len(headers) != 0 {
+		t.Errorf("captured Authorization headers = %v, want none (no request must go out)", headers)
 	}
 }
 

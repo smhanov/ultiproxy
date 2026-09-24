@@ -958,8 +958,15 @@ func (p *Provider) FetchModels(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.apiKey != "" && p.apiKey != "openaicompat" && p.apiKey != "placeholder" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	tok, tokErr := p.Token(ctx)
+	if tokErr == nil {
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+	} else if strings.Contains(tokErr.Error(), "no token available") {
+		// Keyless public/local lane: proceed header-less.
+	} else {
+		return nil, fmt.Errorf("models auth: %w", tokErr)
 	}
 
 	resp, err := p.httpClient.Do(req)
