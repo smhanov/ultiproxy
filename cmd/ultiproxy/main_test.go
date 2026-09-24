@@ -8,8 +8,11 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
+	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/provider"
+	"github.com/smhanov/ultiproxy/pkg/provider/antigravity"
 	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 	"github.com/smhanov/ultiproxy/pkg/server"
 	"github.com/smhanov/ultiproxy/pkg/storage"
@@ -445,5 +448,51 @@ func TestNewFreebuffActorExplicitToken(t *testing.T) {
 	}
 	if got := hook(openaicompat.Config{}); got == nil {
 		t.Fatal("runtimeFreebuffActorBuilder returned nil for a lane falling back to the state token")
+	}
+}
+
+// TestRuntimeLaneBuilderAntigravitySingleNested (T009): a runtime-built
+// antigravity lane must use the same single-nested credential store as the
+// compile-time lane (<dataDir>/credentials/antigravity), not a double-nested
+// <dataDir>/credentials/antigravity/credentials/antigravity dir. A token
+// seeded at the single-nested location must be served by the lane (restore
+// round-trip), and no double-nested path may be created.
+func TestRuntimeLaneBuilderAntigravitySingleNested(t *testing.T) {
+	dir := t.TempDir()
+
+	// Seed a fresh token exactly where the compile-time lane keeps it.
+	single := filepath.Join(dir, "credentials", "antigravity")
+	mgr, err := auth.NewManager(single, nil)
+	if err != nil {
+		t.Fatalf("seed manager: %v", err)
+	}
+	if err := mgr.Store(context.Background(), antigravity.DefaultClientID, auth.Credential{
+		Provider:    "antigravity",
+		AccessToken: "ag-roundtrip-token",
+		ExpiresAt:   time.Now().Add(time.Hour),
+		ClientID:    antigravity.DefaultClientID,
+	}); err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+
+	lane, err := runtimeLaneBuilder("antigravity", "antigravity", dir, "")
+	if err != nil {
+		t.Fatalf("antigravity lane: %v", err)
+	}
+	if lane.Auth == nil {
+		t.Fatal("antigravity lane has no Auth surface")
+	}
+	got, err := lane.Auth.Token(context.Background())
+	if err != nil {
+		t.Fatalf("lane Token(): %v (single-nested token not found — double-nested store?)", err)
+	}
+	if got != "ag-roundtrip-token" {
+		t.Fatalf("lane Token() = %q, want %q", got, "ag-roundtrip-token")
+	}
+
+	// The buggy path created <data>/credentials/antigravity/credentials/...;
+	// it must never exist.
+	if _, err := os.Stat(filepath.Join(single, "credentials")); !os.IsNotExist(err) {
+		t.Errorf("double-nested credential path exists under %s (err = %v)", single, err)
 	}
 }

@@ -199,7 +199,7 @@ func runtimeLaneBuilder(name, kind, dataDir, apiKey string) (provider.Provider, 
 		if err := os.MkdirAll(credDir, 0o700); err != nil {
 			return provider.Provider{}, fmt.Errorf("antigravity: create credential store: %w", err)
 		}
-		p := antigravity.NewFromState(dataDir, credDir, nil)
+		p := antigravity.NewFromState(dataDir, dataDir, nil)
 		if p == nil {
 			return provider.Provider{}, fmt.Errorf("antigravity: could not create provider under %s", credDir)
 		}
