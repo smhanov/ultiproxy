@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -152,6 +153,149 @@ func managerHasToken(mgr *auth.Manager, key string) bool {
 	}
 	cred, err := mgr.LoadFromDisk(key)
 	return err == nil && cred.AccessToken != ""
+}
+
+// errLaneNoCredential is the silent-skip signal for the credential scan: no
+// stored credential and no env-token alternate (AC2). It is never logged.
+var errLaneNoCredential = errors.New("no credential")
+
+// laneScanContext carries the daemon knowledge the credential scan shares
+// with every descriptor: the resolved state dir, the home dir (antigravity
+// fallback) and the single daemon-owned xai store (T002) every xai build
+// closes over. Lanes never compute paths themselves.
+type laneScanContext struct {
+	stateDir string
+	home     string
+	xaiMgr   *auth.Manager
+}
+
+// laneScanDescriptor is one declarative OAuth-lane entry (T005): the lane
+// name, its credential subdir under <stateDir>/credentials (documentation +
+// log context), and a single build func holding the vendor's original startup
+// body unchanged — credential branch first, env-token alternate second,
+// errLaneNoCredential when neither exists.
+//
+// The build returns the source the shared loop logs (AC4):
+// "credential-scan" or "env-token".
+type laneScanDescriptor struct {
+	name       string
+	credSubdir string
+	build      func(ctx laneScanContext) (provider.Provider, string, error)
+}
+
+// buildXAILane is the xAI Grok startup body: ultiproxy-owned credentials via
+// the daemon-owned store (Creds — never a DataDir), then the env static
+// token. A failed credential build is a loud error, never a silent
+// fallthrough to the env alternate (matches the original if/else-if chain).
+func buildXAILane(ctx laneScanContext) (provider.Provider, string, error) {
+	if ctx.xaiMgr != nil && managerHasToken(ctx.xaiMgr, xaiDefaultClientID) {
+		p, err := openaicompat.New(openaicompat.Config{
+			Name:    "xai",
+			BaseURL: xaiDefaultBaseURL,
+			Creds:   ctx.xaiMgr,
+			Quirks: openaicompat.Quirks{
+				AuthViaOAuthManager:  true,
+				CreditsQuotaObserver: xaiDefaultBillingURL,
+			},
+		})
+		if err != nil {
+			return provider.Provider{}, "", err
+		}
+		return p.Provider(), "credential-scan", nil
+	}
+	if tok := firstEnv("ULTIPROXY_XAI_TOKEN"); tok != "" {
+		p, err := openaicompat.New(openaicompat.Config{
+			Name:    "xai",
+			BaseURL: xaiDefaultBaseURL,
+			APIKey:  tok,
+			Quirks: openaicompat.Quirks{
+				CreditsQuotaObserver: xaiDefaultBillingURL,
+			},
+		})
+		if err != nil {
+			return provider.Provider{}, "", err
+		}
+		return p.Provider(), "env-token", nil
+	}
+	return provider.Provider{}, "", errLaneNoCredential
+}
+
+// buildCodexLane is the Codex startup body: ultiproxy-owned credentials (its
+// own manager/dir — separate keys and refresher from xai, see the T002
+// key-collision note on registerProviders) or the env token only. The
+// original trailing duplicate credential branch was dead code (the same
+// condition as the first branch, unreachable behind the else-if) and is
+// folded into the single credential branch with no behavior change.
+func buildCodexLane(ctx laneScanContext) (provider.Provider, string, error) {
+	credDir := filepath.Join(ctx.stateDir, "credentials", "codex")
+	mgr, mgrErr := newOAuthManager(credDir)
+	if mgrErr == nil && managerHasToken(mgr, codex.DefaultClientID) {
+		p := codex.New(codex.Config{AuthManager: mgr, ClientID: codex.DefaultClientID})
+		return p.ProviderBundle(), "credential-scan", nil
+	}
+	if tok := firstEnv("ULTIPROXY_CODEX_TOKEN"); tok != "" {
+		p := codex.New(codex.Config{StaticToken: tok})
+		return p.ProviderBundle(), "env-token", nil
+	}
+	return provider.Provider{}, "", errLaneNoCredential
+}
+
+// buildAntigravityLane is the Antigravity startup body: ultiproxy-owned OAuth
+// only, registering solely when a real token exists (a fresh install
+// registers zero lanes). No env-token alternate exists for this lane.
+func buildAntigravityLane(ctx laneScanContext) (provider.Provider, string, error) {
+	if p := antigravity.NewFromState(ctx.home, ctx.stateDir, nil); p != nil && p.HasToken() {
+		return p.ProviderBundle(), "credential-scan", nil
+	}
+	return provider.Provider{}, "", errLaneNoCredential
+}
+
+// laneScanDescriptors is the declarative registry of OAuth startup lanes
+// (T005). Adding a lane is a map entry, not a new compile-time block.
+var laneScanDescriptors = map[string]laneScanDescriptor{
+	"xai":         {name: "xai", credSubdir: "xai", build: buildXAILane},
+	"codex":       {name: "codex", credSubdir: "codex", build: buildCodexLane},
+	"antigravity": {name: "antigravity", credSubdir: "antigravity", build: buildAntigravityLane},
+}
+
+// laneScanOrder is the deterministic scan order (the original block order in
+// registerProviders).
+var laneScanOrder = []string{"xai", "codex", "antigravity"}
+
+// scanCredentialLanes registers every descriptor whose credential (or
+// env-token alternate) exists, through the vendor's own build func. Absence
+// is a silent skip (AC2: a fresh install registers zero lanes, saying
+// nothing). A lane that is already registered is replaced in place
+// (Registry.Register replaces preserving order) and the replacement is
+// logged, so the winner is always deterministic and visible (AC1).
+//
+// Conflict vs Restore (providers.json): runServe calls registerProviders
+// BEFORE providerStore.Restore (cmd/ultiproxy/main.go), so on a same-name
+// conflict the runtime lane wins — the scan line logs first, the
+// "registered runtime <lane>" line logs second, and the last line is the
+// live lane. Ordering is logging-only, never correctness: the registry holds
+// one entry either way and both builds close over the same daemon-owned
+// credential state.
+func scanCredentialLanes(registry *provider.Registry, ctx laneScanContext) {
+	for _, name := range laneScanOrder {
+		d, ok := laneScanDescriptors[name]
+		if !ok || d.build == nil {
+			continue
+		}
+		bundle, source, err := d.build(ctx)
+		if err != nil {
+			if errors.Is(err, errLaneNoCredential) {
+				continue
+			}
+			log.Printf("[providers] %s: %v", d.name, err)
+			continue
+		}
+		if _, exists := registry.Get(d.name); exists {
+			log.Printf("[providers] %s: replacing existing registration with %s build", d.name, source)
+		}
+		registry.Register(bundle)
+		log.Printf("[providers] registered %s via %s", d.name, source)
+	}
 }
 
 // resolveProviderStateDir unifies credential-state root resolution for
@@ -329,58 +473,12 @@ func registerProviders(registry *provider.Registry, configuredDataDir string) *a
 		}
 	}
 
-	// xAI Grok — ultiproxy-owned credentials first, then env static token.
-	// The lane receives the daemon-owned store (Creds), never a DataDir.
-	if xaiMgr != nil && managerHasToken(xaiMgr, xaiDefaultClientID) {
-		if p, err := openaicompat.New(openaicompat.Config{
-			Name:    "xai",
-			BaseURL: xaiDefaultBaseURL,
-			Creds:   xaiMgr,
-			Quirks: openaicompat.Quirks{
-				AuthViaOAuthManager:  true,
-				CreditsQuotaObserver: xaiDefaultBillingURL,
-			},
-		}); err == nil {
-			add("xai", p.Provider())
-		} else {
-			log.Printf("[providers] xai: %v", err)
-		}
-	} else if tok := firstEnv("ULTIPROXY_XAI_TOKEN"); tok != "" {
-		if p, err := openaicompat.New(openaicompat.Config{
-			Name:    "xai",
-			BaseURL: xaiDefaultBaseURL,
-			APIKey:  tok,
-			Quirks: openaicompat.Quirks{
-				CreditsQuotaObserver: xaiDefaultBillingURL,
-			},
-		}); err == nil {
-			add("xai", p.Provider())
-		} else {
-			log.Printf("[providers] xai: %v", err)
-		}
-	}
-
-	// Codex — ultiproxy-owned credentials or env token only (no ~/.codex reads).
-	{
-		credDir := filepath.Join(stateDir, "credentials", "codex")
-		mgr, mgrErr := newOAuthManager(credDir)
-		if mgrErr == nil && managerHasToken(mgr, codex.DefaultClientID) {
-			p := codex.New(codex.Config{AuthManager: mgr, ClientID: codex.DefaultClientID})
-			add("codex", p.ProviderBundle())
-		} else if tok := firstEnv("ULTIPROXY_CODEX_TOKEN"); tok != "" {
-			p := codex.New(codex.Config{StaticToken: tok})
-			add("codex", p.ProviderBundle())
-		} else if mgrErr == nil && managerHasToken(mgr, codex.DefaultClientID) {
-			p := codex.New(codex.Config{AuthManager: mgr, ClientID: codex.DefaultClientID})
-			add("codex", p.ProviderBundle())
-		}
-	}
-
-	// Antigravity — ultiproxy-owned OAuth only; registers only when a real token
-	// exists (a fresh install registers zero lanes).
-	if p := antigravity.NewFromState(home, stateDir, nil); p != nil && p.HasToken() {
-		add("antigravity", p.ProviderBundle())
-	}
+	// OAuth credential-scan lanes (T005): xai/codex/antigravity share one
+	// declarative scan+build loop (laneScanDescriptors) instead of three
+	// compile-time blocks. The xai build closes over the daemon-owned store
+	// above, so the compile-time lane, runtime lanes (providerStore.Creds,
+	// set by the caller) and MCP share one token.
+	scanCredentialLanes(registry, laneScanContext{stateDir: stateDir, home: home, xaiMgr: xaiMgr})
 
 	// Copilot — env token only (ultiproxy self-contained; no gh CLI shell-out).
 	copTok := firstEnv("ULTIPROXY_COPILOT_TOKEN", "COPILOT_GITHUB_TOKEN", "GH_TOKEN")
