@@ -1,0 +1,128 @@
+name: release
+
+# T008: tagging a release (v*) runs the repo gates, cross-builds the four
+# targets dist/install.sh fetches, and publishes checksummed tarballs whose
+# names match install.sh exactly:
+#   ultiproxy-<os>-<arch>.tar.gz (+ .sha256 sidecar)
+# where os = lowercased `uname -s` (linux|darwin) and arch = x86_64|arm64
+# (mapped from `uname -m`). The tarball holds the binary at archive root.
+#
+# CGO: go.mod uses modernc.org/sqlite (pure Go), so CGO_ENABLED=0
+# cross-builds work with the stock Go toolchain — no cgo cross toolchain.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  gates:
+    name: gates (build/test/vet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: go build
+        run: go build ./...
+      - name: go test
+        run: go test ./...
+      - name: go vet
+        run: go vet ./...
+
+  build:
+    name: build ${{ matrix.goos }}-${{ matrix.asset_arch }}
+    needs: gates
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # goarch is the GOARCH value; asset_arch is the install.sh name
+          # (install.sh maps x86_64|amd64 -> x86_64, arm64|aarch64 -> arm64).
+          - goos: linux
+            goarch: amd64
+            asset_arch: x86_64
+          - goos: linux
+            goarch: arm64
+            asset_arch: arm64
+          - goos: darwin
+            goarch: amd64
+            asset_arch: x86_64
+          - goos: darwin
+            goarch: arm64
+            asset_arch: arm64
+    env:
+      CGO_ENABLED: "0"
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build ultiproxy (version stamped from tag)
+        # GITHUB_REF_NAME is the tag (e.g. v0.1.1); main.version flows into
+        # `ultiproxy version`, the startup log and /healthz (AC4).
+        run: go build -trimpath -ldflags "-X main.version=${GITHUB_REF_NAME}" -o ultiproxy ./cmd/ultiproxy
+      - name: Package release asset
+        run: |
+          set -euo pipefail
+          ASSET="ultiproxy-${{ matrix.goos }}-${{ matrix.asset_arch }}.tar.gz"
+          # Binary at archive root: install.sh finds ./ultiproxy or one level deep.
+          tar -czf "${ASSET}" ultiproxy
+          # Sidecar in "hash  filename" form; install.sh also accepts a bare hash
+          # (it parses with awk '{print $1}').
+          sha256sum "${ASSET}" > "${ASSET}.sha256"
+          echo "--- pre-upload self-check ---"
+          sha256sum -c "${ASSET}.sha256"
+          tar -tzf "${ASSET}"
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ultiproxy-${{ matrix.goos }}-${{ matrix.asset_arch }}.tar.gz
+            ultiproxy-${{ matrix.goos }}-${{ matrix.asset_arch }}.tar.gz.sha256
+          fail_on_unmatched_files: true
+
+  verify:
+    # AC2: download-back check — fetch what was just published and verify
+    # exactly the way dist/install.sh does (awk '{print $1}' parsing).
+    name: verify published checksums
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dl && cd dl
+          gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
+          ls -la
+      - name: Verify checksums (install.sh parsing)
+        run: |
+          set -euo pipefail
+          cd dl
+          for TARBALL in ultiproxy-*.tar.gz; do
+            # Skip sidecars themselves; verify each tarball against its sidecar.
+            case "${TARBALL}" in *.sha256) continue;; esac
+            echo "== ${TARBALL} =="
+            sha256sum -c "${TARBALL}.sha256"
+            # install.sh:122-124 parsing: first field of sidecar vs first field
+            # of the local hash (works whether the sidecar carries "hash  file"
+            # or a bare "hash").
+            EXPECTED_HASH="$(awk '{print $1}' "${TARBALL}.sha256")"
+            ACTUAL_HASH="$(sha256sum "${TARBALL}" | awk '{print $1}')"
+            if [ "${EXPECTED_HASH}" != "${ACTUAL_HASH}" ]; then
+              echo "SHA256 mismatch for ${TARBALL}: expected ${EXPECTED_HASH}, got ${ACTUAL_HASH}" >&2
+              exit 1
+            fi
+            # install.sh:139-150 requires an executable named ultiproxy in the archive.
+            tar -tzf "${TARBALL}" | grep -qxE '(.*/)?ultiproxy'
+            echo "OK ${TARBALL}: checksum matches, ultiproxy binary present"
+          done

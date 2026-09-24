@@ -86,6 +86,17 @@ func WithCredentialStore(cs auth.CredentialStore) Option {
 	}
 }
 
+// WithVersion overrides the serverInfo version reported on initialize
+// (T008: release builds stamp the tag through server.WithVersion; empty
+// leaves the default untouched).
+func WithVersion(v string) Option {
+	return func(s *Server) {
+		if v != "" {
+			s.version = v
+		}
+	}
+}
+
 // NewServer creates a new MCP server.
 func NewServer(registry *provider.Registry, stateSource StateSource, opts ...Option) *Server {
 	s := &Server{

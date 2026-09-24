@@ -25,7 +25,11 @@ import (
 	"github.com/smhanov/ultiproxy/pkg/storage"
 )
 
-const version = "0.1.0"
+// version is the release version reported by `ultiproxy version`, the
+// startup log line and /healthz (via server.WithVersion). Release builds
+// stamp the tag with -ldflags "-X main.version=vX.Y.Z" (see
+// .github/workflows/release.yml, T008); the default is the dev version.
+var version = "0.1.0"
 
 func main() {
 	// The daemon serves by default (`ultiproxy --config ...` or the explicit
@@ -49,7 +53,9 @@ func main() {
 
 	switch cmd {
 	case "version":
-		fmt.Printf("ultiproxy v%s\n", version)
+		// version carries the full tag (e.g. v0.1.1) so /healthz equals
+		// the release tag (AC4); trim one leading v for display only.
+		fmt.Printf("ultiproxy v%s\n", strings.TrimPrefix(version, "v"))
 		os.Exit(0)
 
 	case "serve":
@@ -158,6 +164,7 @@ func runServe(configPath, dataDir string) {
 	providerStore.Restore(registry)
 
 	srv := server.NewServer(cfg, registry,
+		server.WithVersion(version),
 		server.WithStateManager(stateManager),
 		server.WithStorageWriter(writer),
 		server.WithRuntimeProviderStore(providerStore),
@@ -167,7 +174,7 @@ func runServe(configPath, dataDir string) {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("Ultiproxy v%s starting on %s", version, cfg.Server.Addr)
+		log.Printf("Ultiproxy v%s starting on %s", strings.TrimPrefix(version, "v"), cfg.Server.Addr)
 		if err := srv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			if isAddrInUse(err) {
 				log.Fatalf("HTTP server error: %v\nHint: the address is already in use — another process (e.g. Tor's SOCKS port or a second ultiproxy) may own %s; set ULTIPROXY_ADDR=127.0.0.1:<free port> to bind elsewhere", err, cfg.Server.Addr)

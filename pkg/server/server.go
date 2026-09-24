@@ -74,6 +74,11 @@ type Server struct {
 	// usage telemetry rows of one dispatch together. See nextRequestID.
 	requestIDSeq atomic.Int64
 	startedAt    time.Time
+	// version is the release version reported by /healthz and the MCP
+	// initialize response (T008). Default "0.1.0"; release builds override
+	// it via WithVersion from main.version (stamped by
+	// -ldflags "-X main.version=...").
+	version string
 }
 
 // nextRequestID returns a unique positive request id.
@@ -142,6 +147,17 @@ func WithModelRefreshInterval(d time.Duration) Option {
 	}
 }
 
+// WithVersion sets the release version reported by /healthz and the MCP
+// initialize response. main passes its ldflags-stamped version here; empty
+// leaves the default untouched.
+func WithVersion(v string) Option {
+	return func(s *Server) {
+		if v != "" {
+			s.version = v
+		}
+	}
+}
+
 // NewServer creates a new Server.
 func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server {
 	if cfg == nil {
@@ -158,6 +174,7 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		// Same convention for the credential refresher.
 		credentialRefreshInterval: -1,
 		startedAt:                 time.Now().UTC(),
+		version:                   "0.1.0",
 	}
 	s.requestIDSeq.Store(time.Now().UnixNano())
 
@@ -222,6 +239,7 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		mcpOpts := []mcp.Option{
 			mcp.WithAliasManager(&catalogBridge{catalog: s.catalog, server: s}),
 			mcp.WithTimeoutManager(&timeoutBridge{timeouts: s.timeouts}),
+			mcp.WithVersion(s.version),
 		}
 		if s.providers != nil {
 			mcpOpts = append(mcpOpts, mcp.WithProviderStore(s.providers))
@@ -380,11 +398,15 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if !s.startedAt.IsZero() {
 		uptime = int(time.Since(s.startedAt).Seconds())
 	}
+	ver := s.version
+	if ver == "" {
+		ver = "0.1.0"
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":         "ok",
-		"version":        "0.1.0",
+		"version":        ver,
 		"uptime_seconds": uptime,
 	})
 }
