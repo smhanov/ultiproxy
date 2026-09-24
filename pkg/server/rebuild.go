@@ -81,6 +81,6 @@ func (s *RuntimeProviderStore) RebuildLane(registry *provider.Registry, name str
 
 	// Replace in place (Register replaces preserving order). Only reached on
 	// success, so a failure never leaves the lane missing.
-	registry.Register(p.Provider())
+	registry.RegisterWithSource(p.Provider(), "rebuild")
 	return discovered, nil
 }

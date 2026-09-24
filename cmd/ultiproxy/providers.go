@@ -293,7 +293,7 @@ func scanCredentialLanes(registry *provider.Registry, ctx laneScanContext) {
 		if _, exists := registry.Get(d.name); exists {
 			log.Printf("[providers] %s: replacing existing registration with %s build", d.name, source)
 		}
-		registry.Register(bundle)
+		registry.RegisterWithSource(bundle, "startup-scan:"+source)
 		log.Printf("[providers] registered %s via %s", d.name, source)
 	}
 }
@@ -337,7 +337,7 @@ func registerProviders(registry *provider.Registry, configuredDataDir string) *a
 	stateDir := resolveProviderStateDir(configuredDataDir)
 
 	add := func(name string, bundle provider.Provider) {
-		registry.Register(bundle)
+		registry.RegisterWithSource(bundle, "startup-scan")
 		log.Printf("[providers] registered %s", name)
 	}
 

@@ -11,6 +11,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"time"
 
@@ -183,8 +184,22 @@ func NewRegistry() *Registry {
 	return &Registry{providers: make(map[string]Provider)}
 }
 
-// Register adds or replaces a provider under its Name().
+// Register adds or replaces a provider under its Name(). A second
+// registration with the same name deterministically replaces the entry in
+// place, preserving its order position; lookups afterwards return the new
+// provider. The source tag defaults to "runtime" (MCP add_provider).
 func (r *Registry) Register(p Provider) {
+	r.RegisterWithSource(p, "runtime")
+}
+
+// RegisterWithSource adds or replaces a provider under its Name(), tagging
+// the replacement log with the caller category: "runtime" (MCP add_provider
+// default), "restore" (providers.json Restore), "rebuild" (post-login
+// RebuildLane) or "startup-scan" (compile-time credential scan, with an
+// optional ":<subsource>" suffix such as "startup-scan:credential-scan").
+// Every replacement emits a log line naming the lane and its source; a first
+// registration is silent. An empty source defaults to "runtime".
+func (r *Registry) RegisterWithSource(p Provider, source string) {
 	name := ""
 	if p.Inference != nil {
 		name = p.Inference.Name()
@@ -196,9 +211,14 @@ func (r *Registry) Register(p Provider) {
 	if name == "" {
 		return
 	}
+	if source == "" {
+		source = "runtime"
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, exists := r.providers[name]; !exists {
+	if _, exists := r.providers[name]; exists {
+		log.Printf("[provider] replacing lane %q (source %s)", name, source)
+	} else {
 		r.order = append(r.order, name)
 	}
 	r.providers[name] = p

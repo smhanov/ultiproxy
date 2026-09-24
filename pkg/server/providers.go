@@ -555,7 +555,7 @@ func (s *RuntimeProviderStore) Restore(registry *provider.Registry) []string {
 			log.Printf("[providers] runtime %s: %v", name, err)
 			continue
 		}
-		registry.Register(p.Provider())
+		registry.RegisterWithSource(p.Provider(), "restore")
 		registered = append(registered, name)
 		log.Printf("[providers] registered runtime %s", name)
 	}
@@ -570,7 +570,7 @@ func (s *RuntimeProviderStore) Restore(registry *provider.Registry) []string {
 			log.Printf("[providers] runtime %s: %v", name, err)
 			continue
 		}
-		registry.Register(bundle)
+		registry.RegisterWithSource(bundle, "restore")
 		registered = append(registered, name)
 		log.Printf("[providers] registered runtime %s (kind %s)", name, sp.Kind)
 	}

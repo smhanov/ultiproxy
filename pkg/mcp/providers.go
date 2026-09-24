@@ -151,7 +151,7 @@ func (s *Server) rebuildLaneAfterLogin(ctx context.Context, name string) (int, s
 	if strings.Contains(note, "failed") {
 		return 0, fmt.Sprintf("lane rebuild failed: %s (previous lane preserved)", note), false
 	}
-	s.registry.Register(p.Provider())
+	s.registry.RegisterWithSource(p.Provider(), "rebuild")
 	return discovered, note, false
 }
 
