@@ -154,15 +154,32 @@ func managerHasToken(mgr *auth.Manager, key string) bool {
 	return err == nil && cred.AccessToken != ""
 }
 
+// resolveProviderStateDir unifies credential-state root resolution for
+// compile-time lanes. Precedence: explicit ULTIPROXY_DATA_DIR /
+// ULTIPROXY_STATE_DIR env wins, then the daemon's configured data_dir, then
+// the home default. An empty configured dir or "." (the zero-config default,
+// meaning "no custom dir") falls through to the home default so default runs
+// stay byte-identical to the pre-T008 behavior.
+func resolveProviderStateDir(configured string) string {
+	if dir := firstEnv("ULTIPROXY_DATA_DIR", "ULTIPROXY_STATE_DIR"); dir != "" {
+		return dir
+	}
+	if configured != "" && configured != "." {
+		return configured
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "state", "ultiproxy")
+}
+
 // registerProviders wires upstream adapters into the registry. Registration is
 // opt-in per provider and driven by environment variables OR ultiproxy-owned
 // credential stores. Antigravity never reads external CLI credential stores.
-func registerProviders(registry *provider.Registry) {
+// configuredDataDir is the daemon's general data dir (cfg.DataDir): credential
+// state follows it unless an explicit ULTIPROXY_DATA_DIR/ULTIPROXY_STATE_DIR
+// env override is set (see resolveProviderStateDir).
+func registerProviders(registry *provider.Registry, configuredDataDir string) {
 	home, _ := os.UserHomeDir()
-	stateDir := firstEnv("ULTIPROXY_DATA_DIR", "ULTIPROXY_STATE_DIR")
-	if stateDir == "" {
-		stateDir = filepath.Join(home, ".local", "state", "ultiproxy")
-	}
+	stateDir := resolveProviderStateDir(configuredDataDir)
 
 	add := func(name string, bundle provider.Provider) {
 		registry.Register(bundle)

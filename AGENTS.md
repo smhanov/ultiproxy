@@ -20,4 +20,4 @@ go test ./...          # full suite
 go vet ./...           # clean (except pre-existing gofmt debt in some files)
 ```
 
-Pre-existing gofmt violations that predate the migration (do not "fix" them as part of other tasks): `pkg/codec/openai.go`, `pkg/contract/opencode/fakeupstream.go`, `pkg/provider/hublane/adapter_test.go`, `pkg/provider/hublane/convert_test.go`.
+Pre-existing gofmt violations that predate the migration (do not "fix" them as part of other tasks): `pkg/codec/openai.go`, `pkg/contract/opencode/fakeupstream.go`, `pkg/provider/hublane/adapter_test.go`, `pkg/provider/hublane/convert_test.go`, `pkg/mcp/model_info_test.go`, `pkg/provider/openaicompat/openaicompat.go`.

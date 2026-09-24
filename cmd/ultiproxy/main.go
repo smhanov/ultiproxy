@@ -133,7 +133,7 @@ func runServe(configPath, dataDir string) {
 	registry := provider.NewRegistry()
 	stateManager := state.NewStateManager()
 
-	registerProviders(registry)
+	registerProviders(registry, cfg.DataDir)
 
 	// Runtime-registered lanes (MCP add_provider) persist to
 	// <data_dir>/providers.json and must be loaded BEFORE the router / model

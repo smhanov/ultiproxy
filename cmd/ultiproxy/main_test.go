@@ -298,6 +298,91 @@ func TestRuntimeLaneBuilderFreebuff(t *testing.T) {
 	}
 }
 
+// TestResolveProviderStateDirPrecedence (T008): explicit env wins, then the
+// configured data_dir, then the home default. "" and "." (the zero-config
+// default) both mean "no custom dir" and fall through to the home default so
+// default runs stay byte-identical.
+func TestResolveProviderStateDirPrecedence(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	def := filepath.Join(fakeHome, ".local", "state", "ultiproxy")
+
+	cases := []struct {
+		name       string
+		dataEnv    string
+		stateEnv   string
+		configured string
+		want       string
+	}{
+		{"dataDirEnvWins", "/env-data", "/env-state", "/cfg", "/env-data"},
+		{"stateDirEnvSecond", "", "/env-state", "/cfg", "/env-state"},
+		{"configuredWins", "", "", "/cfg", "/cfg"},
+		{"emptyFallsThrough", "", "", "", def},
+		{"dotFallsThrough", "", "", ".", def},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ULTIPROXY_DATA_DIR", tc.dataEnv)
+			t.Setenv("ULTIPROXY_STATE_DIR", tc.stateEnv)
+			if got := resolveProviderStateDir(tc.configured); got != tc.want {
+				t.Errorf("resolveProviderStateDir(%q) = %q, want %q", tc.configured, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRegisterProvidersFollowsConfiguredDataDir (T008 AC1/AC3): with no env
+// override, the compile-time lanes resolve credential state under the passed
+// configured dir (augure_token probe); with "" configured they fall back to
+// the home default.
+func TestRegisterProvidersFollowsConfiguredDataDir(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("ULTIPROXY_DATA_DIR", "")
+	t.Setenv("ULTIPROXY_STATE_DIR", "")
+	// Neutralize every env-token source except the augure probe so the test
+	// only observes the configured dir vs the home default.
+	for _, k := range []string{
+		"ZAI_API_KEY", "ULTIPROXY_ZAI_API_KEY",
+		"DEEPSEEK_API_KEY", "ULTIPROXY_DEEPSEEK_API_KEY",
+		"ULTIPROXY_ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY",
+		"OPENROUTER_API_KEY", "ULTIPROXY_OPENROUTER_API_KEY",
+		"ULTIPROXY_VLLM_BASE_URL", "VLLM_BASE_URL",
+		"OPENCODE_API_KEY", "ULTIPROXY_OPENCODE_API_KEY",
+		"AUGURE_TOKEN", "ULTIPROXY_XAI_TOKEN",
+		"ULTIPROXY_CODEX_TOKEN", "ULTIPROXY_COPILOT_TOKEN",
+		"COPILOT_GITHUB_TOKEN", "GH_TOKEN",
+		"ULTIPROXY_FREEBUFF_TOKEN", "FREEBUFF_TOKEN",
+	} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("ULTIPROXY_AUGURE_TOKEN", "aug-probe-token")
+
+	configured := t.TempDir()
+	registerProviders(provider.NewRegistry(), configured)
+
+	raw, err := os.ReadFile(filepath.Join(configured, "augure_token"))
+	if err != nil {
+		t.Fatalf("augure_token not written under configured dir: %v", err)
+	}
+	if got := strings.TrimSpace(string(raw)); got != "aug-probe-token" {
+		t.Errorf("augure_token = %q, want %q", got, "aug-probe-token")
+	}
+	if _, err := os.Stat(filepath.Join(fakeHome, ".local")); !os.IsNotExist(err) {
+		t.Errorf("fake HOME touched (err = %v), want no state under the home default", err)
+	}
+
+	// Default path: "" configured resolves under the home default.
+	registerProviders(provider.NewRegistry(), "")
+	raw, err = os.ReadFile(filepath.Join(fakeHome, ".local", "state", "ultiproxy", "augure_token"))
+	if err != nil {
+		t.Fatalf("augure_token not written under home default: %v", err)
+	}
+	if got := strings.TrimSpace(string(raw)); got != "aug-probe-token" {
+		t.Errorf("default augure_token = %q, want %q", got, "aug-probe-token")
+	}
+}
+
 // TestNewFreebuffActorExplicitToken verifies the actor builder itself: an
 // explicit token wins over discovery, is persisted once, and yields an actor
 // that satisfies the adapter surface used by the openaicompat quirks.
