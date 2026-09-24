@@ -4,20 +4,23 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/smhanov/llmhub/auth"
+	llmauth "github.com/smhanov/llmhub/auth"
+	"github.com/smhanov/ultiproxy/pkg/auth"
 )
 
 // Config configures the OpenAI-compatible provider adapter.
 type Config struct {
-	Name        string           // registry lane name ("openai-zai", "openai-vllm", ...)
-	BaseURL     string           // vendor default OR configured
-	APIKey      string           // static key
-	TokenSource auth.TokenSource // xai OAuth, augure refresh (set by the daemon, never by MCP)
+	Name        string               // registry lane name ("openai-zai", "openai-vllm", ...)
+	BaseURL     string               // vendor default OR configured
+	APIKey      string               // static key
+	TokenSource llmauth.TokenSource  // xai OAuth, augure refresh (set by the daemon, never by MCP)
+	Creds       auth.CredentialStore // xai OAuth credential store (injected by the daemon, never by MCP)
 	HTTPClient  *http.Client
-	// DataDir is internal daemon plumbing (not client-facing): the server-level
-	// directory holding xai OAuth creds / the augure token file. Runtime lanes
-	// get it assigned by the daemon runner, never from a config option.
-	DataDir string // for xai OAuth cred dir, augure token file
+	// DataDir is deprecated daemon plumbing (not client-facing): only the
+	// augure TokenFile derivation still reads it (see New). xai OAuth lanes
+	// must use Creds instead — a missing store is a hard error, never a
+	// TempDir fallback. Runtime lanes never carry their own data dir.
+	DataDir string // deprecated: augure token file only; xai uses Creds
 	Quirks  Quirks
 
 	// OptOutModelListPassthrough explicitly disables upstream model discovery

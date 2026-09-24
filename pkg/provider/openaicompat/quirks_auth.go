@@ -276,14 +276,15 @@ func (s *SupabaseTokenSource) Invalidate(accessToken string) {
 
 var _ llmauth.InvalidatableTokenSource = (*SupabaseTokenSource)(nil)
 
-// OAuthManagerTokenSource wraps an auth.Manager to implement llmauth.InvalidatableTokenSource.
+// OAuthManagerTokenSource wraps a CredentialStore to implement llmauth.InvalidatableTokenSource.
 type OAuthManagerTokenSource struct {
-	mgr      *auth.Manager
+	mgr      auth.CredentialStore
 	clientID string
 }
 
-// NewOAuthManagerTokenSource wraps an auth.Manager.
-func NewOAuthManagerTokenSource(mgr *auth.Manager, clientID string) *OAuthManagerTokenSource {
+// NewOAuthManagerTokenSource wraps a CredentialStore (usually the daemon-owned
+// *auth.Manager injected via Config.Creds).
+func NewOAuthManagerTokenSource(mgr auth.CredentialStore, clientID string) *OAuthManagerTokenSource {
 	if clientID == "" {
 		clientID = defaultXAIClientID
 	}

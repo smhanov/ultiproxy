@@ -133,7 +133,11 @@ func runServe(configPath, dataDir string) {
 	registry := provider.NewRegistry()
 	stateManager := state.NewStateManager()
 
-	registerProviders(registry, cfg.DataDir)
+	// Daemon-owned xai credential store (T002): a single *auth.Manager the
+	// compile-time lane, runtime lanes (via providerStore.Creds → injectCreds)
+	// and the MCP server (bridged through the store) all share, so an
+	// MCP-added OAuth lane persists where a restart will find it — never /tmp.
+	xaiCreds := registerProviders(registry, cfg.DataDir)
 
 	// Runtime-registered lanes (MCP add_provider) persist to
 	// <data_dir>/providers.json and must be loaded BEFORE the router / model
@@ -141,6 +145,9 @@ func runServe(configPath, dataDir string) {
 	// restores them without any config file.
 	providerStore := server.NewRuntimeProviderStore(filepath.Join(cfg.DataDir, "providers.json"))
 	providerStore.DefaultDataDir = cfg.DataDir
+	if xaiCreds != nil {
+		providerStore.Creds = xaiCreds
+	}
 	providerStore.ActorBuilder = runtimeFreebuffActorBuilder(cfg.DataDir)
 	// Custom-wire lanes (antigravity, anthropic, codex) reconstruct from the
 	// server's general DataDir: credential state lives at

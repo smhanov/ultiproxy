@@ -24,6 +24,21 @@ var (
 // Refresher defines the signature for token refresh logic.
 type Refresher func(ctx context.Context, cred Credential) (Credential, error)
 
+// CredentialStore is the lane-facing credential surface: the exact method set
+// lanes use today via *Manager. The daemon owns exactly one *Manager rooted at
+// <dataDir>/credentials and injects it into lanes as this interface, so lanes
+// never compute storage paths themselves. A missing store is a hard error at
+// lane build/login time (no TempDir fallback).
+type CredentialStore interface {
+	Get(ctx context.Context, key string) (Credential, error)
+	Peek(key string) (Credential, bool)
+	Store(ctx context.Context, key string, cred Credential) error
+	Invalidate(key, accessToken string) bool
+}
+
+// compile-time assertion: *Manager is the concrete CredentialStore.
+var _ CredentialStore = (*Manager)(nil)
+
 // Option configures Manager.
 type Option func(*Manager)
 

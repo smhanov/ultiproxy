@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/provider"
 )
 
@@ -20,9 +21,14 @@ type Server struct {
 	timeouts          TimeoutManager
 	providers         ProviderStore
 	customLaneBuilder func(name, kind, apiKey string) (provider.Provider, error)
-	name              string
-	version           string
-	mu                sync.RWMutex
+	// creds is the daemon-owned credential store injected into OAuth lanes
+	// added via add_provider (T002). Without it an auth_via_oauth_manager lane
+	// fails at build time with "credential store not injected", never falling
+	// back to os.TempDir().
+	creds   auth.CredentialStore
+	name    string
+	version string
+	mu      sync.RWMutex
 }
 
 // Option configures MCP server.
@@ -67,6 +73,16 @@ func WithProviderStore(ps ProviderStore) Option {
 func WithCustomLaneBuilder(builder func(name, kind, apiKey string) (provider.Provider, error)) Option {
 	return func(s *Server) {
 		s.customLaneBuilder = builder
+	}
+}
+
+// WithCredentialStore wires the daemon-owned credential store into OAuth lanes
+// added via add_provider (T002). The store is injected into the lane config
+// before openaicompat.New, so T004/T006 can Peek after login and a missing
+// store fails loudly instead of falling back to os.TempDir().
+func WithCredentialStore(cs auth.CredentialStore) Option {
+	return func(s *Server) {
+		s.creds = cs
 	}
 }
 

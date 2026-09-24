@@ -41,6 +41,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 )
@@ -167,10 +168,17 @@ type RuntimeProviderStore struct {
 	// "actor == nil") to decide which lanes are Freebuff.
 	freebuff map[string]bool
 	// DefaultDataDir is the server's general data directory. Runtime lanes do
-	// NOT carry their own data dir; credential state lives under
-	// <DefaultDataDir>/credentials/<lane> exactly like compile-time lanes.
+	// NOT carry their own data dir; credential state lives in the daemon-owned
+	// store (Creds, rooted at <DefaultDataDir>/credentials), exactly like
+	// compile-time lanes. DataDir is still assigned per lane for the remaining
+	// file-backed quirks (freebuff token, augure token file).
 	DefaultDataDir string
-	ActorBuilder   func(openaicompat.Config) any // optional freebuff actor reconstruction hook (set by cmd)
+	// Creds is the daemon-owned credential store injected into every runtime
+	// lane that authenticates via AuthViaOAuthManager (T002). It is never
+	// persisted (like TokenSource): restored lanes get the same store via
+	// injectCreds, so a restart keeps serving the same credential.
+	Creds        auth.CredentialStore
+	ActorBuilder func(openaicompat.Config) any // optional freebuff actor reconstruction hook (set by cmd)
 	// LaneBuilder constructs compile-time-wired lane kinds that are not
 	// openai-compatible (e.g. antigravity, anthropic, codex) from their stored
 	// identity. It receives the lane name, kind, the server's general DataDir
@@ -324,15 +332,27 @@ func (s *RuntimeProviderStore) Get(name string) (openaicompat.Config, bool) {
 	return cfg, ok
 }
 
-// credentialDir assigns a lane's credential directory from the server's
-// general DataDir. Runtime lanes never carry their own data dir, so restored
-// lanes get <DefaultDataDir>/credentials/<lane> exactly like a freshly added
-// one; the persisted DTO holds no data_dir of its own.
-func (s *RuntimeProviderStore) credentialDir(cfg openaicompat.Config) openaicompat.Config {
+// injectCreds assigns a lane's daemon-owned dependencies from the server's
+// general DataDir and shared credential store. Runtime lanes never carry their
+// own data dir or store: restored lanes get the same Creds as a freshly added
+// one (T002), so a restart keeps serving the same credential; the persisted
+// DTO holds neither. DataDir is still assigned per lane for the remaining
+// file-backed quirks (freebuff token, augure token file).
+func (s *RuntimeProviderStore) injectCreds(cfg openaicompat.Config) openaicompat.Config {
 	if cfg.DataDir == "" && s != nil && s.DefaultDataDir != "" {
 		cfg.DataDir = filepath.Join(s.DefaultDataDir, "credentials", cfg.Name)
 	}
+	if cfg.Creds == nil && s != nil && s.Creds != nil {
+		cfg.Creds = s.Creds
+	}
 	return cfg
+}
+
+// credentialDir is kept as a thin wrapper for injectCreds (T002 renamed the
+// helper to reflect that lanes now receive the daemon-owned store, not just a
+// directory).
+func (s *RuntimeProviderStore) credentialDir(cfg openaicompat.Config) openaicompat.Config {
+	return s.injectCreds(cfg)
 }
 
 // Add validates and stores a lane config, replacing any existing entry with

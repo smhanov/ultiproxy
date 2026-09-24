@@ -225,6 +225,7 @@ func TestProvider_TokenExpiresAt(t *testing.T) {
 	p, err := New(Config{
 		Name:                       "xai",
 		BaseURL:                    "http://127.0.0.1:1",
+		Creds:                      mgr,
 		TokenSource:                NewOAuthManagerTokenSource(mgr, defaultXAIClientID),
 		OptOutModelListPassthrough: true,
 		Quirks:                     Quirks{AuthViaOAuthManager: true},

@@ -175,6 +175,13 @@ func (s *Server) toolAddProvider(ctx context.Context, argsRaw json.RawMessage) (
 	}
 
 	cfg := args.config()
+	// T002: OAuth lanes authenticate from the daemon-owned credential store,
+	// never from a TempDir fallback. Inject it before validation so New builds
+	// its TokenSource from the same store a restart will restore; a missing
+	// store fails loudly in New with "credential store not injected".
+	if cfg.Quirks.AuthViaOAuthManager && cfg.Creds == nil && s.creds != nil {
+		cfg.Creds = s.creds
+	}
 
 	// Validate by building the adapter. New() does not dial the upstream
 	// (except the optional model-list passthrough discovery, whose failure is
@@ -188,10 +195,15 @@ func (s *Server) toolAddProvider(ctx context.Context, argsRaw json.RawMessage) (
 		return toolError("%v", err), nil
 	}
 	// The store may enrich what was added (the freebuff actor cannot cross the
-	// MCP boundary): re-read the stored config and rebuild when it changed so
-	// the lane registered right now matches what a restart would restore.
+	// MCP boundary, and injectCreds supplies the daemon-owned Creds): re-read
+	// the stored config and rebuild when it changed so the lane registered
+	// right now matches what a restart would restore.
 	if stored, ok := s.providers.List()[cfg.Name]; ok {
 		if stored.Quirks.FreebuffActor != nil && cfg.Quirks.FreebuffActor != stored.Quirks.FreebuffActor {
+			if rebuilt, err := openaicompat.New(stored); err == nil {
+				p = rebuilt
+			}
+		} else if cfg.Creds == nil && stored.Creds != nil {
 			if rebuilt, err := openaicompat.New(stored); err == nil {
 				p = rebuilt
 			}

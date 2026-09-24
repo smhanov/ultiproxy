@@ -225,6 +225,13 @@ func NewServer(cfg *Config, registry *provider.Registry, opts ...Option) *Server
 		}
 		if s.providers != nil {
 			mcpOpts = append(mcpOpts, mcp.WithProviderStore(s.providers))
+			// T002: the same daemon-owned store restored lanes get is visible
+			// to MCP add_provider, so an OAuth lane added over MCP persists
+			// through the store that a restart will re-inject (T004/T006 Peek
+			// after login through the same handle).
+			if s.providers.Creds != nil {
+				mcpOpts = append(mcpOpts, mcp.WithCredentialStore(s.providers.Creds))
+			}
 		}
 		if s.mcpLaneBuilder != nil {
 			mcpOpts = append(mcpOpts, mcp.WithCustomLaneBuilder(s.mcpLaneBuilder))

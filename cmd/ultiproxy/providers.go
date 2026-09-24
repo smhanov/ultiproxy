@@ -177,13 +177,33 @@ func resolveProviderStateDir(configured string) string {
 // configuredDataDir is the daemon's general data dir (cfg.DataDir): credential
 // state follows it unless an explicit ULTIPROXY_DATA_DIR/ULTIPROXY_STATE_DIR
 // env override is set (see resolveProviderStateDir).
-func registerProviders(registry *provider.Registry, configuredDataDir string) {
+//
+// It returns the daemon-owned xai credential store (T002): exactly one
+// *auth.Manager rooted at <stateDir>/credentials/xai, injected into every
+// openaicompat xai lane via Config.Creds. The per-lane subdir is kept (not
+// flattened to <stateDir>/credentials) so existing tokens stay valid, the
+// startup scan keeps finding them, and AC1's <dataDir>/credentials/<lane>/
+// layout holds. Lanes never compute paths themselves; a nil Creds is a hard
+// error in openaicompat.New/CompleteLogin, never a TempDir fallback.
+// Key-collision check (T002 risk): the shared store only ever holds xai keys
+// (defaultXAIClientID); codex (app_EMoamEEZ...) and antigravity use separate
+// managers/dirs with their own refreshers, so no key or refresher collision.
+func registerProviders(registry *provider.Registry, configuredDataDir string) *auth.Manager {
 	home, _ := os.UserHomeDir()
 	stateDir := resolveProviderStateDir(configuredDataDir)
 
 	add := func(name string, bundle provider.Provider) {
 		registry.Register(bundle)
 		log.Printf("[providers] registered %s", name)
+	}
+
+	// Daemon-owned xai store (T002). Created once here and shared by the
+	// compile-time lane below, the RuntimeProviderStore (providerStore.Creds,
+	// set by the caller) and the MCP server (bridged through the store).
+	xaiMgr, xaiMgrErr := newOAuthManager(filepath.Join(stateDir, "credentials", "xai"))
+	if xaiMgrErr != nil {
+		log.Printf("[providers] xai credential store: %v", xaiMgrErr)
+		xaiMgr = nil
 	}
 
 	// Z.ai Coding Plan (GLM) — zero marginal cost on subscription.
@@ -309,51 +329,34 @@ func registerProviders(registry *provider.Registry, configuredDataDir string) {
 		}
 	}
 
-	// xAI Grok — ultiproxy-owned credentials first; env, then ~/.grok (xAI CLI).
-	{
-		credDir := filepath.Join(stateDir, "credentials", "xai")
-		mgr, mgrErr := newOAuthManager(credDir)
-		if mgrErr == nil && managerHasToken(mgr, xaiDefaultClientID) {
-			if p, err := openaicompat.New(openaicompat.Config{
-				Name:    "xai",
-				BaseURL: xaiDefaultBaseURL,
-				DataDir: credDir,
-				Quirks: openaicompat.Quirks{
-					AuthViaOAuthManager:  true,
-					CreditsQuotaObserver: xaiDefaultBillingURL,
-				},
-			}); err == nil {
-				add("xai", p.Provider())
-			} else {
-				log.Printf("[providers] xai: %v", err)
-			}
-		} else if tok := firstEnv("ULTIPROXY_XAI_TOKEN"); tok != "" {
-			if p, err := openaicompat.New(openaicompat.Config{
-				Name:    "xai",
-				BaseURL: xaiDefaultBaseURL,
-				APIKey:  tok,
-				Quirks: openaicompat.Quirks{
-					CreditsQuotaObserver: xaiDefaultBillingURL,
-				},
-			}); err == nil {
-				add("xai", p.Provider())
-			} else {
-				log.Printf("[providers] xai: %v", err)
-			}
-		} else if mgrErr == nil && managerHasToken(mgr, xaiDefaultClientID) {
-			if p, err := openaicompat.New(openaicompat.Config{
-				Name:    "xai",
-				BaseURL: xaiDefaultBaseURL,
-				DataDir: credDir,
-				Quirks: openaicompat.Quirks{
-					AuthViaOAuthManager:  true,
-					CreditsQuotaObserver: xaiDefaultBillingURL,
-				},
-			}); err == nil {
-				add("xai", p.Provider())
-			} else {
-				log.Printf("[providers] xai: %v", err)
-			}
+	// xAI Grok — ultiproxy-owned credentials first, then env static token.
+	// The lane receives the daemon-owned store (Creds), never a DataDir.
+	if xaiMgr != nil && managerHasToken(xaiMgr, xaiDefaultClientID) {
+		if p, err := openaicompat.New(openaicompat.Config{
+			Name:    "xai",
+			BaseURL: xaiDefaultBaseURL,
+			Creds:   xaiMgr,
+			Quirks: openaicompat.Quirks{
+				AuthViaOAuthManager:  true,
+				CreditsQuotaObserver: xaiDefaultBillingURL,
+			},
+		}); err == nil {
+			add("xai", p.Provider())
+		} else {
+			log.Printf("[providers] xai: %v", err)
+		}
+	} else if tok := firstEnv("ULTIPROXY_XAI_TOKEN"); tok != "" {
+		if p, err := openaicompat.New(openaicompat.Config{
+			Name:    "xai",
+			BaseURL: xaiDefaultBaseURL,
+			APIKey:  tok,
+			Quirks: openaicompat.Quirks{
+				CreditsQuotaObserver: xaiDefaultBillingURL,
+			},
+		}); err == nil {
+			add("xai", p.Provider())
+		} else {
+			log.Printf("[providers] xai: %v", err)
 		}
 	}
 
@@ -414,6 +417,8 @@ func registerProviders(registry *provider.Registry, configuredDataDir string) {
 			}
 		}
 	}
+
+	return xaiMgr
 }
 
 // fbLaneBaseURL returns the freebuff lane's upstream base URL. Overridable via

@@ -1529,10 +1529,14 @@ func TestOpenAICompat_Login_OAuthManager(t *testing.T) {
 	defer srv.Close()
 
 	tempDir := t.TempDir()
+	mgr, err := auth.NewManager(tempDir, nil)
+	if err != nil {
+		t.Fatalf("auth.NewManager: %v", err)
+	}
 	p, err := New(Config{
 		Name:          "xai",
 		BaseURL:       "https://api.x.ai",
-		DataDir:       tempDir,
+		Creds:         mgr,
 		HTTPClient:    srv.Client(),
 		DeviceAuthURL: srv.URL + "/device",
 		TokenURL:      srv.URL + "/token",
@@ -1583,10 +1587,14 @@ func TestOpenAICompat_StartLogin_XAIScope(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
+	mgr, err := auth.NewManager(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("auth.NewManager: %v", err)
+	}
 	p, err := New(Config{
 		Name:          "xai",
 		BaseURL:       "https://api.x.ai",
-		DataDir:       t.TempDir(),
+		Creds:         mgr,
 		HTTPClient:    srv.Client(),
 		DeviceAuthURL: srv.URL + "/device",
 		TokenURL:      srv.URL + "/token",
@@ -1810,7 +1818,7 @@ func newRefreshTestProvider(t *testing.T, baseURL string, client *http.Client, r
 		Name:        "xai",
 		BaseURL:     baseURL,
 		HTTPClient:  client,
-		DataDir:     t.TempDir(),
+		Creds:       mgr,
 		TokenSource: NewOAuthManagerTokenSource(mgr, defaultXAIClientID),
 		Quirks:      Quirks{AuthViaOAuthManager: true},
 	})

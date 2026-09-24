@@ -115,17 +115,17 @@ func New(cfg Config) (*Provider, error) {
 		cfg.TokenSource = NewSupabaseTokenSource(client, refreshURL, tokenFile, cfg.APIKey, "")
 	}
 
-	// Quirks: AuthViaOAuthManager TokenSource initialization
+	// Quirks: AuthViaOAuthManager TokenSource initialization. The credential
+	// store is daemon-owned and injected via Config.Creds — a missing store is
+	// a hard error, never a TempDir fallback (T002).
 	if cfg.Quirks.AuthViaOAuthManager && cfg.TokenSource == nil {
-		dataDir := cfg.DataDir
-		if dataDir == "" {
-			dataDir = filepath.Join(os.TempDir(), "ultiproxy-xai-auth")
+		if cfg.Creds == nil {
+			return nil, errors.New("openaicompat: xai: credential store not injected (Config.Creds is nil)")
 		}
-		refresher := oauth.MakeRefresher(client, "https://auth.x.ai/oauth2/token", defaultXAIClientID, "")
-		mgr, err := auth.NewManager(dataDir, refresher)
-		if err == nil {
-			cfg.TokenSource = NewOAuthManagerTokenSource(mgr, defaultXAIClientID)
+		if setter, ok := cfg.Creds.(interface{ SetRefresher(auth.Refresher) }); ok {
+			setter.SetRefresher(oauth.MakeRefresher(client, "https://auth.x.ai/oauth2/token", defaultXAIClientID, ""))
 		}
+		cfg.TokenSource = NewOAuthManagerTokenSource(cfg.Creds, defaultXAIClientID)
 	}
 
 	// Model discovery is on by default for OpenAI-compatible lanes (see
@@ -1212,14 +1212,10 @@ func (p *Provider) completeXAI(ctx context.Context) error {
 	p.mu.Unlock()
 
 	// Persist so Token() (via the OAuth manager TokenSource) can serve it later.
-	dataDir := p.cfg.DataDir
-	if dataDir == "" {
-		dataDir = filepath.Join(os.TempDir(), "ultiproxy-xai-auth")
-	}
-	refresher := oauth.MakeRefresher(p.httpClient, pending.cfg.TokenURL, defaultXAIClientID, "")
-	mgr, err := auth.NewManager(dataDir, refresher)
-	if err != nil {
-		return fmt.Errorf("openaicompat: xai login credential store: %w", err)
+	// The store is daemon-owned (Config.Creds) — a missing store is a hard
+	// error, never a TempDir fallback (T002).
+	if p.cfg.Creds == nil {
+		return errors.New("openaicompat: xai: credential store not injected (Config.Creds is nil)")
 	}
 	expiresIn := tokResp.ExpiresIn
 	if expiresIn <= 0 {
@@ -1232,7 +1228,7 @@ func (p *Provider) completeXAI(ctx context.Context) error {
 		ExpiresAt:    time.Now().Add(time.Duration(expiresIn) * time.Second),
 		ClientID:     defaultXAIClientID,
 	}
-	if err := mgr.Store(ctx, defaultXAIClientID, cred); err != nil {
+	if err := p.cfg.Creds.Store(ctx, defaultXAIClientID, cred); err != nil {
 		return fmt.Errorf("openaicompat: xai login credential store: %w", err)
 	}
 	return nil

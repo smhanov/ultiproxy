@@ -107,7 +107,7 @@ func newExpiringLane(t *testing.T, name, baseURL string, client *http.Client, cl
 		Name:        name,
 		BaseURL:     baseURL,
 		HTTPClient:  client,
-		DataDir:     dir,
+		Creds:       mgr,
 		TokenSource: openaicompat.NewOAuthManagerTokenSource(mgr, xaiClientID),
 		// Discovery would dial the upstream at construction time; the
 		// assertion under test is "zero upstream calls", so opt out.
