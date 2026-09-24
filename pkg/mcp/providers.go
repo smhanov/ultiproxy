@@ -38,6 +38,98 @@ type ProviderStore interface {
 	List() map[string]openaicompat.Config
 }
 
+// laneRebuilder is implemented by the real RuntimeProviderStore
+// (pkg/server/rebuild.go) to rebuild one lane from its stored config after a
+// credential change. It is asserted dynamically so this package never imports
+// server (import cycle); stores that do not implement it use the local
+// fallback in rebuildLaneAfterLogin, which mirrors the same Enrich → New →
+// Register → bounded-discovery path through the ProviderStore interface.
+type laneRebuilder interface {
+	RebuildLane(registry *provider.Registry, name string) (int, error)
+}
+
+// hasLane reports whether the store holds any record (openai-compatible or
+// custom) for name. ProviderStore.List covers only openai-compatible lanes;
+// the real store also answers Has for custom kinds.
+func hasLane(store ProviderStore, name string) bool {
+	if store == nil {
+		return false
+	}
+	if _, ok := store.List()[name]; ok {
+		return true
+	}
+	if h, ok := store.(interface{ Has(string) bool }); ok {
+		return h.Has(name)
+	}
+	return false
+}
+
+// rebuildLaneAfterLogin rebuilds one lane after CompleteLogin stored a fresh
+// credential, so the completion reply can state the real routable state.
+//
+// It returns the post-login discovery count, an explanatory note ("" on a
+// clean rebuild) and whether the lane is not held by the runtime store. The
+// three outcomes map to the T004 acceptance criteria:
+//   - success: (n, "", false) — registry serves the rebuilt lane, list_models
+//     is fresh without a restart (AC1, AC2);
+//   - not in store: (0, "", true) — the caller reports "credential stored;
+//     lane not registered — call add_provider" (AC3), not an error and not a
+//     false "usable";
+//   - rebuild failure: (0, "lane rebuild failed: ... (previous lane
+//     preserved)", false) — the previous lane is untouched (AC4).
+//
+// The preferred path delegates to the daemon store's RebuildLane (the same
+// Enrich helper and discovery budget T003 established). Test doubles that do
+// not implement it fall back to the identical path built from the
+// ProviderStore interface.
+func (s *Server) rebuildLaneAfterLogin(ctx context.Context, name string) (int, string, bool) {
+	if s == nil || s.registry == nil || s.providers == nil {
+		return 0, "lane rebuild skipped: provider store or registry not configured (previous lane preserved)", false
+	}
+	// Preferred: the daemon-owned store rebuilds from what a restart would
+	// restore.
+	if rb, ok := s.providers.(laneRebuilder); ok {
+		discovered, err := rb.RebuildLane(s.registry, name)
+		if err == nil {
+			return discovered, "", false
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "not present in runtime store") {
+			return 0, "", true
+		}
+		if strings.Contains(msg, "custom-wire lane") {
+			return 0, "credential stored; custom-wire lane has no post-login rebuild (models addressed as <lane>/<model>)", false
+		}
+		return 0, fmt.Sprintf("lane rebuild failed: %v (previous lane preserved)", err), false
+	}
+	// Fallback for stores without RebuildLane (tests): same path through the
+	// interface. List covers openai-compatible lanes; Has also catches custom
+	// kinds so a stored custom lane is not misreported as unregistered.
+	stored, ok := s.providers.List()[name]
+	if !ok {
+		if hasLane(s.providers, name) {
+			return 0, "credential stored; custom-wire lane has no post-login rebuild (models addressed as <lane>/<model>)", false
+		}
+		return 0, "", true
+	}
+	cfg := s.providers.Enrich(stored)
+	// T002 is preserved: OAuth lanes authenticate from the daemon-owned
+	// store, never a TempDir fallback (mirrors toolAddProvider).
+	if cfg.Quirks.AuthViaOAuthManager && cfg.Creds == nil && s.creds != nil {
+		cfg.Creds = s.creds
+	}
+	p, err := openaicompat.New(cfg)
+	if err != nil {
+		return 0, fmt.Sprintf("lane rebuild failed: %v (previous lane preserved)", err), false
+	}
+	discovered, note := discoverModelsForReply(ctx, name, p.Provider())
+	if strings.Contains(note, "failed") {
+		return 0, fmt.Sprintf("lane rebuild failed: %s (previous lane preserved)", note), false
+	}
+	s.registry.Register(p.Provider())
+	return discovered, note, false
+}
+
 // providerQuirksArgs is the JSON-able subset of openaicompat.Quirks accepted by
 // the add_provider tool. Quirks.FreebuffActor cannot cross the MCP boundary (it
 // is an injected *FreebuffAccountActor, not JSON-serializable), so freebuff

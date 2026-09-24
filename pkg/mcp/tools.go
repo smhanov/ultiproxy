@@ -124,9 +124,9 @@ provider: the lane whose login was started with initiate_oauth_login.
 
 One call waits at most ~90 seconds and answers either:
 - status "pending": nobody has approved yet - simply call again (device flows normally need a few polls while the human types the user_code)
-- status "completed": tokens are stored, the lane is usable
+- status "completed": tokens are stored, the lane is rebuilt from its stored config with the fresh credential and re-discovered, so it is usable without a restart - the reply carries discovered_models (post-login model count) and, when relevant, a note
 
-Anything else is returned as an error. Auth-code flows whose token exchange happens server-side also finish here; flows that need the code copied out of the browser redirect must use submit_oauth_code instead.`,
+The completed reply is honest about the lane state: a lane that is not held by the runtime store reports "credential stored; lane not registered — call add_provider" instead of a false "usable", and a rebuild failure reports its reason with the previous lane preserved. Auth-code flows whose token exchange happens server-side also finish here; flows that need the code copied out of the browser redirect must use submit_oauth_code instead.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
@@ -142,7 +142,7 @@ Anything else is returned as an error. Auth-code flows whose token exchange happ
 - provider: the lane whose login was started with initiate_oauth_login (e.g. antigravity)
 - code: the authorization code from the redirect callback URL (http://localhost:<port>/oauth-callback?code=...&state=... - copy only the code value) or from the provider's success page
 
-On success the code is exchanged for tokens server-side and the answer is status "completed". Codes are single-use and short-lived: if the exchange fails, start over with initiate_oauth_login. A browser running on the same machine as the daemon is captured automatically by the loopback listener, so this tool is the path for remote or headless browsers.`,
+On success the code is exchanged for tokens server-side and the answer is status "completed": the lane is rebuilt from its stored config with the fresh credential and re-discovered, so it is usable without a restart - the reply carries discovered_models (post-login model count) and, when relevant, a note (including "credential stored; lane not registered — call add_provider" when the lane is not held by the runtime store, and the rebuild failure reason with the previous lane preserved). Codes are single-use and short-lived: if the exchange fails, start over with initiate_oauth_login. A browser running on the same machine as the daemon is captured automatically by the loopback listener, so this tool is the path for remote or headless browsers.`,
 		InputSchema: &InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
@@ -983,6 +983,9 @@ func (s *Server) toolInitiateOAuthLogin(ctx context.Context, argsRaw json.RawMes
 	}
 
 	// Legacy blocking providers: run the full flow (may block on stdin).
+	// A post-login rebuild still runs so the reply states the real routable
+	// state without a restart (T004); failures are honest notes, never a
+	// false "usable".
 	if err := prov.Auth.Login(ctx); err != nil {
 		return &CallToolResult{
 			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("oauth login error: %v", err)}},
@@ -990,14 +993,35 @@ func (s *Server) toolInitiateOAuthLogin(ctx context.Context, argsRaw json.RawMes
 		}, nil
 	}
 
-	res := map[string]any{
-		"status":   "initiated",
-		"provider": args.Provider,
-	}
+	res := s.completedLoginReply(ctx, args.Provider, "initiated")
 	b, _ := json.MarshalIndent(res, "", "  ")
 	return &CallToolResult{
 		Content: []ToolContent{{Type: "text", Text: string(b)}},
 	}, nil
+}
+
+// completedLoginReply builds the post-login reply after CompleteLogin (or the
+// legacy Login) stored a fresh credential. It rebuilds the lane from its
+// stored config so "completed" means usable without a restart (T004):
+//   - rebuilt: status/completed + discovered_models count (AC1, AC2);
+//   - lane not in the runtime store: credential stored; lane not registered —
+//     call add_provider (AC3), not an error and not a false "usable";
+//   - rebuild failure: honest note with the failure reason; the previous lane
+//     is preserved (AC4).
+func (s *Server) completedLoginReply(ctx context.Context, lane, status string) map[string]any {
+	res := map[string]any{
+		"status":   status,
+		"provider": lane,
+	}
+	discovered, note, notRegistered := s.rebuildLaneAfterLogin(ctx, lane)
+	res["discovered_models"] = discovered
+	switch {
+	case notRegistered:
+		res["note"] = "credential stored; lane not registered — call add_provider"
+	case note != "":
+		res["note"] = note
+	}
+	return res
 }
 
 // toolCheckOAuthLogin polls a pending device flow (CompleteLogin with a short
@@ -1056,10 +1080,7 @@ func (s *Server) toolCheckOAuthLogin(ctx context.Context, argsRaw json.RawMessag
 		}, nil
 	}
 
-	b, _ := json.MarshalIndent(map[string]any{
-		"status":   "completed",
-		"provider": args.Provider,
-	}, "", "  ")
+	b, _ := json.MarshalIndent(s.completedLoginReply(ctx, args.Provider, "completed"), "", "  ")
 	return &CallToolResult{Content: []ToolContent{{Type: "text", Text: string(b)}}}, nil
 }
 
@@ -1103,10 +1124,7 @@ func (s *Server) toolSubmitOAuthCode(ctx context.Context, argsRaw json.RawMessag
 			IsError: true,
 		}, nil
 	}
-	b, _ := json.MarshalIndent(map[string]any{
-		"status":   "completed",
-		"provider": args.Provider,
-	}, "", "  ")
+	b, _ := json.MarshalIndent(s.completedLoginReply(ctx, args.Provider, "completed"), "", "  ")
 	return &CallToolResult{Content: []ToolContent{{Type: "text", Text: string(b)}}}, nil
 }
 
