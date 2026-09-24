@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -18,6 +20,11 @@ import (
 type ProviderStore interface {
 	// Add validates + stores a lane config and persists it (providers.json).
 	Add(cfg openaicompat.Config) error
+	// Enrich returns the lane config a restart would restore (credential
+	// injection + resolved discovery flag + real freebuff actor). toolAddProvider
+	// builds the live lane from the enriched config so live == stored; Add
+	// re-applies it as a no-op.
+	Enrich(cfg openaicompat.Config) openaicompat.Config
 	// AddCustom stores a non-OpenAI-compatible lane (kind, plus the api_key
 	// for kinds that need a static key) and persists it. Used for
 	// antigravity-like compile-time-wired lanes that the store can hold but
@@ -151,6 +158,74 @@ func toolJSON(payload any) *CallToolResult {
 	}
 }
 
+// sameInterfaceValue reports whether two interface values are equal without
+// panicking on non-comparable dynamics (e.g. an actor holding a slice). A
+// non-comparable pair is treated as different so the drift path rebuilds.
+func sameInterfaceValue(a, b any) (equal bool) {
+	defer func() {
+		if recover() != nil {
+			equal = false
+		}
+	}()
+	equal = (a == b)
+	return equal
+}
+
+// isRealFreebuffActor reports whether v is a usable actor (not the MCP
+// placeholder marker, which is a non-nil struct{} that implements nothing).
+func isRealFreebuffActor(v any) bool {
+	if v == nil {
+		return false
+	}
+	_, ok := v.(openaicompat.FreebuffActor)
+	return ok
+}
+
+// laneConfigsDrifted reports whether the config the live lane was built from
+// differs from what the store persisted for the same lane. Enrich-before-build
+// plus Add-as-no-op should make this false; a true result means a future
+// enrichment changed one side only, so the caller rebuilds the live lane from
+// the stored config (what a restart would restore).
+func laneConfigsDrifted(built, stored openaicompat.Config) bool {
+	if built.Name != stored.Name ||
+		built.BaseURL != stored.BaseURL ||
+		built.APIKey != stored.APIKey ||
+		built.DataDir != stored.DataDir ||
+		built.OptOutModelListPassthrough != stored.OptOutModelListPassthrough {
+		return true
+	}
+	if (built.Creds == nil) != (stored.Creds == nil) {
+		return true
+	}
+	if built.Creds != nil && stored.Creds != nil && !sameInterfaceValue(built.Creds, stored.Creds) {
+		return true
+	}
+	bq, sq := built.Quirks, stored.Quirks
+	if bq.CodingPlanPath != sq.CodingPlanPath ||
+		bq.EchoReasoning != sq.EchoReasoning ||
+		bq.ModelListPassthrough != sq.ModelListPassthrough ||
+		bq.AuthViaOAuthManager != sq.AuthViaOAuthManager ||
+		bq.CreditsQuotaObserver != sq.CreditsQuotaObserver ||
+		bq.AuthViaSupabaseRefresh != sq.AuthViaSupabaseRefresh ||
+		bq.FreebuffDefaultTool != sq.FreebuffDefaultTool ||
+		bq.DefaultModel != sq.DefaultModel {
+		return true
+	}
+	if !reflect.DeepEqual(bq.MaxTokensByModel, sq.MaxTokensByModel) {
+		return true
+	}
+	if (bq.FreebuffActor == nil) != (sq.FreebuffActor == nil) {
+		return true
+	}
+	if isRealFreebuffActor(bq.FreebuffActor) != isRealFreebuffActor(sq.FreebuffActor) {
+		return true
+	}
+	if bq.FreebuffActor != nil && sq.FreebuffActor != nil && !sameInterfaceValue(bq.FreebuffActor, sq.FreebuffActor) {
+		return true
+	}
+	return false
+}
+
 // toolAddProvider registers an OpenAI-compatible lane at runtime: validate by
 // constructing the adapter, register into the live registry, persist to
 // providers.json so the lane survives a restart.
@@ -174,11 +249,18 @@ func (s *Server) toolAddProvider(ctx context.Context, argsRaw json.RawMessage) (
 		return toolError("base_url is required"), nil
 	}
 
-	cfg := args.config()
-	// T002: OAuth lanes authenticate from the daemon-owned credential store,
-	// never from a TempDir fallback. Inject it before validation so New builds
-	// its TokenSource from the same store a restart will restore; a missing
-	// store fails loudly in New with "credential store not injected".
+	// Single lane build path (T003): enrich first so the live lane is built
+	// from exactly what a restart would restore. T002 is preserved: OAuth lanes
+	// authenticate from the daemon-owned store, never a TempDir fallback. The
+	// MCP handle (s.creds) is injected before Enrich so the store sees it; if
+	// the store carries no Creds the handle is applied again after Enrich, and
+	// a missing store still fails loudly in New with "credential store not
+	// injected".
+	cfgRaw := args.config()
+	if cfgRaw.Quirks.AuthViaOAuthManager && cfgRaw.Creds == nil && s.creds != nil {
+		cfgRaw.Creds = s.creds
+	}
+	cfg := s.providers.Enrich(cfgRaw)
 	if cfg.Quirks.AuthViaOAuthManager && cfg.Creds == nil && s.creds != nil {
 		cfg.Creds = s.creds
 	}
@@ -194,18 +276,17 @@ func (s *Server) toolAddProvider(ctx context.Context, argsRaw json.RawMessage) (
 	if err := s.providers.Add(cfg); err != nil {
 		return toolError("%v", err), nil
 	}
-	// The store may enrich what was added (the freebuff actor cannot cross the
-	// MCP boundary, and injectCreds supplies the daemon-owned Creds): re-read
-	// the stored config and rebuild when it changed so the lane registered
-	// right now matches what a restart would restore.
+	// Add re-applies Enrich as a no-op, so the stored config should equal the
+	// built one. Re-read as a drift assertion: any future enrichment that
+	// changes one side only rebuilds the live lane from the stored config
+	// instead of shipping the drift (this subsumes the old freebuff-only and
+	// Creds-only rebuild branches).
 	if stored, ok := s.providers.List()[cfg.Name]; ok {
-		if stored.Quirks.FreebuffActor != nil && cfg.Quirks.FreebuffActor != stored.Quirks.FreebuffActor {
+		if laneConfigsDrifted(cfg, stored) {
+			log.Printf("[mcp] add_provider drift for %q: built config differs from stored, rebuilding live lane from stored", cfg.Name)
 			if rebuilt, err := openaicompat.New(stored); err == nil {
 				p = rebuilt
-			}
-		} else if cfg.Creds == nil && stored.Creds != nil {
-			if rebuilt, err := openaicompat.New(stored); err == nil {
-				p = rebuilt
+				cfg = stored
 			}
 		}
 	}

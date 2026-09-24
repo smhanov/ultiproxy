@@ -418,10 +418,18 @@ func (s *fileProviderStore) Add(cfg openaicompat.Config) error {
 	if cfg.BaseURL == "" {
 		return errTest("base_url is required")
 	}
+	cfg = s.Enrich(cfg)
 	s.mu.Lock()
 	s.m[cfg.Name] = cfg
 	s.mu.Unlock()
 	return s.persist()
+}
+
+// Enrich mirrors RuntimeProviderStore.Enrich for the discovery flag (the test
+// double has no DataDir, Creds store or actor builder to inject).
+func (s *fileProviderStore) Enrich(cfg openaicompat.Config) openaicompat.Config {
+	cfg.Quirks.ModelListPassthrough = openaicompat.ModelListPassthroughEnabled(cfg)
+	return cfg
 }
 
 // AddCustom stores a custom-kind lane in the in-memory test store.

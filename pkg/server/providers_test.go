@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/smhanov/ultiproxy/pkg/auth"
 	"github.com/smhanov/ultiproxy/pkg/provider"
 	"github.com/smhanov/ultiproxy/pkg/provider/openaicompat"
 )
@@ -362,6 +363,109 @@ type fakeFreebuffActor struct{}
 
 func (fakeFreebuffActor) Acquire(ctx context.Context) error { return nil }
 func (fakeFreebuffActor) Release()                          {}
+
+// TestRuntimeProviderStore_EnrichIsIdempotent (T003 AC1): Enrich injects the
+// daemon-owned DataDir/Creds, resolves the discovery flag and builds the
+// freebuff actor once; a second Enrich and Add are no-ops so live == stored.
+func TestRuntimeProviderStore_EnrichIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.json")
+
+	credDir := filepath.Join(dir, "credentials", "xai")
+	mgr, err := auth.NewManager(credDir, nil)
+	if err != nil {
+		t.Fatalf("creds manager: %v", err)
+	}
+
+	built := 0
+	s := NewRuntimeProviderStore(path)
+	s.DefaultDataDir = dir
+	s.Creds = mgr
+	s.ActorBuilder = func(cfg openaicompat.Config) any {
+		built++
+		return any(fakeFreebuffActor{})
+	}
+
+	raw := openaicompat.Config{
+		Name:    "xai",
+		BaseURL: "http://127.0.0.1:1/v1",
+		Quirks: openaicompat.Quirks{
+			AuthViaOAuthManager: true,
+			FreebuffActor:       freebuffMarkerActor{},
+			FreebuffDefaultTool: true,
+		},
+	}
+	first := s.Enrich(raw)
+	if first.DataDir != filepath.Join(dir, "credentials", "xai") {
+		t.Fatalf("enriched DataDir = %q", first.DataDir)
+	}
+	if first.Creds == nil {
+		t.Fatal("enriched config has no Creds")
+	}
+	if first.Quirks.ModelListPassthrough {
+		t.Error("freebuff lane must resolve discovery OFF")
+	}
+	if _, ok := first.Quirks.FreebuffActor.(fakeFreebuffActor); !ok {
+		t.Fatalf("enriched actor = %T, want fakeFreebuffActor", first.Quirks.FreebuffActor)
+	}
+	if built != 1 {
+		t.Fatalf("builder calls = %d, want 1", built)
+	}
+
+	second := s.Enrich(first)
+	if second.DataDir != first.DataDir {
+		t.Errorf("second Enrich changed DataDir: %q -> %q", first.DataDir, second.DataDir)
+	}
+	if second.Creds != first.Creds {
+		t.Error("second Enrich changed the injected Creds handle")
+	}
+	if second.Quirks.ModelListPassthrough != first.Quirks.ModelListPassthrough {
+		t.Error("second Enrich changed the resolved discovery flag")
+	}
+	if !sameActorValue(second.Quirks.FreebuffActor, first.Quirks.FreebuffActor) {
+		t.Error("second Enrich rebuilt the real actor")
+	}
+	if built != 1 {
+		t.Errorf("builder calls after second Enrich = %d, want still 1", built)
+	}
+
+	if err := s.Add(raw); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	stored, ok := s.Get("xai")
+	if !ok {
+		t.Fatal("xai not stored after Add")
+	}
+	if stored.DataDir != first.DataDir || stored.Creds != first.Creds {
+		t.Error("Add did not store the enriched credential injection")
+	}
+	if stored.Quirks.ModelListPassthrough != first.Quirks.ModelListPassthrough {
+		t.Error("Add did not store the resolved discovery flag")
+	}
+	if !sameActorValue(stored.Quirks.FreebuffActor, first.Quirks.FreebuffActor) {
+		t.Error("Add rebuilt the actor instead of reusing the enriched one")
+	}
+	if built != 2 {
+		t.Errorf("builder calls after Add(raw) = %d, want 2 (one for the pre-Enrich test, one for Add)", built)
+	}
+	// Re-adding the already-enriched config must not rebuild.
+	if err := s.Add(first); err != nil {
+		t.Fatalf("Add(enriched): %v", err)
+	}
+	if built != 2 {
+		t.Errorf("builder calls after Add(enriched) = %d, want still 2", built)
+	}
+}
+
+func sameActorValue(a, b any) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	// Actors in these tests are comparable empty structs; fall back to type
+	// equality if a future actor becomes non-comparable.
+	defer func() { _ = recover() }()
+	return a == b
+}
 
 // TestRuntimeProviderStore_FreebuffActorEnrichment covers a freebuff lane
 // added over MCP: the stored marker actor is swapped for the real one through

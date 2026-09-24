@@ -355,6 +355,31 @@ func (s *RuntimeProviderStore) credentialDir(cfg openaicompat.Config) openaicomp
 	return s.injectCreds(cfg)
 }
 
+// Enrich returns the lane config a restart would restore: daemon-owned
+// credential injection (DataDir + Creds), the resolved model-discovery flag
+// and the real freebuff actor. It is idempotent: enriching an already-enriched
+// config is a no-op (DataDir/Creds only fill when empty, the flag resolves to
+// the same value, and a real actor is never rebuilt).
+func (s *RuntimeProviderStore) Enrich(cfg openaicompat.Config) openaicompat.Config {
+	cfg = s.injectCreds(cfg)
+	// Resolve the effective model-discovery flag once, so the in-memory
+	// config, MCP list_providers and the persisted DTO all report what a
+	// restart would do (openaicompat.New applies the same rule).
+	cfg.Quirks.ModelListPassthrough = openaicompat.ModelListPassthroughEnabled(cfg)
+	// A freebuff lane added over MCP carries only a non-nil marker (the real
+	// actor is not JSON-serializable and cannot cross that boundary). Build the
+	// serialized-request actor here from the lane's own key / data dir so the
+	// stored config is immediately usable, exactly like a restored lane.
+	if cfg.Quirks.FreebuffActor != nil && s != nil && s.ActorBuilder != nil {
+		if _, ok := cfg.Quirks.FreebuffActor.(openaicompat.FreebuffActor); !ok {
+			if actor := s.ActorBuilder(cfg); actor != nil {
+				cfg.Quirks.FreebuffActor = actor
+			}
+		}
+	}
+	return cfg
+}
+
 // Add validates and stores a lane config, replacing any existing entry with
 // the same name (replacement is intentional: re-running add_provider is how a
 // lane's base URL or key gets rotated), then persists.
@@ -365,22 +390,7 @@ func (s *RuntimeProviderStore) Add(cfg openaicompat.Config) error {
 	if err := validateProviderConfig(cfg); err != nil {
 		return err
 	}
-	cfg = s.credentialDir(cfg)
-	// Resolve the effective model-discovery flag once, so the in-memory
-	// config, MCP list_providers and the persisted DTO all report what a
-	// restart would do (openaicompat.New applies the same rule).
-	cfg.Quirks.ModelListPassthrough = openaicompat.ModelListPassthroughEnabled(cfg)
-	// A freebuff lane added over MCP carries only a non-nil marker (the real
-	// actor is not JSON-serializable and cannot cross that boundary). Build the
-	// serialized-request actor here from the lane's own key / data dir so the
-	// stored config is immediately usable, exactly like a restored lane.
-	if cfg.Quirks.FreebuffActor != nil && s.ActorBuilder != nil {
-		if _, ok := cfg.Quirks.FreebuffActor.(openaicompat.FreebuffActor); !ok {
-			if actor := s.ActorBuilder(cfg); actor != nil {
-				cfg.Quirks.FreebuffActor = actor
-			}
-		}
-	}
+	cfg = s.Enrich(cfg)
 	// Mutation, snapshot and write are one critical section, so concurrent MCP
 	// add_provider calls serialize and cannot clobber each other's temporary
 	// file or rename an older snapshot over a newer mutation. The lane is
