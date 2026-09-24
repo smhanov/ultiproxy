@@ -1295,6 +1295,63 @@ func TestFetchModels_TokenSourceError(t *testing.T) {
 	}
 }
 
+// AC1 (T009): Token() on a keyless lane returns the ErrNoTokenAvailable
+// sentinel with stable identity across calls (not a fresh errors.New value).
+func TestToken_NoTokenSentinel(t *testing.T) {
+	p, err := New(Config{
+		BaseURL:                    "http://127.0.0.1:1",
+		HTTPClient:                 http.DefaultClient,
+		OptOutModelListPassthrough: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	first, err := p.Token(context.Background())
+	if err == nil {
+		t.Fatal("Token on a keyless lane: expected an error, got nil")
+	}
+	if first != "" {
+		t.Errorf("Token on a keyless lane = %q, want empty", first)
+	}
+	if !errors.Is(err, ErrNoTokenAvailable) {
+		t.Errorf("Token error = %v, want errors.Is match for ErrNoTokenAvailable", err)
+	}
+	_, err2 := p.Token(context.Background())
+	if !errors.Is(err2, ErrNoTokenAvailable) {
+		t.Errorf("second Token error = %v, want errors.Is match for ErrNoTokenAvailable", err2)
+	}
+}
+
+// AC3 (T009): a Token() error wrapping the sentinel with %w is still treated
+// as keyless by FetchModels — the request proceeds header-less and discovery
+// succeeds.
+func TestFetchModels_WrappedSentinelStillKeyless(t *testing.T) {
+	var headers []string
+	var hits int32
+	srv := newFetchModelsAuthUpstream(t, &headers, &hits)
+
+	p, err := New(Config{
+		BaseURL:     srv.URL,
+		TokenSource: stubTokenSource{err: fmt.Errorf("outer: %w", ErrNoTokenAvailable)},
+		HTTPClient:  srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	models, err := p.FetchModels(context.Background())
+	if err != nil {
+		t.Fatalf("FetchModels with wrapped sentinel: %v", err)
+	}
+	if len(models) != 1 || models[0] != "m1" {
+		t.Errorf("models = %v, want [m1]", models)
+	}
+	for i, h := range headers {
+		if h != "" {
+			t.Errorf("request %d Authorization = %q, want no header", i, h)
+		}
+	}
+}
+
 func TestOpenAICompat_Quirks_UnsetByDefault(t *testing.T) {
 	var capturedPayload map[string]any
 	var capturedHeaders http.Header

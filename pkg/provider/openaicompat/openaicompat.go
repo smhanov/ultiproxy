@@ -963,7 +963,7 @@ func (p *Provider) FetchModels(ctx context.Context) ([]string, error) {
 		if tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
-	} else if strings.Contains(tokErr.Error(), "no token available") {
+	} else if errors.Is(tokErr, ErrNoTokenAvailable) {
 		// Keyless public/local lane: proceed header-less.
 	} else {
 		return nil, fmt.Errorf("models auth: %w", tokErr)
@@ -1290,6 +1290,11 @@ func (p *Provider) CompleteLogin(ctx context.Context, authorizationCode string) 
 	return provider.ErrNotImplemented
 }
 
+// ErrNoTokenAvailable is returned by Provider.Token when the lane has no
+// credential (no TokenSource and no usable static key). FetchModels matches
+// it with errors.Is to let keyless public/local lanes proceed header-less.
+var ErrNoTokenAvailable = errors.New("no token available")
+
 // Token implements provider.AuthProvider.
 func (p *Provider) Token(ctx context.Context) (string, error) {
 	if p.cfg.TokenSource != nil {
@@ -1302,7 +1307,7 @@ func (p *Provider) Token(ctx context.Context) (string, error) {
 	if p.apiKey != "" && p.apiKey != "openaicompat" && p.apiKey != "placeholder" {
 		return p.apiKey, nil
 	}
-	return "", errors.New("no token available")
+	return "", ErrNoTokenAvailable
 }
 
 // Refresh implements provider.AuthProvider.
